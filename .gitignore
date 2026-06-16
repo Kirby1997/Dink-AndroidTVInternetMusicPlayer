@@ -1,0 +1,32 @@
+*.iml
+.gradle
+/local.properties
+local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+.kotlin
+
+# --- release signing secrets — NEVER commit ---
+keystore.properties
+*.jks
+*.keystore
+
+# --- generated Play preview scratch ---
+play/_preview_*.png
+
+# --- repo junk / dev scratch (large or throwaway) ---
+logcat.txt
+*.mp3
+*.zip
+Continuenextsession.txt
+.deploy-stamp

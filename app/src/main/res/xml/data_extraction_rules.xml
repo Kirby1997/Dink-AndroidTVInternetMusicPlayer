@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup / device-transfer rules (Android 12+, minSdk 31 so fullBackupContent is N/A).
+
+  dink_secrets.xml holds SMB credentials + cloud OAuth tokens via
+  EncryptedSharedPreferences. Its master key lives in the AndroidKeyStore, which is
+  hardware-bound and NEVER part of a backup. If the encrypted file were restored onto a
+  new device the key would be gone, so the blob would be undecryptable — at best the user
+  re-enters creds, at worst the store throws on read. We therefore exclude it from BOTH
+  cloud backup and device-to-device transfer. Everything else (library index, prefs,
+  source list) backs up normally.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="dink_secrets.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="dink_secrets.xml" />
+    </device-transfer>
+</data-extraction-rules>

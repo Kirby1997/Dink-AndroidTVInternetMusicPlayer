@@ -1,0 +1,6 @@
+SMB first music player for Android TV
+Current on the market is Samba Player
+Forgets SMB shares it's connected to
+UI isn't intuitive, keep accidentally closing app entirely with back button
+UX is poor having to navigate far left or far right to get to the setting you want
+Have to keep recreating playlists as new music is added to an SMB share. Can't just automatically sync
