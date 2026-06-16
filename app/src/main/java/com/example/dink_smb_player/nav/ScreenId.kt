@@ -60,11 +60,7 @@ sealed class ScreenId(
             listOf(
                 Home, Search, NowPlaying,
                 Songs, Albums, Artists, Playlists, Folders,
-                // Cloud (Google Drive) parked at the device-flow OAuth scope wall — the
-                // code lives on the `parked/cloud` branch. Omitted from the rail so the
-                // dead "not configured" screen is unreachable in release. Re-add `Cloud`
-                // here to restore the entry.
-                LocalStorage, SmbShares,
+                LocalStorage, SmbShares, Cloud,
                 Settings,
             )
         }
