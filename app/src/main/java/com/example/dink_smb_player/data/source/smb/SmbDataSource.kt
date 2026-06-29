@@ -48,12 +48,6 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             ?: throw IOException("Unknown SMB share id: $sid (was the share deleted?)")
         val creds = SmbConnectionRegistry.creds(sid)
 
-        val disk = try {
-            SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
-        } catch (t: Throwable) {
-            throw IOException("Failed to mount SMB share ${share.name}", t)
-        }
-
         // URI path is "/sharename/dir/sub/file.ext" — strip leading slash + share name,
         // decode percent-encoding, swap to smb's backslash separator.
         val rawPath = uri.path.orEmpty().trimStart('/')
@@ -62,21 +56,42 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             .split('/')
             .joinToString("\\") { URLDecoder.decode(it, "UTF-8") }
 
-        val f = try {
-            disk.openFile(
-                smbPath,
-                EnumSet.of(AccessMask.GENERIC_READ),
-                null,
-                SMB2ShareAccess.ALL,
-                SMB2CreateDisposition.FILE_OPEN,
-                null,
-            )
-        } catch (t: Throwable) {
-            throw IOException("Failed to open SMB file $smbPath", t)
+        // Mount + open with ONE reconnect retry. The cached smbj connection can have been
+        // dropped server-side (idle NAS) without isConnected noticing; the first op then
+        // fails, so we evict the dead entry ([SmbClient.close]) and reconnect once. The
+        // idle-threshold reconnect in SmbClient.share avoids most of these, but a session
+        // dropped mid-use still lands here. Only one retry — a genuinely missing file or
+        // down host then surfaces as the error instead of looping.
+        var lastErr: Throwable? = null
+        var f: File? = null
+        for (attempt in 0..1) {
+            val disk = try {
+                SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
+            } catch (t: Throwable) {
+                lastErr = t
+                SmbClient.close(share.id)
+                continue
+            }
+            try {
+                f = disk.openFile(
+                    smbPath,
+                    EnumSet.of(AccessMask.GENERIC_READ),
+                    null,
+                    SMB2ShareAccess.ALL,
+                    SMB2CreateDisposition.FILE_OPEN,
+                    null,
+                )
+                break
+            } catch (t: Throwable) {
+                lastErr = t
+                // Evict the (possibly stale) cached connection so the next attempt reconnects.
+                SmbClient.close(share.id)
+            }
         }
-        file = f
+        val openedFile = f ?: throw IOException("Failed to open SMB file $smbPath", lastErr)
+        file = openedFile
 
-        val totalLen = f.fileInformation.standardInformation.endOfFile
+        val totalLen = openedFile.fileInformation.standardInformation.endOfFile
         val position = dataSpec.position
         if (position > totalLen) throw IOException("Position $position past end-of-file $totalLen")
 
