@@ -81,6 +81,9 @@ fun SongsScreen(
     val context = LocalContext.current
     val librarySongsFlow = remember(context) { LibraryRepository.songs(context) }
     val allSongs by librarySongsFlow.collectAsState()
+    // True until the on-disk index finishes loading at boot. Used to show a loading bar
+    // instead of an empty "0 tracks" list while a 25k library is still being restored.
+    val restored by LibraryRepository.restoredState.collectAsState()
 
     var sort by remember { mutableStateOf(SongSort.Title) }
     var filter by remember { mutableStateOf(SongFilter.All) }
@@ -142,7 +145,7 @@ fun SongsScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        if (filtered == null) {
+        if (filtered == null || (!restored && allSongs.isEmpty())) {
             ThinLoadingBar(modifier = Modifier.padding(horizontal = 64.dp))
         } else {
         val listState = rememberLazyListState()
@@ -169,7 +172,14 @@ fun SongsScreen(
                     onLongClick = { menuSong = song },
                     // Every row routes Left to the rail; otherwise spatial nav from a
                     // lower row grabs whatever rail item is vertically nearest (Settings).
-                    modifier = Modifier.leftEdgeTo(railRequester),
+                    // The top row also pins Up → Shuffle (contentFocus) so reaching the
+                    // top of the list lands on Shuffle, not whichever header control is
+                    // spatially nearest (sort/filter).
+                    modifier = if (index == 0) {
+                        Modifier.focusProperties { left = railRequester; up = contentFocus }
+                    } else {
+                        Modifier.leftEdgeTo(railRequester)
+                    },
                 )
             }
         }

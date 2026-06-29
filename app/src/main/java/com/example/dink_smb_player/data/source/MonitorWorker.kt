@@ -60,14 +60,18 @@ class MonitorWorker(
             val creds = runCatching { store.getSmbCreds(share.id) }.getOrNull()
             // Reuse already-indexed rows so only NEW files are tag-read this pass.
             val existing = LibraryRepository.sourceTrackMap(ctx, SourceType.Smb, share.id)
-            SmbImporter.enumerate(ctx, share, creds, share.monitoredPaths, existing).onSuccess { tracks ->
+            SmbImporter.enumerate(ctx, share, creds, share.monitoredPaths, existing).onSuccess { res ->
+                val tracks = res.tracks
                 val added = tracks.count { it.id !in existing }
-                android.util.Log.i(TAG, "smb '${share.name}': scanned=${tracks.size} new=$added (monitored=${share.monitoredPaths})")
+                android.util.Log.i(TAG, "smb '${share.name}': scanned=${tracks.size} new=$added complete=${res.complete} (monitored=${share.monitoredPaths})")
+                // A partial walk (NAS slow/asleep at boot, network blip) must NOT prune —
+                // pruning a subset deletes real tracks and wipes the library. Upsert-only then.
                 LibraryRepository.refreshMonitored(
                     ctx,
                     SmbImporter.sourceEntityFor(share, tracks.size, tracks.sumOf { it.sizeBytes }),
                     tracks,
                     share.monitoredPaths.map { SmbImporter.monitoredPrefix(share, it) },
+                    prune = res.complete,
                 )
             }.onFailure { android.util.Log.w(TAG, "smb monitor failed '${share.name}'", it) }
         }
@@ -87,12 +91,14 @@ class MonitorWorker(
                     ?: return@withContext null
                 CloudImporter.enumerate(ctx, provider, token, provider.monitoredFolders, existing)
             } ?: continue
-            result.onSuccess { tracks ->
+            result.onSuccess { res ->
+                val tracks = res.tracks
                 LibraryRepository.refreshMonitored(
                     ctx,
                     CloudImporter.sourceEntityFor(provider, tracks.size, tracks.sumOf { it.sizeBytes }),
                     tracks,
                     provider.monitoredFolders.map { CloudImporter.monitoredPrefix(provider, it) },
+                    prune = res.complete,
                 )
             }
         }

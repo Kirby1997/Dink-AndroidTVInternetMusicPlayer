@@ -224,12 +224,14 @@ object CloudLibrary {
             }
             val existing = LibraryRepository.sourceTrackMap(context, SourceType.Cloud, provider.id)
             withContext(Dispatchers.IO) { CloudImporter.enumerate(context, provider, token, listOf(ref), existing) }
-                .onSuccess { tracks ->
+                .onSuccess { res ->
+                    val tracks = res.tracks
                     val total = LibraryRepository.importScoped(
                         context,
                         CloudImporter.sourceEntityFor(provider, tracks.size, tracks.sumOf { it.sizeBytes }),
                         freshTracks = tracks,
                         scopePrefixes = listOf(CloudImporter.monitoredPrefix(provider, ref)),
+                        prune = res.complete,
                     )
                     lastImportedCount[provider.id] = total
                     SharePrefs(context).saveProvider(

@@ -10,7 +10,6 @@ import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
 import com.hierynomus.smbj.share.File
 import java.io.IOException
-import java.io.InputStream
 import java.net.URLDecoder
 import java.util.EnumSet
 
@@ -23,15 +22,18 @@ import java.util.EnumSet
  * we have no reliable way to map an arbitrary smb:// URI back to creds the user
  * once entered, so [open] throws.
  *
- * Seek strategy: smbj's [File.getInputStream] doesn't seek natively; we recreate
- * the stream and `skip` for each `position`. Most audio playback is sequential so
- * this only fires on user scrubs — fine for v1.
+ * Seek strategy: smbj [File] supports RANDOM-ACCESS positioned reads
+ * ([File.read] with a `fileOffset`), so we read from `position` directly. The old
+ * approach `skip`-ped an [java.io.InputStream] to the offset, which read-and-discarded
+ * every byte up to it — a seek near end-of-file (e.g. an M4A/MP4 `moov` atom, which
+ * holds DURATION) dragged the whole file over the network and timed out, so duration
+ * probes silently failed. Positioned reads make a tail seek cost only the bytes wanted.
  */
 class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
 
     private var currentUri: Uri? = null
     private var file: File? = null
-    private var stream: InputStream? = null
+    private var readOffset: Long = 0L
     private var bytesRemaining: Long = 0L
     private var opened: Boolean = false
 
@@ -84,14 +86,8 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             dataSpec.length
         }
 
-        stream = f.inputStream.also { s ->
-            var toSkip = position
-            while (toSkip > 0L) {
-                val skipped = s.skip(toSkip)
-                if (skipped <= 0L) throw IOException("Failed to skip to offset $position")
-                toSkip -= skipped
-            }
-        }
+        // Positioned read — no whole-file skip to reach the offset (see class doc).
+        readOffset = position
 
         opened = true
         transferStarted(dataSpec)
@@ -102,12 +98,9 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
         if (length == 0) return 0
         if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
         val want = minOf(length.toLong(), bytesRemaining).toInt()
-        val n = try {
-            stream!!.read(buffer, offset, want)
-        } catch (t: IOException) {
-            throw t
-        }
+        val n = file!!.read(buffer, readOffset, offset, want)
         if (n == -1) return C.RESULT_END_OF_INPUT
+        readOffset += n
         bytesRemaining -= n
         bytesTransferred(n)
         return n
@@ -117,11 +110,10 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
 
     override fun close() {
         try {
-            runCatching { stream?.close() }
             runCatching { file?.close() }
         } finally {
-            stream = null
             file = null
+            readOffset = 0L
             bytesRemaining = 0L
             currentUri = null
             if (opened) {

@@ -47,6 +47,11 @@ object SharesLibrary {
      *  recursive (includes every subfolder), so the UI can report real scope. */
     val lastImportedCount = mutableStateMapOf<String, Int>()
 
+    /** Live count of tracks indexed so far in the IN-FLIGHT import, updated as the walk
+     *  flushes batches. Drives the "Importing… N tracks" progress in the UI; cleared when
+     *  the import finishes. Distinct from [lastImportedCount] (the final settled total). */
+    val importProgress = mutableStateMapOf<String, Int>()
+
     /** App-lifetime scope so a sync (and its status write) survives the user
      *  navigating away from SmbSharesScreen. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -152,6 +157,7 @@ object SharesLibrary {
      *  without touching the share's other imported folders. ("" = whole share.) */
     private suspend fun runImportFolder(context: Context, share: SmbShare, smbPath: String) {
         importingShares[share.id] = true
+        importProgress[share.id] = 0
         errorsByShare.remove(share.id)
         try {
             val creds = EncryptedShareStore(context).getSmbCreds(share.id)
@@ -162,14 +168,21 @@ object SharesLibrary {
                     // Persist new tracks in batches as the walk finds them, so a restart
                     // mid-import doesn't lose the whole walk — resumes via id reuse instead.
                     flushBatch = { batch -> LibraryRepository.upsertBatch(context, batch) },
+                    // Live progress count for the "Importing… N tracks" UI.
+                    onProgress = { count -> importProgress[share.id] = count },
                 )
             }
-                .onSuccess { tracks ->
+                .onSuccess { res ->
+                    val tracks = res.tracks
+                    if (!res.complete) {
+                        android.util.Log.w("SharesLibrary", "import walk incomplete id=${share.id} path=$smbPath — upsert-only, not pruning (would lose unseen tracks)")
+                    }
                     val total = LibraryRepository.importScoped(
                         context,
                         SmbImporter.sourceEntityFor(share, tracks.size, tracks.sumOf { it.sizeBytes }),
                         freshTracks = tracks,
                         scopePrefixes = listOf(SmbImporter.monitoredPrefix(share, smbPath)),
+                        prune = res.complete,
                     )
                     lastImportedCount[share.id] = total
                     SharePrefs(context).saveShare(
@@ -186,6 +199,7 @@ object SharesLibrary {
                 }
         } finally {
             importingShares[share.id] = false
+            importProgress.remove(share.id)
         }
     }
 

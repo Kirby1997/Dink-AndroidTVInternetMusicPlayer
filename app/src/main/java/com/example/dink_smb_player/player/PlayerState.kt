@@ -17,6 +17,7 @@ import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.platform.LocalContext
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.LyricLine
@@ -76,6 +77,16 @@ class PlayerState(
 
     var karaokeMode by mutableStateOf(false)
         private set
+
+    /** Transient, user-facing playback error (e.g. a track whose file vanished from the
+     *  share). Set when a source fails; the UI observes it to toast, then clears it. */
+    var playbackError by mutableStateOf<String?>(null)
+
+    // Consecutive engine source-errors since the last successful READY. Bounds the
+    // auto-skip so an unreachable queue (NAS offline, every path stale) stops instead
+    // of spinning through every track.
+    private var consecutiveErrors = 0
+    private val MAX_SKIP_ON_ERROR = 8
 
     /** Sink for tags the engine extracts while streaming (Phase 8.7). The Composable
      *  owner sets this to persist enrichment into the library index off-thread. */
@@ -152,6 +163,7 @@ class PlayerState(
 
     fun playFrom(songs: List<Song>, startIndex: Int, autoplay: Boolean = true) {
         if (songs.isEmpty()) return
+        consecutiveErrors = 0 // fresh user-initiated playback — retry after a prior stop
         baseOrder = songs
         val safeStart = startIndex.coerceIn(0, songs.lastIndex)
         // Shuffle = reorder the queue (chosen track first, rest shuffled) and play it
@@ -311,8 +323,33 @@ class PlayerState(
         }
     }
 
+    /**
+     * Engine source error (e.g. STATUS_OBJECT_PATH_NOT_FOUND — the file was moved or
+     * deleted on the share, common with Servarr/lidarr auto-renames). A single bad track
+     * must not brick the player: skip past it to the next, but bound the skipping so a
+     * fully-unreachable queue stops instead of racing through every track.
+     */
+    internal fun onPlaybackError(error: PlaybackException) {
+        val failedTitle = currentSong?.title ?: "track"
+        consecutiveErrors++
+        val skipLimit = minOf(_queue.size, MAX_SKIP_ON_ERROR)
+        val nextIdx = if (consecutiveErrors <= skipLimit) pickNextIndex(advance = 1) else null
+        if (nextIdx != null) {
+            playbackError = "Skipped \"$failedTitle\" — file not found on share"
+            moveTo(nextIdx)
+        } else {
+            // Either the queue end, or we've hit the skip budget (likely share offline).
+            isPlaying = false
+            engine?.stop()
+            playbackError = "Can't play \"$failedTitle\" — file not found. Re-import the folder to refresh moved files."
+        }
+    }
+
     internal fun setEngineIsPlaying(playing: Boolean) {
         isPlaying = playing
+        // Throttle background SMB imports while a track streams, so concurrent tag-read
+        // extractors don't starve playback's reads (the "janky during import" report).
+        com.example.dink_smb_player.data.source.ImportThrottle.playbackActive = playing
     }
 
     internal fun setEngineDurationMs(durMs: Long) {
@@ -418,9 +455,15 @@ class PlayerState(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (currentSong?.mediaUri == null) return
                 when (playbackState) {
-                    Player.STATE_READY -> setEngineDurationMs(player.duration)
+                    Player.STATE_READY -> {
+                        setEngineDurationMs(player.duration)
+                        consecutiveErrors = 0 // a track loaded fine — reset the skip budget
+                    }
                     Player.STATE_ENDED -> onTrackEnded()
                 }
+            }
+            override fun onPlayerError(error: PlaybackException) {
+                onPlaybackError(error)
             }
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) return

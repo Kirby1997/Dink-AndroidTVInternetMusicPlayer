@@ -105,6 +105,14 @@ fun DinkApp() {
     )
 
     // Persist tags the engine extracts while streaming (Phase 8.7) into the index.
+    // Surface playback source errors (e.g. a track whose file was moved/deleted on the
+    // share) as a toast — PlayerState auto-skips the bad track, this just tells the user.
+    LaunchedEffect(player.playbackError) {
+        val msg = player.playbackError ?: return@LaunchedEffect
+        toast.show(msg)
+        player.playbackError = null
+    }
+
     LaunchedEffect(player) {
         val app = context.applicationContext as? DinkApplication
         player.onMetadataResolved = { tags ->

@@ -24,7 +24,7 @@ object DurationReader {
     /** Header + metadata atom for an audio file is comfortably inside this; a VBR MP3
      *  with a Xing header or an M4A moov both land well under it. Past this we bail to
      *  avoid pulling the whole file over the network on 25k tracks. */
-    private const val PROBE_BUDGET_BYTES = 4L * 1024 * 1024
+    private const val PROBE_BUDGET_BYTES = 8L * 1024 * 1024
 
     fun read(context: Context, uri: String): Long? {
         val retriever = MediaMetadataRetriever()

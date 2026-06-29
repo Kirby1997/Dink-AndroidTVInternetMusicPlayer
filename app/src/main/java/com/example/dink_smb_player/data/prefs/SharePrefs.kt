@@ -1,18 +1,26 @@
 package com.example.dink_smb_player.data.prefs
 
 import android.content.Context
-import androidx.datastore.preferences.core.Preferences
+import android.util.Log
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.dink_smb_player.data.model.CloudProvider
 import com.example.dink_smb_player.data.model.SmbShare
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-private val Context.shareDataStore by preferencesDataStore(name = "dink_sources")
+// A corrupt prefs file otherwise throws on every read AND write forever (a share
+// can never be re-added). Reset to empty on corruption so the store self-heals.
+private val Context.shareDataStore by preferencesDataStore(
+    name = "dink_sources",
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+)
 
 private val SMB_SHARES_KEY = stringSetPreferencesKey("smb_shares_json")
 private val CLOUD_PROVIDERS_KEY = stringSetPreferencesKey("cloud_providers_json")
@@ -28,13 +36,13 @@ class SharePrefs(private val context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    val shares: Flow<List<SmbShare>> = context.shareDataStore.data.map { prefs ->
-        decodeSet<SmbShare>(prefs[SMB_SHARES_KEY])
-    }
+    val shares: Flow<List<SmbShare>> = context.shareDataStore.data
+        .catch { e -> Log.e("SharePrefs", "shares read failed, emitting empty", e); emit(emptyPreferences()) }
+        .map { prefs -> decodeSet<SmbShare>(prefs[SMB_SHARES_KEY]) }
 
-    val providers: Flow<List<CloudProvider>> = context.shareDataStore.data.map { prefs ->
-        decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
-    }
+    val providers: Flow<List<CloudProvider>> = context.shareDataStore.data
+        .catch { e -> Log.e("SharePrefs", "providers read failed, emitting empty", e); emit(emptyPreferences()) }
+        .map { prefs -> decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY]) }
 
     suspend fun saveShare(share: SmbShare) {
         context.shareDataStore.edit { prefs ->
@@ -67,7 +75,11 @@ class SharePrefs(private val context: Context) {
     }
 
     private inline fun <reified T> decodeSet(set: Set<String>?): List<T> =
-        set?.mapNotNull { runCatching { json.decodeFromString<T>(it) }.getOrNull() } ?: emptyList()
+        set?.mapNotNull { blob ->
+            runCatching { json.decodeFromString<T>(blob) }
+                .onFailure { Log.w("SharePrefs", "dropping unparseable source blob: ${it.message}") }
+                .getOrNull()
+        } ?: emptyList()
 
     private inline fun <reified T> encodeSet(list: List<T>): Set<String> =
         list.map { json.encodeToString(it) }.toSet()

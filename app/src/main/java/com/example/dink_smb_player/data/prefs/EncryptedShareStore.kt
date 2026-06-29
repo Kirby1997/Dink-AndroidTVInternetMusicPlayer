@@ -28,11 +28,21 @@ class EncryptedShareStore(context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val prefs: SharedPreferences = run {
+    // A wedged Tink keyset / secrets file makes create() throw forever, which would
+    // silently block every credential write (and thus break adding a share). Recover
+    // by wiping the file once and rebuilding rather than staying permanently broken.
+    private val prefs: SharedPreferences = runCatching { build(context) }
+        .getOrElse {
+            android.util.Log.e("EncryptedShareStore", "secrets store corrupt, resetting", it)
+            context.deleteSharedPreferences("dink_secrets")
+            build(context)
+        }
+
+    private fun build(context: Context): SharedPreferences {
         val masterKey = MasterKey.Builder(context)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
-        EncryptedSharedPreferences.create(
+        return EncryptedSharedPreferences.create(
             context,
             "dink_secrets",
             masterKey,
@@ -48,7 +58,9 @@ class EncryptedShareStore(context: Context) {
     }
 
     fun getSmbCreds(shareId: String): SmbCreds? {
-        val raw = prefs.getString(smbKey(shareId), null) ?: return null
+        // getString itself can throw if this entry's ciphertext is corrupt — guard
+        // the whole read so one bad value doesn't bubble up as a crash.
+        val raw = runCatching { prefs.getString(smbKey(shareId), null) }.getOrNull() ?: return null
         return runCatching { json.decodeFromString<SmbCreds>(raw) }.getOrNull()
     }
 

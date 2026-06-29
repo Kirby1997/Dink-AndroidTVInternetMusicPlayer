@@ -118,6 +118,7 @@ fun AddShareWizard(
     var authGuest by remember { mutableStateOf(false) }
     var user by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var showPassword by remember { mutableStateOf(false) }
     var domain by remember { mutableStateOf("") }
 
     var discovering by remember { mutableStateOf(false) }
@@ -128,6 +129,16 @@ fun AddShareWizard(
     var testing by remember { mutableStateOf(false) }
     var testError by remember { mutableStateOf<String?>(null) }
     var testPassed by remember { mutableStateOf(false) }
+    val addFocus = remember { FocusRequester() }
+
+    // When the test passes, pull focus straight onto the now-enabled Add button so
+    // the user just presses OK to confirm — no hunting, no chance of drifting to the rail.
+    LaunchedEffect(testPassed) {
+        if (testPassed) {
+            kotlinx.coroutines.delay(40)
+            runCatching { addFocus.requestFocus() }
+        }
+    }
 
     val valid = host.isNotBlank() &&
         port.toIntOrNull() != null &&
@@ -192,14 +203,21 @@ fun AddShareWizard(
         SmbConnectionRegistry.add(share)
         SharesLibrary.activeBrowseShareId = id
         appScope.launch {
-            if (credsToStore != null) secretStore.putSmbCreds(id, credsToStore)
-            sharePrefs.saveShare(share)
+            // Persist the share config FIRST and independently of the secret write.
+            // If the encrypted creds store is wedged it must NOT block the share from
+            // landing in SharePrefs — that ordering was the "re-add vanishes" bug.
+            runCatching { sharePrefs.saveShare(share) }
+                .onFailure { android.util.Log.e("AddShareWizard", "saveShare failed id=$id", it) }
+            if (credsToStore != null) {
+                runCatching { secretStore.putSmbCreds(id, credsToStore) }
+                    .onFailure { android.util.Log.e("AddShareWizard", "putSmbCreds failed id=$id", it) }
+            }
             android.util.Log.i("AddShareWizard", "saved share id=$id host=${share.host}")
             // No upfront flat walk — SmbBrowseScreen lists the root folder lazily on
             // open, and the user imports the folders they want into the library there.
         }
         onToast("${share.name} saved")
-        onDone(ScreenId.SmbBrowse)
+        onDone(ScreenId.SmbShares)
     }
 
     Column(
@@ -315,8 +333,17 @@ fun AddShareWizard(
                 value = password,
                 onChange = { password = it; testPassed = false },
                 placeholder = "••••••••",
-                secret = true,
+                // Mask only when hidden; reveal toggle below flips it. KeyboardType
+                // .Password puts the IME in password mode (no learning/suggestions)
+                // regardless of reveal, so the on-screen keyboard never remembers it.
+                secret = !showPassword,
+                keyboardType = KeyboardType.Password,
                 fieldModifier = rail,
+            )
+            FormButton(
+                label = if (showPassword) "Hide password" else "Show password",
+                modifier = rail,
+                onClick = { showPassword = !showPassword },
             )
             TapEditField(
                 label = "Domain (optional)",
@@ -354,7 +381,7 @@ fun AddShareWizard(
                 // Gated on a passing test so a wrong IP / share name can't be
                 // saved as a phantom "online" share.
                 label = "Add share",
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).focusRequester(addFocus),
                 primary = true,
                 enabled = testPassed && !testing,
                 onClick = { save() },
@@ -602,7 +629,10 @@ private fun FormButton(
             .clip(RoundedCornerShape(8.dp))
             .background(bg)
             .onFocusChanged { focused = it.isFocused }
-            .clickable(enabled = enabled) { onClick() },
+            // Always focusable — only the action is gated. A disabled `clickable`
+            // drops the node from the focus tree, so disabling the just-pressed Test
+            // button mid-test threw focus to the rail and opened the nav drawer.
+            .clickable { if (enabled) onClick() },
         contentAlignment = Alignment.Center,
     ) {
         Text(label, style = type.buttonLabel.copy(color = ink))

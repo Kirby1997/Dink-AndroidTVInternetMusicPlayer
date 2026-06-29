@@ -49,6 +49,13 @@ object LibraryRepository {
     @Volatile private var restored = false
     private val restoreMutex = Mutex()
 
+    // Observable mirror of [restored] for the UI. Boot restore of a 25k-row index takes
+    // a few seconds; without this, library screens see an empty index and render the
+    // "nothing imported — add a source" empty state over a library that's about to load.
+    // Screens show a loading bar while this is false and the list is still empty.
+    private val _restored = MutableStateFlow(false)
+    val restoredState: StateFlow<Boolean> = _restored.asStateFlow()
+
     // Gates [persist]. Stays true normally, but flips false if a restore finds the
     // on-disk index present-but-unreadable: persisting then would snapshot an index
     // that is missing that file's tracks and overwrite the (recoverable) file with
@@ -77,6 +84,7 @@ object LibraryRepository {
             }
         }
         restored = true
+        _restored.value = true
     }
 
     /**
@@ -201,17 +209,23 @@ object LibraryRepository {
         source: SourceEntity,
         freshTracks: List<TrackEntity>,
         scopePrefixes: List<String>,
+        // Prune rows under [scopePrefixes] that the scan didn't return. Only safe when the
+        // enumeration was COMPLETE — a partial/failed walk returns a subset, and pruning
+        // against it deletes real, still-present files. Pass the walk's `complete` flag.
+        prune: Boolean = true,
     ): Int {
         safeToPersist = true
         val dao = dao(context)
         dao.upsertSource(source)
-        val existing = dao.observeTracksFor(source.type, source.id).first()
-        val keepUris = buildSet {
-            existing.forEach { t -> if (scopePrefixes.none { t.path.startsWith(it) }) add(t.uri) }
-            freshTracks.forEach { add(it.uri) }
-        }
         dao.upsertTracks(freshTracks)
-        dao.pruneSource(source.type, source.id, keepUris.toList())
+        if (prune) {
+            val existing = dao.observeTracksFor(source.type, source.id).first()
+            val keepUris = buildSet {
+                existing.forEach { t -> if (scopePrefixes.none { t.path.startsWith(it) }) add(t.uri) }
+                freshTracks.forEach { add(it.uri) }
+            }
+            dao.pruneSource(source.type, source.id, keepUris.toList())
+        }
         val total = dao.observeTracksFor(source.type, source.id).first()
         dao.updateSourceStats(
             id = source.id,
@@ -236,19 +250,26 @@ object LibraryRepository {
         source: SourceEntity,
         freshTracks: List<TrackEntity>,
         monitoredPrefixes: List<String>,
+        // Prune monitored-folder rows the scan didn't return (i.e. deleted on the source).
+        // Only safe when the enumeration was COMPLETE. A flaky walk (NAS asleep right after
+        // a TV boot, transient network drop) returns a subset; pruning against it deletes
+        // real tracks and wipes the library. When false this is upsert-only — never deletes.
+        prune: Boolean = true,
     ) {
         if (monitoredPrefixes.isEmpty()) return
         val dao = dao(context)
-        val existing = dao.observeTracksFor(source.type, source.id).first()
-        // Keep: every row that is NOT inside a monitored folder, plus the fresh scan
-        // of the monitored folders. Anything under a monitored prefix and absent from
-        // the fresh scan was deleted on the source and gets pruned.
-        val keepUris = buildSet {
-            existing.forEach { t -> if (monitoredPrefixes.none { t.path.startsWith(it) }) add(t.uri) }
-            freshTracks.forEach { add(it.uri) }
-        }
         dao.upsertTracks(freshTracks)
-        dao.pruneSource(source.type, source.id, keepUris.toList())
+        if (prune) {
+            val existing = dao.observeTracksFor(source.type, source.id).first()
+            // Keep: every row that is NOT inside a monitored folder, plus the fresh scan
+            // of the monitored folders. Anything under a monitored prefix and absent from
+            // the fresh scan was deleted on the source and gets pruned.
+            val keepUris = buildSet {
+                existing.forEach { t -> if (monitoredPrefixes.none { t.path.startsWith(it) }) add(t.uri) }
+                freshTracks.forEach { add(it.uri) }
+            }
+            dao.pruneSource(source.type, source.id, keepUris.toList())
+        }
         val total = dao.observeTracksFor(source.type, source.id).first()
         dao.updateSourceStats(
             id = source.id,
@@ -268,12 +289,26 @@ object LibraryRepository {
      * rows and skips re-reading their tags. Authoritative (user-initiated import), so it
      * re-enables persistence after a failed restore.
      */
+    @Volatile private var lastBatchPersistMs = 0L
+    private val BATCH_PERSIST_INTERVAL_MS = 3_000L
+
     suspend fun upsertBatch(context: Context, tracks: List<TrackEntity>) {
         if (tracks.isEmpty()) return
         safeToPersist = true
         val dao = dao(context)
+        // The index is in-memory, so this upsert is cheap and immediately re-emits to
+        // the live `songs()` flow — that's what populates the Library view progressively.
         dao.upsertTracks(tracks)
-        persist(context)
+        // The disk snapshot (full JSON serialize) is the expensive part, so throttle it
+        // mid-walk instead of snapshotting on every batch. The caller's final importScoped
+        // persists unconditionally, so the completed import is always fully on disk; the
+        // only exposure is a crash losing ≤ this interval of un-snapshotted rows, which the
+        // next run re-reads cheaply (id reuse). Was: persist on every 500-track batch.
+        val now = System.currentTimeMillis()
+        if (now - lastBatchPersistMs >= BATCH_PERSIST_INTERVAL_MS) {
+            lastBatchPersistMs = now
+            persist(context)
+        }
     }
 
     suspend fun removeSource(context: Context, type: SourceType, sourceId: String) {

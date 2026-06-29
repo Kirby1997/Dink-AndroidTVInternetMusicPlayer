@@ -47,6 +47,11 @@ object CloudImporter {
         sizeBytes = sizeBytes,
     )
 
+    /** Outcome of a walk. [complete] is false when any folder listing failed (or a subtree
+     *  past [MAX_DEPTH]) — [tracks] is then a SUBSET, so callers MUST NOT prune against it.
+     *  Mirrors [com.example.dink_smb_player.data.source.smb.SmbImporter.EnumResult]. */
+    data class EnumResult(val tracks: List<TrackEntity>, val complete: Boolean)
+
     /** Recursively enumerate the audio under each [CloudFolderRef] and map to index
      *  rows. Dedupes overlapping roots by track id. */
     fun enumerate(
@@ -55,11 +60,12 @@ object CloudImporter {
         accessToken: String,
         folders: List<CloudFolderRef>,
         existing: Map<String, TrackEntity> = emptyMap(),
-    ): Result<List<TrackEntity>> =
+    ): Result<EnumResult> =
         runCatching {
             val out = LinkedHashMap<String, TrackEntity>()
-            for (ref in folders) walk(context, provider, accessToken, ref.id, ref.path, 0, out, existing)
-            out.values.toList()
+            val complete = java.util.concurrent.atomic.AtomicBoolean(true)
+            for (ref in folders) walk(context, provider, accessToken, ref.id, ref.path, 0, out, existing, complete)
+            EnumResult(out.values.toList(), complete.get())
         }
 
     private fun walk(
@@ -71,13 +77,16 @@ object CloudImporter {
         depth: Int,
         out: MutableMap<String, TrackEntity>,
         existing: Map<String, TrackEntity>,
+        complete: java.util.concurrent.atomic.AtomicBoolean,
     ) {
-        if (depth > MAX_DEPTH) return
-        val items = GoogleDriveClient.listChildren(token, folderId).getOrElse { return }
+        if (depth > MAX_DEPTH) { complete.set(false); return }
+        // Listing failure → skip this folder but mark incomplete so the caller upserts
+        // WITHOUT pruning; pruning a subset would delete real tracks we couldn't see.
+        val items = GoogleDriveClient.listChildren(token, folderId).getOrElse { complete.set(false); return }
         for (item in items) {
             val childPath = if (namePath.isEmpty()) item.name else "$namePath/${item.name}"
             if (item.isFolder) {
-                walk(context, provider, token, item.id, childPath, depth + 1, out, existing)
+                walk(context, provider, token, item.id, childPath, depth + 1, out, existing, complete)
             } else {
                 val id = trackIdFor(SourceType.Cloud, provider.id, item.id)
                 // Already indexed → reuse the row (keep tags), skip the tag read.
