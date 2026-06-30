@@ -149,6 +149,13 @@ object LibraryRepository {
     fun songsNow(context: Context): List<Song> =
         dao(context).snapshot().first.map(TrackEntity::toSong)
 
+    /** Synchronous count of indexed tracks — O(1) read of the in-memory list size, no
+     *  per-row [Song] mapping. Reflects [restore]/[upsertTracks] immediately, BEFORE the
+     *  async [songs] flow (which sorts on Dispatchers.Default) catches up. Screens use it
+     *  to tell "restored, has tracks, flow still propagating" (show loading) apart from
+     *  "restored, genuinely empty" (show empty state). */
+    fun trackCountNow(context: Context): Int = dao(context).snapshot().first.size
+
     fun recentlyAdded(context: Context, limit: Int = 30): Flow<List<Song>> =
         dao(context).observeRecentlyAdded(limit).map { rows -> rows.map(TrackEntity::toSong) }
             .flowOn(Dispatchers.Default)
