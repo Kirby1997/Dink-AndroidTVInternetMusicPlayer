@@ -381,7 +381,11 @@ object LibraryRepository {
                     chunk.forEach { row ->
                         launch {
                             gate.withPermit {
-                                val tags = TagReader.read(context, row.uri)
+                                // Only re-read embedded tags when the title still looks
+                                // filename-derived; a row that just lacks a duration keeps its
+                                // good title, so skip the 1-6s tag retrieve and probe duration only.
+                                val tagsNeeded = looksFilenameDerived(row)
+                                val tags = TagReader.read(context, row.uri, tagsNeeded = tagsNeeded)
                                 if (tags != null) {
                                     val merged = row.copy(
                                         title = tags.title?.ifBlank { null } ?: row.title,

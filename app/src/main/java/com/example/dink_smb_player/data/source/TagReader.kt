@@ -37,38 +37,47 @@ object TagReader {
     // tracks that worst case dominates total rescan time. Keep it tight.
     private const val TIMEOUT_SECONDS = 6L
 
-    fun read(context: Context, uri: String): Tags? {
+    /**
+     * [tagsNeeded] = false skips the embedded-tag retrieve and reads ONLY the duration.
+     * The duration rescan re-tags 25k rows; one with a real title (not filename-derived)
+     * needs only its missing duration, and the tag retrieve there is 1-6s of pure waste —
+     * it always finds nothing useful on those (the title is already as good as it gets).
+     * Skipping it is a big part of the rescan speed-up.
+     */
+    fun read(context: Context, uri: String, tagsNeeded: Boolean = true): Tags? {
         val appContext = context.applicationContext
-        val sourceFactory = DefaultMediaSourceFactory(appContext)
-            .setDataSourceFactory(DinkDataSourceFactory(appContext))
-        // Hold the future so we can CANCEL it on timeout/error. Without this, a slow
-        // file's extraction keeps running on a background thread after .get() gives up,
-        // holding multi-MB read buffers — across a 25k rescan those leaks pile up and
-        // OOM the process (the crash was in smbj's reader allocating into a dead read).
-        val future = MetadataRetriever.retrieveMetadata(sourceFactory, MediaItem.fromUri(uri))
-        val mm: MediaMetadata? = try {
-            val trackGroups = future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            val builder = MediaMetadata.Builder()
-            var sawAny = false
-            for (g in 0 until trackGroups.length) {
-                val group = trackGroups.get(g)
-                for (f in 0 until group.length) {
-                    val md = group.getFormat(f).metadata ?: continue
-                    for (i in 0 until md.length()) {
-                        md.get(i).populateMediaMetadata(builder)
-                        sawAny = true
+        val mm: MediaMetadata? = if (!tagsNeeded) null else {
+            val sourceFactory = DefaultMediaSourceFactory(appContext)
+                .setDataSourceFactory(DinkDataSourceFactory(appContext))
+            // Hold the future so we can CANCEL it on timeout/error. Without this, a slow
+            // file's extraction keeps running on a background thread after .get() gives up,
+            // holding multi-MB read buffers — across a 25k rescan those leaks pile up and
+            // OOM the process (the crash was in smbj's reader allocating into a dead read).
+            val future = MetadataRetriever.retrieveMetadata(sourceFactory, MediaItem.fromUri(uri))
+            try {
+                val trackGroups = future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                val builder = MediaMetadata.Builder()
+                var sawAny = false
+                for (g in 0 until trackGroups.length) {
+                    val group = trackGroups.get(g)
+                    for (f in 0 until group.length) {
+                        val md = group.getFormat(f).metadata ?: continue
+                        for (i in 0 until md.length()) {
+                            md.get(i).populateMediaMetadata(builder)
+                            sawAny = true
+                        }
                     }
                 }
+                if (sawAny) builder.build() else null
+            } catch (t: Throwable) {
+                null
+            } finally {
+                // Idempotent: harmless after a successful get, frees the extractor on timeout.
+                future.cancel(true)
             }
-            if (sawAny) builder.build() else null
-        } catch (t: Throwable) {
-            null
-        } finally {
-            // Idempotent: harmless after a successful get, frees the extractor on timeout.
-            future.cancel(true)
         }
         // Duration is a separate platform-retriever probe — Media3 1.4's MetadataRetriever
-        // doesn't expose it. Header-only, byte-budgeted, no download (see DurationReader).
+        // doesn't expose it. Header-only, byte-budgeted, time-capped, no download (see DurationReader).
         val durationMs = DurationReader.read(appContext, uri)
         val tags = Tags(
             title = mm?.title?.toString()?.trim()?.ifBlank { null },

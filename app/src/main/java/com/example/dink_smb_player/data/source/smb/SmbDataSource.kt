@@ -84,8 +84,11 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
                 break
             } catch (t: Throwable) {
                 lastErr = t
-                // Evict the (possibly stale) cached connection so the next attempt reconnects.
-                SmbClient.close(share.id)
+                // Only evict + retry when the failure looks connection-level (a dropped/dead
+                // session). A per-file error (FILE_NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
+                // means the connection is fine — tearing it down would poison every other
+                // concurrent read/list (e.g. an in-progress import walk) over the same share.
+                if (isConnectionError(t)) SmbClient.close(share.id) else break
             }
         }
         val openedFile = f ?: throw IOException("Failed to open SMB file $smbPath", lastErr)
@@ -119,6 +122,21 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
         bytesRemaining -= n
         bytesTransferred(n)
         return n
+    }
+
+    /** True when [t] reads as a transport/session failure (dead connection) rather than a
+     *  per-file SMB status. Per-file statuses (NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
+     *  must NOT evict the shared connection. We key off message text since smbj's status
+     *  enums live across packages and the socket layer throws plain IOExceptions. */
+    private fun isConnectionError(t: Throwable): Boolean {
+        val text = buildString {
+            var e: Throwable? = t
+            while (e != null) { append(e.message ?: e::class.simpleName.orEmpty()); append(' '); e = e.cause }
+        }.uppercase()
+        return "TIMEOUT" in text || "TIMED OUT" in text || "SOCKET" in text ||
+            "CONNECTION" in text || "ECONNRESET" in text || "RESET" in text ||
+            "BROKEN PIPE" in text || "EOF" in text || "TRANSPORT" in text ||
+            "USER_SESSION_DELETED" in text || "NETWORK_NAME_DELETED" in text
     }
 
     override fun getUri(): Uri? = currentUri

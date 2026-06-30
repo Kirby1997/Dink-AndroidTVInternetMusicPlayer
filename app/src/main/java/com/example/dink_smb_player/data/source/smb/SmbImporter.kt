@@ -93,7 +93,9 @@ object SmbImporter {
         onProgress: (suspend (Int) -> Unit)? = null,
     ): Result<EnumResult> = withContext(Dispatchers.IO) {
         runCatching {
-            val disk = SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
+            // Fail fast if the share can't be reached at all. The walk itself re-acquires the
+            // DiskShare per list() (below) rather than capturing this handle — see [walk].
+            SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
             val out = ConcurrentHashMap<String, TrackEntity>() // dedupe overlapping roots by id
             // Flipped to false by [walk] if any directory listing fails — see [EnumResult].
             val complete = java.util.concurrent.atomic.AtomicBoolean(true)
@@ -127,7 +129,7 @@ object SmbImporter {
             val topRoots = dropNestedRoots(roots)
             coroutineScope {
                 for (root in topRoots) {
-                    launch { walk(this, gate, tagGate, context, disk, share, root, 0, out, existing, onNewTrack, complete) }
+                    launch { walk(this, gate, tagGate, context, creds, share, root, 0, out, existing, onNewTrack, complete) }
                 }
             }
             // Flush the trailing partial batch so the last <FLUSH_BATCH new files are
@@ -172,7 +174,7 @@ object SmbImporter {
         gate: Semaphore,
         tagGate: Semaphore,
         context: Context,
-        disk: DiskShare,
+        creds: SmbCreds?,
         share: SmbShare,
         smbPath: String,
         depth: Int,
@@ -184,10 +186,24 @@ object SmbImporter {
         // Hit the depth cap: deeper folders go unwalked, so the result is a subset —
         // mark incomplete so callers don't prune the tracks we never reached.
         if (depth > MAX_DEPTH) { complete.set(false); return }
+        // Re-acquire the share per list() instead of capturing one DiskShare for the whole
+        // walk. Two reasons: (1) SmbClient.share refreshes its idle timer + proactively
+        // reconnects a session the NAS dropped while idle — a captured handle bypasses that
+        // and every list() then blocks the full 30 s soTimeout, which is what made a reused
+        // walk crawl; (2) a concurrent tag-read's SmbDataSource.open can evict the cached
+        // connection, which would dead-handle a captured disk. Cache hit, so this is ~free.
         // Hold a permit only for the list() round-trip, not while waiting on children,
         // so the bounded pool never deadlocks on a deep tree.
         val entries: List<FileIdBothDirectoryInformation> = gate.withPermit {
-            runCatching { disk.list(smbPath) }.getOrNull()
+            fun acquire(): DiskShare =
+                SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
+            runCatching { acquire().list(smbPath) }.getOrElse {
+                // First list failed — the session may have been dropped server-side. Evict
+                // and reconnect once before giving up; a genuinely unreadable folder then
+                // still falls through to the incomplete path below.
+                SmbClient.close(share.id)
+                runCatching { acquire().list(smbPath) }.getOrNull()
+            }
         } ?: run {
             // Unreadable folder (transient network/SMB error). Skip it so a partial walk
             // still surfaces what it can — but mark the result incomplete so the caller
@@ -203,7 +219,7 @@ object SmbImporter {
             val isDir = (entry.fileAttributes and FileAttributes.FILE_ATTRIBUTE_DIRECTORY.value) != 0L
             val child = if (smbPath.isEmpty()) name else "$smbPath\\$name"
             if (isDir) {
-                jobs += scope.launch { walk(scope, gate, tagGate, context, disk, share, child, depth + 1, out, existing, onNewTrack, complete) }
+                jobs += scope.launch { walk(scope, gate, tagGate, context, creds, share, child, depth + 1, out, existing, onNewTrack, complete) }
             } else if (SmbSync.isAudio(name)) {
                 val id = trackIdFor(SourceType.Smb, share.id, child)
                 val reused = existing[id]
