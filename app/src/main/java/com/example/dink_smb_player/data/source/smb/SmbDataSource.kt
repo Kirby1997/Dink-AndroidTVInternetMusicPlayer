@@ -123,6 +123,22 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
         return n
     }
 
+    /**
+     * Random-access read at an ABSOLUTE file offset on the already-open handle — no re-open.
+     * The platform MP3 duration scanner issues hundreds of scattered reads per file; routing
+     * each through a fresh [open] meant a full SMB CREATE per seek (~636 CREATEs for one probe,
+     * ~20s over the network → the probe timed out and duration fell back to a bogus partial
+     * value). smbj's [File] is genuinely random-access, so reusing one open handle collapses
+     * that whole scan to a single CREATE. Returns -1 at real EOF. [open] must precede this.
+     */
+    fun readAtOffset(fileOffset: Long, buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        val f = file ?: throw IOException("readAtOffset before open()")
+        val n = f.read(buffer, fileOffset, offset, length)
+        if (n > 0) bytesTransferred(n)
+        return n // smbj returns -1 at EOF
+    }
+
     /** True when [t] reads as a transport/session failure (dead connection) rather than a
      *  per-file SMB status. Per-file statuses (NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
      *  must NOT evict the shared connection. We key off message text since smbj's status

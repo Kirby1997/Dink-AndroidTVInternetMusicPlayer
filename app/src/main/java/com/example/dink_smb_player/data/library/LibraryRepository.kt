@@ -379,6 +379,13 @@ object LibraryRepository {
      *  flooding the StateFlow + recomposition from many concurrent reads. */
     private const val PROGRESS_EMIT_MS = 250L
 
+    /** Implied-bitrate ceiling (kbps) above which a stored duration is treated as a bogus
+     *  truncated-probe artifact and re-probed. Lossy formats top out ~320, lossless ~1411
+     *  (CD) and a few thousand for hi-res; 700 sits clear of real lossy values while still
+     *  catching the thousands-of-kbps artifacts. Small files with heavy ID3 art can read a
+     *  little high — a harmless re-probe, idempotent if the duration was actually right. */
+    private const val BOGUS_DURATION_KBPS = 700.0
+
     /**
      * Re-read embedded tags for every already-indexed REMOTE track (SMB/cloud) and
      * merge any improvements in place. Fixes libraries imported before tag reading
@@ -400,7 +407,8 @@ object LibraryRepository {
         // with a real name AND a duration is skipped, so this is cheap to re-run and resumes
         // after an interrupt instead of re-reading 25k. The same probe fills both.
         val rows = dao.snapshot().first.filter {
-            it.sourceType != SourceType.Local && (looksFilenameDerived(it) || it.durationMs <= 0L)
+            it.sourceType != SourceType.Local &&
+                (looksFilenameDerived(it) || it.durationMs <= 0L || durationLooksBogus(it))
         }
         val total = rows.size
         if (total == 0) {
@@ -449,7 +457,7 @@ object LibraryRepository {
                                 // a real title → skip the 1-3s tag retrieve. Duration missing →
                                 // probe it; already present → skip a whole second SMB open.
                                 val tagsNeeded = looksFilenameDerived(row)
-                                val durationNeeded = row.durationMs <= 0L
+                                val durationNeeded = row.durationMs <= 0L || durationLooksBogus(row)
                                 val tags = TagReader.read(
                                     context,
                                     row.uri,
@@ -492,6 +500,17 @@ object LibraryRepository {
     private fun looksFilenameDerived(row: TrackEntity): Boolean {
         val stem = row.path.substringAfterLast('/').substringBeforeLast('.')
         return row.title.equals(stem, ignoreCase = true)
+    }
+
+    /** True when a stored duration is physically impossible for the file size — the implied
+     *  bitrate (sizeBytes*8 / durationMs, in kbps) exceeds [BOGUS_DURATION_KBPS]. Catches the
+     *  truncated-probe artifact (old 5s deadline reported fake 5-16s durations whose implied
+     *  bitrate ran to thousands of kbps; lossy audio tops out near 320, lossless near ~1400).
+     *  Such a row is re-probed by retag even though it already has a (wrong) duration > 0. */
+    private fun durationLooksBogus(row: TrackEntity): Boolean {
+        if (row.sizeBytes <= 0L || row.durationMs <= 0L) return false
+        val impliedKbps = row.sizeBytes * 8.0 / row.durationMs
+        return impliedKbps > BOGUS_DURATION_KBPS
     }
 
     /**
