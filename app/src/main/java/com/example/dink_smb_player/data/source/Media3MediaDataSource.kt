@@ -7,6 +7,7 @@ import androidx.media3.common.C
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import com.example.dink_smb_player.data.source.smb.DinkDataSourceFactory
+import com.example.dink_smb_player.data.source.smb.SmbDataSource
 
 /**
  * [MediaDataSource] adapter over a Media3 [androidx.media3.datasource.DataSource]
@@ -14,17 +15,17 @@ import com.example.dink_smb_player.data.source.smb.DinkDataSourceFactory
  * Lets the platform [android.media.MediaMetadataRetriever] read a remote track's
  * header / metadata atom over smbj or HTTP Range — no full download.
  *
- * One open handle is kept ALIVE across SEQUENTIAL [readAt] calls and only re-opened on an
- * actual seek (a [position] that isn't where the current handle is). This matters a lot:
- * the platform retriever parses MP4/M4A atom boxes with dozens of small back-to-back reads,
- * and opening a fresh SMB file (an SMB CREATE round-trip) per read made one duration probe
- * cost dozens of round-trips — minutes-per-thousand on a slow NAS, the bottleneck that made
- * the 25k duration rescan crawl. Sequential runs now collapse to a single open. A byte
- * [budgetBytes] still caps total transfer so a probe can never fall through to pulling a
- * whole file (past budget → EOF; the retriever stops).
+ * smb:// is genuinely random-access, so it gets a fast path: the file is opened ONCE and every
+ * [readAt] — including the platform retriever's hundreds of scattered frame-scan reads — is
+ * served by a positioned read on that single handle ([SmbDataSource.readAtOffset]) through a
+ * 512KB sequential read-ahead buffer. The old code re-opened the SMB file (a full SMB CREATE
+ * round-trip) on every non-sequential read, which cost ~636 opens for one duration probe and
+ * timed it out. Other schemes (http Range / gdrive) can't reposition a live stream, so they
+ * keep the re-open-on-seek fallback. A byte [budgetBytes] caps total transfer so a probe can
+ * never fall through to pulling a whole file (past budget → EOF; the retriever stops).
  *
- * Used by [DurationReader] (duration) and [com.example.dink_smb_player.data.art.ArtExtractor]
- * (embedded cover art).
+ * Used by [DurationReader] (the M4A/FLAC fallback path — MP3 duration goes through the much
+ * cheaper [Mp3DurationParser]) and [com.example.dink_smb_player.data.art.ArtExtractor].
  */
 internal class Media3MediaDataSource(
     context: Context,
@@ -42,6 +43,34 @@ internal class Media3MediaDataSource(
     private val factory = DinkDataSourceFactory(context.applicationContext)
     private var cachedSize: Long = -2 // -2 = not probed yet; -1 = unknown; >=0 = known
     private var consumed: Long = 0
+
+    // smb:// is genuinely random-access (one open handle, positioned reads). The platform
+    // duration scanner issues hundreds of scattered reads; serving each by re-opening the file
+    // cost a full SMB CREATE per seek (~636 per probe → 20s timeout). For smb we open ONCE and
+    // random-access via SmbDataSource.readAtOffset. Other schemes (http Range / gdrive) can't
+    // reposition a live stream, so they keep the re-open-on-seek fallback below.
+    private val isSmb = uri.startsWith("smb", ignoreCase = true)
+    private var smbSource: SmbDataSource? = null
+    private var smbTried = false
+
+    // Sequential read-ahead buffer for the SMB path. The platform scans a VBR MP3 frame-by-frame
+    // in tiny (~2KB) reads — ~1700 for one 3.5MB file — and these are SEQUENTIAL (seeks=0). One
+    // big SMB read per ~512KB serves hundreds of those tiny reads from memory, turning ~1700
+    // network round-trips into ~7. `consumed` counts only NETWORK bytes (refills), so the budget
+    // still bounds transfer and cache hits are free.
+    private val raBuf = ByteArray(512 * 1024)
+    private var raStart = -1L // file offset of raBuf[0]; -1 = empty
+    private var raLen = 0
+
+    // True once the stream was cut short by our budget / deadline / a read error — i.e. the
+    // retriever was handed a -1 (EOF) at a position BEFORE the real end of file. Crucial: the
+    // platform MediaMetadataRetriever does NOT discard a duration when it hits a premature EOF;
+    // it happily reports a duration derived from the PARTIAL bytes it managed to read, which is
+    // far too short. Callers (DurationReader) must treat a truncated probe as "no value" rather
+    // than trust that bogus short duration. Stays false when the underlying file is read fully
+    // to its real EOF, where the parsed duration is valid.
+    var truncated: Boolean = false
+        private set
 
     private fun pastDeadline(): Boolean =
         deadlineMs > 0L && android.os.SystemClock.elapsedRealtime() >= deadlineMs
@@ -66,12 +95,59 @@ internal class Media3MediaDataSource(
         return cachedSize
     }
 
+    /** Open the SMB handle once; all subsequent seeks random-access it. Null if this isn't an
+     *  smb URI or the open failed (then we fall back to the generic re-open path). */
+    private fun ensureSmb(): SmbDataSource? {
+        if (smbTried) return smbSource
+        smbTried = true
+        if (!isSmb) return null
+        // Construct SmbDataSource DIRECTLY — the factory hands back a MultiSchemeDataSource
+        // wrapper, not the bare smbj-backed source we need for random-access readAtOffset.
+        // SmbDataSource.open resolves creds from the global SmbConnectionRegistry, so it needs
+        // no context.
+        val ds = SmbDataSource()
+        try {
+            ds.open(DataSpec.Builder().setUri(uri).setPosition(0).build())
+            smbSource = ds
+        } catch (t: Throwable) {
+            runCatching { ds.close() }
+            truncated = true
+        }
+        return smbSource
+    }
+
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
         if (size == 0) return 0
-        if (consumed >= budgetBytes) return -1 // budget spent: stop the probe (EOF)
-        if (pastDeadline()) return -1 // time budget spent: stop the probe (EOF)
+        if (consumed >= budgetBytes) { truncated = true; return -1 } // budget spent: stop (false EOF)
+        if (pastDeadline()) { truncated = true; return -1 } // time budget spent: stop (false EOF)
 
-        // Re-open only on a seek; reuse the open handle when the read continues sequentially.
+        val want = minOf(size.toLong(), budgetBytes - consumed).toInt()
+
+        // SMB fast path: one open handle + read-ahead buffer — no CREATE per seek, and the
+        // platform's ~2KB sequential scan reads are served from memory between refills.
+        if (isSmb) {
+            val smb = ensureSmb() ?: return -1
+            // Refill when the requested offset isn't covered by the buffer.
+            if (raStart < 0 || position < raStart || position >= raStart + raLen) {
+                val cap = minOf(raBuf.size.toLong(), budgetBytes - consumed).toInt()
+                val n = try {
+                    smb.readAtOffset(position, raBuf, 0, cap)
+                } catch (t: Throwable) {
+                    truncated = true // read error mid-parse — stream is incomplete
+                    return -1
+                }
+                if (n <= 0) return -1 // n == -1 is a GENUINE EOF from smbj → valid, NOT truncated
+                raStart = position
+                raLen = n
+                consumed += n // budget bounds NETWORK transfer; cache hits below are free
+            }
+            val srcOff = (position - raStart).toInt()
+            val give = minOf(want, raLen - srcOff)
+            System.arraycopy(raBuf, srcOff, buffer, offset, give)
+            return give
+        }
+
+        // Generic fallback (http / gdrive / file): re-open on seek; reuse handle when sequential.
         if (openDs == null || position != cursor) {
             closeOpen()
             val ds = factory.createDataSource()
@@ -81,6 +157,7 @@ internal class Media3MediaDataSource(
                 ds.open(DataSpec.Builder().setUri(uri).setPosition(position).build())
             } catch (t: Throwable) {
                 runCatching { ds.close() }
+                truncated = true // open/seek failed mid-parse — stream is incomplete
                 return -1
             }
             openDs = ds
@@ -88,7 +165,6 @@ internal class Media3MediaDataSource(
         }
 
         val ds = openDs!!
-        val want = minOf(size.toLong(), budgetBytes - consumed).toInt()
         return try {
             var got = 0
             while (got < want) {
@@ -98,9 +174,12 @@ internal class Media3MediaDataSource(
             }
             consumed += got
             cursor += got
+            // got == 0 here is a GENUINE end-of-file (underlying ds returned END_OF_INPUT): the
+            // file was read fully, so the parsed duration is valid — do NOT mark truncated.
             if (got == 0) -1 else got
         } catch (t: Throwable) {
             closeOpen()
+            truncated = true // read error mid-parse — stream is incomplete
             -1
         }
     }
@@ -113,5 +192,7 @@ internal class Media3MediaDataSource(
 
     override fun close() {
         closeOpen()
+        runCatching { smbSource?.close() }
+        smbSource = null
     }
 }
