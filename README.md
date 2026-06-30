@@ -86,4 +86,6 @@ signing, Console setup) and **[PHASES.md](PHASES.md)** for the build plan of rec
 
 ## License
 
-All rights reserved. Personal project — not currently open for redistribution.
+Dink is released under the **[MIT License](LICENSE)** — use, modify, and redistribute it
+freely. Bundled open-source libraries and their licenses are listed in
+**[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)** and in-app under **Settings → About**.

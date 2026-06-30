@@ -2,6 +2,9 @@
 
 package com.example.dink_smb_player.ui.screens.settings
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -75,7 +78,7 @@ import com.example.dink_smb_player.ui.theme.UiScaleStep
  *  (e.g. the EQ shortcut on Now Playing → Audio). Mirrors the screen-as-state nav
  *  pattern used elsewhere (LibraryDetailNav). One-shot: consumed on read. */
 object SettingsNav {
-    /** 0 = Display, 1 = Audio, 2 = Lyrics, 3 = Library. */
+    /** 0 = Display, 1 = Audio, 2 = Lyrics, 3 = Library, 4 = About. */
     var initialTab: Int? = null
     fun consume(): Int? {
         val t = initialTab
@@ -116,7 +119,7 @@ fun SettingsScreen() {
             // Categories as D-pad tabs (switch on focus) instead of one long scroll.
             // Honour a deep-link target (e.g. the Now Playing EQ shortcut → Audio).
             var tab by remember { mutableStateOf(SettingsNav.consume() ?: 0) }
-            val tabs = listOf("Display", "Audio", "Lyrics", "Library")
+            val tabs = listOf("Display", "Audio", "Lyrics", "Library", "About")
             // Up from content returns to the ACTIVE tab (not the spatially-nearest one,
             // which would switch category). Bound to whichever tab is currently selected.
             val activeTabFocus = remember { FocusRequester() }
@@ -144,7 +147,10 @@ fun SettingsScreen() {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState()),
+                    .verticalScroll(rememberScrollState())
+                    // Scrollable bottom inset so the last line of any tab clears the 96dp
+                    // persistent MiniPlayer bar instead of being clipped behind it.
+                    .padding(bottom = 120.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp),
             ) {
                 when (tab) {
@@ -304,7 +310,7 @@ fun SettingsScreen() {
                     }
 
                     // ---- Library: maintenance ----
-                    else -> {
+                    3 -> {
                         Column(modifier = Modifier.width(720.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(text = "Library", style = type.cardTitle.copy(color = palette.ink0))
                             Text(
@@ -351,6 +357,9 @@ fun SettingsScreen() {
                             }
                         }
                     }
+
+                    // ---- About: version, source link, licenses ----
+                    else -> AboutTab(activeTabFocus = activeTabFocus, railReq = railReq)
                 }
             }
         }
@@ -453,6 +462,138 @@ private fun LyricToggleRow(
             )
         }
     }
+}
+
+/** Public source repository, also surfaced in Settings → About. */
+private const val GITHUB_URL = "https://github.com/Kirby1997/Dink-AndroidTVInternetMusicPlayer"
+
+/** Third-party libraries bundled in the app, with their licenses, for the in-app
+ *  acknowledgements. Most are Apache-2.0; jAudioTagger is LGPL-2.1. Keep in sync with
+ *  app/build.gradle.kts dependencies and THIRD-PARTY-NOTICES.md. */
+private val ACKNOWLEDGEMENTS = listOf(
+    "AndroidX (Core, AppCompat, Activity, Lifecycle, DataStore, Security, WorkManager)" to "Apache-2.0",
+    "Jetpack Compose + Compose for TV" to "Apache-2.0",
+    "Media3 / ExoPlayer" to "Apache-2.0",
+    "Kotlin, kotlinx-coroutines, kotlinx-serialization" to "Apache-2.0",
+    "smbj (SMB client)" to "Apache-2.0",
+    "OkHttp" to "Apache-2.0",
+    "jAudioTagger (embedded-tag reading)" to "LGPL-2.1",
+)
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun AboutTab(activeTabFocus: FocusRequester, railReq: FocusRequester) {
+    val palette = LocalDinkPalette.current
+    val type = LocalDinkType.current
+    val context = LocalContext.current
+    val version = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: ""
+    }
+
+    Column(modifier = Modifier.width(720.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(text = "Dink", style = type.cardTitle.copy(color = palette.ink0))
+            Text(
+                text = "Network music player for Android TV.",
+                style = type.body.copy(color = palette.ink2),
+            )
+            Text(
+                text = "Version $version · com.dink.player",
+                style = type.monoSmall.copy(color = palette.ink3),
+            )
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(text = "Source code", style = type.cardTitle.copy(color = palette.ink0))
+            Text(text = GITHUB_URL, style = type.monoSmall.copy(color = palette.ink2))
+            GhostButton(
+                label = "Open on GitHub",
+                onClick = {
+                    // Many TVs ship no browser; the URL text above lets it be typed on a
+                    // phone. Try to launch a viewer anyway, swallowing the absence.
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    } catch (_: ActivityNotFoundException) {
+                    }
+                },
+                // First focusable of About → Up returns to the active tab; Left → rail.
+                modifier = Modifier.focusProperties { left = railReq; up = activeTabFocus },
+            )
+        }
+
+        AboutCard(railReq = railReq) {
+            Text(text = "License", style = type.cardTitle.copy(color = palette.ink0))
+            Text(
+                text = "Dink is free software under the MIT License — you may use, modify, " +
+                    "and redistribute it. See the LICENSE file in the source repository.",
+                style = type.body.copy(color = palette.ink2),
+            )
+        }
+
+        Text(text = "Open-source libraries", style = type.cardTitle.copy(color = palette.ink0))
+        // Each library is its own focusable row so D-pad Down steps through them and the
+        // parent scroll follows — a single tall card would leave its lower half off-screen,
+        // behind the MiniPlayer, with no way to scroll to it.
+        ACKNOWLEDGEMENTS.forEach { (name, license) ->
+            AboutRow(text = "$name — $license", railReq = railReq)
+        }
+    }
+}
+
+/** A slim focusable row carrying one line of read-only text (an acknowledgement),
+ *  so it's reachable by D-pad and scrolls into view when focused. */
+@Composable
+private fun AboutRow(text: String, railReq: FocusRequester) {
+    val palette = LocalDinkPalette.current
+    val type = LocalDinkType.current
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (focused) palette.bg2 else palette.bg1)
+            .border(
+                width = if (focused) 2.dp else 1.dp,
+                color = if (focused) palette.accent else palette.lineStrong,
+                shape = RoundedCornerShape(12.dp),
+            )
+            .focusProperties { left = railReq }
+            .focusable(interactionSource = interaction)
+            .padding(horizontal = 18.dp, vertical = 14.dp),
+    ) {
+        Text(text = text, style = type.body.copy(color = if (focused) palette.ink0 else palette.ink2))
+    }
+}
+
+/** A focusable, bordered panel so its (otherwise non-focusable) text is reachable by
+ *  D-pad — focusing it lets the parent scroll bring the acknowledgements into view. */
+@Composable
+private fun AboutCard(railReq: FocusRequester, content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
+    val palette = LocalDinkPalette.current
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (focused) palette.bg2 else palette.bg1)
+            .border(
+                width = if (focused) 2.dp else 1.dp,
+                color = if (focused) palette.accent else palette.lineStrong,
+                shape = RoundedCornerShape(14.dp),
+            )
+            .focusProperties { left = railReq }
+            .focusable(interactionSource = interaction)
+            .padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        content = content,
+    )
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
