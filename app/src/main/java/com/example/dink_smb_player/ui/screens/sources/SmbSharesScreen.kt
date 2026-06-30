@@ -78,6 +78,14 @@ fun SmbSharesScreen(
     // the data source can't resolve `?sid=` back to a share config.
     LaunchedEffect(shares) { SmbConnectionRegistry.update(shares) }
 
+    // Grab content focus on entry, else focus is unbound on arrival and Compose
+    // hands it to the rail (drawer pops open / focus stranded at the rail top).
+    // contentFocus is bound to the "Add share" button below.
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(120)
+        runCatching { contentFocus.requestFocus() }
+    }
+
     // Track counts come from the persisted per-share total (updated on import), not
     // a live flat walk — browsing is lazy now. `importing` drives the card pill.
     val importing = SharesLibrary.importingShares
@@ -146,6 +154,7 @@ fun SmbSharesScreen(
                         share = share,
                         trackCount = share.trackCount,
                         syncing = importing[share.id] == true,
+                        importedSoFar = SharesLibrary.importProgress[share.id],
                         error = errors[share.id],
                         // Leftmost column (every 3rd card) routes Left → rail; interior
                         // columns keep spatial Left to the card on their left. `idx == 0`
@@ -198,6 +207,7 @@ private fun ShareCard(
     share: SmbShare,
     trackCount: Int,
     syncing: Boolean,
+    importedSoFar: SharesLibrary.ImportProgress?,
     error: String?,
     modifier: Modifier = Modifier,
     onOpen: () -> Unit,
@@ -247,7 +257,9 @@ private fun ShareCard(
         Text(
             text = when {
                 error != null -> error
-                syncing -> "Syncing…"
+                syncing && importedSoFar != null ->
+                    "Importing… ${"%,d".format(importedSoFar.found)} tracks (${"%.1f".format(importedSoFar.ratePerSec)}/s)"
+                syncing -> "Importing…"
                 else -> "$trackCount tracks · ${lastSyncLabel(share.lastSyncMs)}"
             },
             style = type.bodySmall.copy(color = if (error != null) palette.warn else palette.ink2),

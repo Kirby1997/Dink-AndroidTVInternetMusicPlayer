@@ -169,7 +169,9 @@ fun SmbBrowseScreen(
             Text(
                 text = when {
                     loading -> "Loading…"
-                    importing -> "Importing into library…"
+                    importing -> SharesLibrary.importProgress[share.id]
+                        ?.let { "Importing into library… ${"%,d".format(it.found)} found (${"%.1f".format(it.ratePerSec)}/s)" }
+                        ?: "Importing into library…"
                     error != null -> "Error: $error"
                     // "here" makes clear these counts are this folder's direct contents —
                     // Import is recursive, so the share-wide imported total is shown too.

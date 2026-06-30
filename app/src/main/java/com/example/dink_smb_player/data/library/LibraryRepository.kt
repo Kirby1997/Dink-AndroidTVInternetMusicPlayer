@@ -31,6 +31,7 @@ import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Single source of truth for *imported* playable tracks across every source (local,
@@ -48,6 +49,13 @@ object LibraryRepository {
 
     @Volatile private var restored = false
     private val restoreMutex = Mutex()
+
+    // Observable mirror of [restored] for the UI. Boot restore of a 25k-row index takes
+    // a few seconds; without this, library screens see an empty index and render the
+    // "nothing imported — add a source" empty state over a library that's about to load.
+    // Screens show a loading bar while this is false and the list is still empty.
+    private val _restored = MutableStateFlow(false)
+    val restoredState: StateFlow<Boolean> = _restored.asStateFlow()
 
     // Gates [persist]. Stays true normally, but flips false if a restore finds the
     // on-disk index present-but-unreadable: persisting then would snapshot an index
@@ -77,6 +85,7 @@ object LibraryRepository {
             }
         }
         restored = true
+        _restored.value = true
     }
 
     /**
@@ -140,6 +149,13 @@ object LibraryRepository {
     fun songsNow(context: Context): List<Song> =
         dao(context).snapshot().first.map(TrackEntity::toSong)
 
+    /** Synchronous count of indexed tracks — O(1) read of the in-memory list size, no
+     *  per-row [Song] mapping. Reflects [restore]/[upsertTracks] immediately, BEFORE the
+     *  async [songs] flow (which sorts on Dispatchers.Default) catches up. Screens use it
+     *  to tell "restored, has tracks, flow still propagating" (show loading) apart from
+     *  "restored, genuinely empty" (show empty state). */
+    fun trackCountNow(context: Context): Int = dao(context).snapshot().first.size
+
     fun recentlyAdded(context: Context, limit: Int = 30): Flow<List<Song>> =
         dao(context).observeRecentlyAdded(limit).map { rows -> rows.map(TrackEntity::toSong) }
             .flowOn(Dispatchers.Default)
@@ -201,17 +217,23 @@ object LibraryRepository {
         source: SourceEntity,
         freshTracks: List<TrackEntity>,
         scopePrefixes: List<String>,
+        // Prune rows under [scopePrefixes] that the scan didn't return. Only safe when the
+        // enumeration was COMPLETE — a partial/failed walk returns a subset, and pruning
+        // against it deletes real, still-present files. Pass the walk's `complete` flag.
+        prune: Boolean = true,
     ): Int {
         safeToPersist = true
         val dao = dao(context)
         dao.upsertSource(source)
-        val existing = dao.observeTracksFor(source.type, source.id).first()
-        val keepUris = buildSet {
-            existing.forEach { t -> if (scopePrefixes.none { t.path.startsWith(it) }) add(t.uri) }
-            freshTracks.forEach { add(it.uri) }
-        }
         dao.upsertTracks(freshTracks)
-        dao.pruneSource(source.type, source.id, keepUris.toList())
+        if (prune) {
+            val existing = dao.observeTracksFor(source.type, source.id).first()
+            val keepUris = buildSet {
+                existing.forEach { t -> if (scopePrefixes.none { t.path.startsWith(it) }) add(t.uri) }
+                freshTracks.forEach { add(it.uri) }
+            }
+            dao.pruneSource(source.type, source.id, keepUris.toList())
+        }
         val total = dao.observeTracksFor(source.type, source.id).first()
         dao.updateSourceStats(
             id = source.id,
@@ -236,19 +258,26 @@ object LibraryRepository {
         source: SourceEntity,
         freshTracks: List<TrackEntity>,
         monitoredPrefixes: List<String>,
+        // Prune monitored-folder rows the scan didn't return (i.e. deleted on the source).
+        // Only safe when the enumeration was COMPLETE. A flaky walk (NAS asleep right after
+        // a TV boot, transient network drop) returns a subset; pruning against it deletes
+        // real tracks and wipes the library. When false this is upsert-only — never deletes.
+        prune: Boolean = true,
     ) {
         if (monitoredPrefixes.isEmpty()) return
         val dao = dao(context)
-        val existing = dao.observeTracksFor(source.type, source.id).first()
-        // Keep: every row that is NOT inside a monitored folder, plus the fresh scan
-        // of the monitored folders. Anything under a monitored prefix and absent from
-        // the fresh scan was deleted on the source and gets pruned.
-        val keepUris = buildSet {
-            existing.forEach { t -> if (monitoredPrefixes.none { t.path.startsWith(it) }) add(t.uri) }
-            freshTracks.forEach { add(it.uri) }
-        }
         dao.upsertTracks(freshTracks)
-        dao.pruneSource(source.type, source.id, keepUris.toList())
+        if (prune) {
+            val existing = dao.observeTracksFor(source.type, source.id).first()
+            // Keep: every row that is NOT inside a monitored folder, plus the fresh scan
+            // of the monitored folders. Anything under a monitored prefix and absent from
+            // the fresh scan was deleted on the source and gets pruned.
+            val keepUris = buildSet {
+                existing.forEach { t -> if (monitoredPrefixes.none { t.path.startsWith(it) }) add(t.uri) }
+                freshTracks.forEach { add(it.uri) }
+            }
+            dao.pruneSource(source.type, source.id, keepUris.toList())
+        }
         val total = dao.observeTracksFor(source.type, source.id).first()
         dao.updateSourceStats(
             id = source.id,
@@ -268,12 +297,26 @@ object LibraryRepository {
      * rows and skips re-reading their tags. Authoritative (user-initiated import), so it
      * re-enables persistence after a failed restore.
      */
+    @Volatile private var lastBatchPersistMs = 0L
+    private val BATCH_PERSIST_INTERVAL_MS = 3_000L
+
     suspend fun upsertBatch(context: Context, tracks: List<TrackEntity>) {
         if (tracks.isEmpty()) return
         safeToPersist = true
         val dao = dao(context)
+        // The index is in-memory, so this upsert is cheap and immediately re-emits to
+        // the live `songs()` flow — that's what populates the Library view progressively.
         dao.upsertTracks(tracks)
-        persist(context)
+        // The disk snapshot (full JSON serialize) is the expensive part, so throttle it
+        // mid-walk instead of snapshotting on every batch. The caller's final importScoped
+        // persists unconditionally, so the completed import is always fully on disk; the
+        // only exposure is a crash losing ≤ this interval of un-snapshotted rows, which the
+        // next run re-reads cheaply (id reuse). Was: persist on every 500-track batch.
+        val now = System.currentTimeMillis()
+        if (now - lastBatchPersistMs >= BATCH_PERSIST_INTERVAL_MS) {
+            lastBatchPersistMs = now
+            persist(context)
+        }
     }
 
     suspend fun removeSource(context: Context, type: SourceType, sourceId: String) {
@@ -287,22 +330,54 @@ object LibraryRepository {
         dao(context).markPlayed(trackId, System.currentTimeMillis())
     }
 
-    /** Progress of an in-flight [retagAll], for the Settings UI. null = idle. */
-    data class RetagProgress(val done: Int, val total: Int, val changed: Int, val running: Boolean)
+    /** Progress of an in-flight [retagAll], for the Settings UI. null = idle.
+     *  [ratePerSec] is rows processed / elapsed wall time — surfaced so the UI can show
+     *  throughput and an ETA, and so a slow run reads as "2.7/s" rather than a frozen count. */
+    data class RetagProgress(
+        val done: Int,
+        val total: Int,
+        val changed: Int,
+        val running: Boolean,
+        val ratePerSec: Double = 0.0,
+    ) {
+        /** Seconds of work left at the current rate, or null until a rate is known. */
+        val etaSeconds: Long?
+            get() = if (ratePerSec > 0.0 && running) ((total - done) / ratePerSec).toLong() else null
+    }
 
     private val _retagProgress = MutableStateFlow<RetagProgress?>(null)
     val retagProgress: StateFlow<RetagProgress?> = _retagProgress.asStateFlow()
 
-    /** Max concurrent tag reads during a full rescan. Kept LOW: each read spins a full
-     *  Media3 extractor that buffers multi-MB chunks (M4A/MP4 pull the moov atom from
-     *  end-of-file), so high concurrency multiplies peak heap and OOMs on a 25k library.
-     *  Throughput here is memory-bound, not latency-bound — 6 in flight is the safe cap. */
-    private const val RETAG_CONCURRENCY = 6
+    /** Max concurrent tag reads for TAIL-LOADED containers (M4A/MP4/AAC/MOV). Kept LOW:
+     *  these pull the moov atom from end-of-file, so each read buffers multi-MB chunks and
+     *  high concurrency multiplies peak heap and OOMs on a 25k library. Memory-bound —
+     *  6 in flight is the safe cap. */
+    private const val RETAG_CONCURRENCY_HEAVY = 6
+
+    /** Max concurrent tag reads for FRONT-LOADED containers (MP3/FLAC/OGG/OPUS/WAV). Their
+     *  header sits at the start of the file, so a read pulls only a small header and peak
+     *  heap stays tiny regardless of concurrency. These are LATENCY-bound (waiting on SMB
+     *  round-trips), so more in flight directly lifts throughput on the common mostly-MP3
+     *  library. Sized well above the heavy cap; the two gates are independent. */
+    private const val RETAG_CONCURRENCY_LIGHT = 16
+
+    /** Container extensions whose metadata/duration live near END-OF-FILE (the moov atom),
+     *  so a read buffers large tail chunks and must stay on the low-concurrency gate. */
+    private val TAIL_LOADED_EXTS = setOf("m4a", "m4b", "mp4", "m4p", "aac", "mov")
+
+    /** True when [path]'s container buffers from end-of-file (see [TAIL_LOADED_EXTS]); such
+     *  rows go on the heavy (low-concurrency) gate, everything else on the light gate. */
+    private fun isTailLoaded(path: String): Boolean =
+        path.substringAfterLast('.', "").lowercase() in TAIL_LOADED_EXTS
 
     /** Rows per persisted chunk — bounds the crash-loss window. Peak memory is capped
-     *  by [RETAG_CONCURRENCY] (in-flight reads), not this, so it can be comfortably large
+     *  by [RETAG_CONCURRENCY_HEAVY] (in-flight reads), not this, so it can be comfortably large
      *  to keep full-index snapshot writes infrequent over a 25k rescan. */
     private const val RETAG_CHUNK = 500
+
+    /** Min gap between per-row progress emits. Keeps the count/rate visibly moving without
+     *  flooding the StateFlow + recomposition from many concurrent reads. */
+    private const val PROGRESS_EMIT_MS = 250L
 
     /**
      * Re-read embedded tags for every already-indexed REMOTE track (SMB/cloud) and
@@ -333,20 +408,54 @@ object LibraryRepository {
             return 0
         }
         _retagProgress.value = RetagProgress(0, total, 0, true)
-        val gate = Semaphore(RETAG_CONCURRENCY)
+        // Two independent gates: tail-loaded containers (M4A/MP4 — moov at EOF) buffer
+        // multi-MB tails so stay capped low to bound heap; front-loaded ones (MP3/FLAC)
+        // read a tiny header and are network-latency-bound, so run many more in flight.
+        val heavyGate = Semaphore(RETAG_CONCURRENCY_HEAVY)
+        val lightGate = Semaphore(RETAG_CONCURRENCY_LIGHT)
         val done = AtomicInteger(0)
         val changed = AtomicInteger(0)
-        // Process in chunks and persist after each: bounds peak heap (only one chunk's
-        // reads in flight) AND makes the rescan crash-resumable — a kill loses at most
-        // one chunk, and rows already persisted with real titles are skipped on rerun.
+        // Wall-clock start + last-emit guard: progress is published per ROW (not per 500-row
+        // chunk) so the UI count moves continuously instead of jumping once a chunk and
+        // looking frozen for minutes. Emits are time-throttled to avoid spamming the StateFlow
+        // from up to RETAG_CONCURRENCY_LIGHT coroutines at once.
+        val startMs = System.currentTimeMillis()
+        val lastEmitMs = AtomicLong(0L)
+        fun emitProgress(running: Boolean, force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            val prev = lastEmitMs.get()
+            if (!force && now - prev < PROGRESS_EMIT_MS) return
+            if (!force && !lastEmitMs.compareAndSet(prev, now)) return // another row just emitted
+            if (force) lastEmitMs.set(now)
+            val d = done.get()
+            val elapsedSec = (now - startMs) / 1000.0
+            val rate = if (elapsedSec > 0.0) d / elapsedSec else 0.0
+            _retagProgress.value = RetagProgress(d, total, changed.get(), running, rate)
+        }
+        // Process in chunks and persist after each: peak heap is bounded by the gates (only
+        // RETAG_CONCURRENCY_HEAVY tail-loaded reads buffer big tails at once), and chunking
+        // makes the rescan crash-resumable — a kill loses at most one chunk, and rows already
+        // persisted with real titles/durations are skipped on rerun.
         withContext(Dispatchers.IO) {
             rows.chunked(RETAG_CHUNK).forEach { chunk ->
                 val updates = Collections.synchronizedList(ArrayList<TrackEntity>())
                 coroutineScope {
                     chunk.forEach { row ->
                         launch {
+                            val gate = if (isTailLoaded(row.path)) heavyGate else lightGate
                             gate.withPermit {
-                                val tags = TagReader.read(context, row.uri)
+                                // Read over SMB ONLY the field this row is actually missing.
+                                // Title still filename-derived → re-read embedded tags; already
+                                // a real title → skip the 1-3s tag retrieve. Duration missing →
+                                // probe it; already present → skip a whole second SMB open.
+                                val tagsNeeded = looksFilenameDerived(row)
+                                val durationNeeded = row.durationMs <= 0L
+                                val tags = TagReader.read(
+                                    context,
+                                    row.uri,
+                                    tagsNeeded = tagsNeeded,
+                                    durationNeeded = durationNeeded,
+                                )
                                 if (tags != null) {
                                     val merged = row.copy(
                                         title = tags.title?.ifBlank { null } ?: row.title,
@@ -363,6 +472,7 @@ object LibraryRepository {
                                 }
                             }
                             done.incrementAndGet()
+                            emitProgress(running = true)
                         }
                     }
                 }
@@ -370,10 +480,10 @@ object LibraryRepository {
                     dao.upsertTracks(updates)
                     persist(context)
                 }
-                _retagProgress.value = RetagProgress(done.get(), total, changed.get(), true)
+                emitProgress(running = true, force = true)
             }
         }
-        _retagProgress.value = RetagProgress(total, total, changed.get(), false)
+        emitProgress(running = false, force = true)
         return changed.get()
     }
 

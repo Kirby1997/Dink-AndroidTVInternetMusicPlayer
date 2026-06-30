@@ -335,7 +335,14 @@ fun SettingsScreen() {
                                 modifier = Modifier.focusProperties { left = railReq; up = activeTabFocus },
                             )
                             retag?.let { p ->
-                                if (!p.running) {
+                                if (p.running) {
+                                    val rate = "%.1f".format(p.ratePerSec)
+                                    val eta = p.etaSeconds?.let { s -> " · ~%d:%02d left".format(s / 60, s % 60) } ?: ""
+                                    Text(
+                                        text = "$rate tracks/s$eta",
+                                        style = type.monoSmall.copy(color = palette.ink3),
+                                    )
+                                } else {
                                     Text(
                                         text = "Last rescan: updated ${p.changed} of ${p.total} tracks.",
                                         style = type.monoSmall.copy(color = palette.ink3),

@@ -55,6 +55,7 @@ import com.example.dink_smb_player.ui.components.GhostButton
 import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.components.ShelfRow
 import com.example.dink_smb_player.ui.components.SongCard
+import com.example.dink_smb_player.ui.components.ThinLoadingBar
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 
@@ -80,6 +81,9 @@ fun HomeScreen(
     // which source scanned it. Initial = synchronous snapshot so Home doesn't flash a
     // frame of empty content on (re)composition.
     val allSongs by remember(context) { LibraryRepository.songs(context) }.collectAsState()
+    // True until the on-disk index finishes loading at boot. Distinguishes a genuinely
+    // empty library from one that just hasn't been restored yet — see the feed == null branch.
+    val restored by LibraryRepository.restoredState.collectAsState()
     val recentPlayed by remember(context) { LibraryRepository.recentlyPlayed(context, 12) }
         .collectAsState(initial = emptyList())
     val recentAdded by remember(context) { LibraryRepository.recentlyAdded(context, 12) }
@@ -90,9 +94,19 @@ fun HomeScreen(
     }
 
     // Empty library → an invitation, not a barren hero. Keeps a focusable so the drawer
-    // can collapse onto content.
+    // can collapse onto content. But feed == null also happens transiently at cold boot,
+    // in two stages we must NOT show EmptyHome through:
+    //   1. restore() still parsing library_index.json (restored == false).
+    //   2. restore() done (restored == true) but the async songs() flow — which sorts on
+    //      Dispatchers.Default — hasn't re-emitted yet, so allSongs is still empty for a
+    //      frame even though the index already holds tracks.
+    // Gating on `restored` alone let stage 2 flash "nothing loaded" between the loading bar
+    // and the hero. So consult the SYNCHRONOUS index count, which reflects restore the
+    // instant it upserts: show EmptyHome only when restore is done AND the index is truly
+    // empty; otherwise we're still settling — show loading.
     if (feed == null) {
-        EmptyHome(onNavigate = onNavigate)
+        val indexEmpty = restored && LibraryRepository.trackCountNow(context) == 0
+        if (indexEmpty) EmptyHome(onNavigate = onNavigate) else HomeLoading()
         return
     }
 
@@ -220,6 +234,36 @@ private fun cardFocus(
     if (isLeftEdge) left = railRequester
     upTarget?.let { up = it }
     downTarget?.let { down = it }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
+@Composable
+private fun HomeLoading() {
+    val palette = LocalDinkPalette.current
+    val type = LocalDinkType.current
+    val contentFocus = LocalContentFocus.current
+    val railRequester = LocalRailFocusRequester.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(palette.bg0)
+            .padding(horizontal = 64.dp, vertical = 48.dp),
+    ) {
+        Column(
+            // Keep a focusable bound to contentFocus so the drawer can collapse onto
+            // content during the restore window, exactly as EmptyHome does.
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .widthIn(max = 640.dp)
+                .focusRequester(contentFocus)
+                .focusProperties { left = railRequester }
+                .focusable(),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Text("LOADING YOUR LIBRARY", style = type.monoSmall.copy(color = palette.ink3))
+            ThinLoadingBar(modifier = Modifier.widthIn(max = 360.dp))
+        }
+    }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)

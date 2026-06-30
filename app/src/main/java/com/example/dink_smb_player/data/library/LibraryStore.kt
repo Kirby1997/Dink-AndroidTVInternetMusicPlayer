@@ -7,10 +7,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.encodeToStream
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
@@ -50,13 +54,19 @@ object LibraryStore {
     private fun file(context: Context): File =
         File(context.applicationContext.filesDir, "library_index.json")
 
+    @OptIn(ExperimentalSerializationApi::class)
     suspend fun save(context: Context, tracks: List<TrackEntity>, sources: List<SourceEntity>) =
         withContext(Dispatchers.IO) {
             ioLock.withLock {
                 runCatching {
                     val f = file(context)
                     val tmp = File(f.parentFile, "${f.name}.tmp")
-                    tmp.writeText(json.encodeToString(Snapshot(tracks, sources)))
+                    // Stream the encode straight to the file instead of building one giant
+                    // String first — halves peak heap and avoids a full extra copy of a
+                    // multi-MB snapshot on every persist.
+                    BufferedOutputStream(FileOutputStream(tmp)).use { out ->
+                        json.encodeToStream(Snapshot(tracks, sources), out)
+                    }
                     // Atomic replace: a reader (or the next boot) sees either the old
                     // complete file or the new complete file, never a partial write.
                     Files.move(
@@ -70,11 +80,15 @@ object LibraryStore {
             }
         }
 
+    @OptIn(ExperimentalSerializationApi::class)
     suspend fun load(context: Context): LoadResult = withContext(Dispatchers.IO) {
         ioLock.withLock {
             val f = file(context)
             if (!f.exists()) return@withContext LoadResult.Missing
-            runCatching { json.decodeFromString<Snapshot>(f.readText()) }.fold(
+            // Parse straight off a buffered file stream — never materialises the whole
+            // file as a String, so cold-boot restore of a big index is faster and uses
+            // far less peak memory (the long pole before Home can show any track).
+            runCatching { f.inputStream().buffered().use { json.decodeFromStream<Snapshot>(it) } }.fold(
                 onSuccess = { LoadResult.Ok(it) },
                 onFailure = { t ->
                     // Preserve the unreadable file for inspection/recovery instead of

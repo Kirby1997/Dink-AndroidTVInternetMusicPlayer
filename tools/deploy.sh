@@ -5,8 +5,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 0
 
-PKG=com.example.dink_smb_player
-ACT=$PKG/.MainActivity
+# applicationId is com.dink.player (release prep); the Activity CLASS still lives in
+# the com.example.dink_smb_player namespace, so the component is PKG/<full-class>.
+# Mismatch here = installs the new package but force-stops/launches the old one,
+# leaving a stale build running (exactly what bit us once).
+PKG=com.dink.player
+ACT=$PKG/com.example.dink_smb_player.MainActivity
 APK=app/build/outputs/apk/debug/app-debug.apk
 STAMP=.deploy-stamp
 SERIAL=${DINK_SERIAL:-192.168.138.95:5555}
@@ -47,8 +51,11 @@ fi
 # Ensure device reachable (TV drops 5555 on sleep/reboot).
 adb connect "$SERIAL" >/dev/null 2>&1
 if ! adb -s "$SERIAL" get-state >/dev/null 2>&1; then
+  # Do NOT stamp here: the APK built but never reached the device. Stamping would
+  # mark this source as deployed, so later runs no-op against a device still on the
+  # old build (the TV drops 5555 on sleep/reboot — a common transient). Leave the
+  # gate dirty so the next run retries the install once the device is back.
   echo "[deploy] device $SERIAL offline — APK built, not installed" >&2
-  echo "$newest" > "$STAMP"
   exit 1
 fi
 

@@ -107,6 +107,9 @@ fun LibraryGroupScreen(
     val songs by songsFlow.collectAsState(
         initial = remember(context) { LibraryRepository.songsNow(context) },
     )
+    // False until the on-disk index finishes restoring at boot — drives a loading state
+    // so an empty list during restore isn't mistaken for an empty library.
+    val restored by LibraryRepository.restoredState.collectAsState()
     // Bucket the (up to 25k-song) library off the main thread — grouper does a
     // groupBy + sortedBy that froze navigation when run inline in composition.
     // null = still computing → show a thin loading bar instead of a blank list.
@@ -134,6 +137,7 @@ fun LibraryGroupScreen(
                 Text(title, style = type.screenTitle.copy(color = palette.ink0), maxLines = 1)
                 Text(
                     text = when {
+                        !restored && songs.isEmpty() -> "Loading library…"
                         groups == null -> "${songs.size} tracks"
                         groups?.isEmpty() == true -> "Nothing imported yet — add a source and import folders."
                         else -> "${groups?.size ?: 0} ${title.lowercase()} · ${songs.size} tracks"
@@ -175,7 +179,7 @@ fun LibraryGroupScreen(
         }
 
         val groupList = groups
-        if (groupList == null) {
+        if (groupList == null || (!restored && songs.isEmpty())) {
             ThinLoadingBar()
         } else if (groupList.isEmpty()) {
             // Empty library → a way out, not a dead end. Takes contentFocus (the Shuffle

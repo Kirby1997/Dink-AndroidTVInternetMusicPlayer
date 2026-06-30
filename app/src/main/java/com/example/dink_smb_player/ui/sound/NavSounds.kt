@@ -56,19 +56,25 @@ class NavSounds(
         enabled = value
     }
 
-    /** Focus moved onto a new menu item (rail hover / preview). */
+    /** Focus moved onto a new item (D-pad navigation tick). */
     fun move() {
-        if (enabled) audio?.playSoundEffect(AudioManager.FX_FOCUS_NAVIGATION_RIGHT, VOLUME)
+        // FX_KEY_CLICK, not FX_FOCUS_NAVIGATION_*: the directional nav effects are
+        // not populated in the sound pool on most Android TV builds and play silent,
+        // which is why navigation made no sound. FX_KEY_CLICK is the one effect proven
+        // audible here (commit uses it too), so reuse it softer for the move tick.
+        if (enabled) audio?.playSoundEffect(AudioManager.FX_KEY_CLICK, MOVE_VOLUME)
     }
 
     /** An item was committed (Enter / click). */
     fun select() {
-        if (enabled) audio?.playSoundEffect(AudioManager.FX_KEY_CLICK, VOLUME)
+        if (enabled) audio?.playSoundEffect(AudioManager.FX_KEY_CLICK, SELECT_VOLUME)
     }
 
     private companion object {
         // Soft relative to the music being played — a feedback tick, not a jingle.
-        const val VOLUME = 0.4f
+        // Move is quieter than commit so navigation and selection feel distinct.
+        const val MOVE_VOLUME = 0.25f
+        const val SELECT_VOLUME = 0.45f
     }
 }
 

@@ -10,8 +10,6 @@ import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
 import com.hierynomus.smbj.share.File
 import java.io.IOException
-import java.io.InputStream
-import java.net.URLDecoder
 import java.util.EnumSet
 
 /**
@@ -23,15 +21,18 @@ import java.util.EnumSet
  * we have no reliable way to map an arbitrary smb:// URI back to creds the user
  * once entered, so [open] throws.
  *
- * Seek strategy: smbj's [File.getInputStream] doesn't seek natively; we recreate
- * the stream and `skip` for each `position`. Most audio playback is sequential so
- * this only fires on user scrubs — fine for v1.
+ * Seek strategy: smbj [File] supports RANDOM-ACCESS positioned reads
+ * ([File.read] with a `fileOffset`), so we read from `position` directly. The old
+ * approach `skip`-ped an [java.io.InputStream] to the offset, which read-and-discarded
+ * every byte up to it — a seek near end-of-file (e.g. an M4A/MP4 `moov` atom, which
+ * holds DURATION) dragged the whole file over the network and timed out, so duration
+ * probes silently failed. Positioned reads make a tail seek cost only the bytes wanted.
  */
 class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
 
     private var currentUri: Uri? = null
     private var file: File? = null
-    private var stream: InputStream? = null
+    private var readOffset: Long = 0L
     private var bytesRemaining: Long = 0L
     private var opened: Boolean = false
 
@@ -46,35 +47,53 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             ?: throw IOException("Unknown SMB share id: $sid (was the share deleted?)")
         val creds = SmbConnectionRegistry.creds(sid)
 
-        val disk = try {
-            SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
-        } catch (t: Throwable) {
-            throw IOException("Failed to mount SMB share ${share.name}", t)
+        // Path segments are "[sharename, dir, sub, file.ext]". Uri.pathSegments already
+        // percent-DECODES each segment, so we must NOT URLDecoder.decode again: a filename
+        // with a literal '%' is stored as "%25", which getPath/pathSegments turns back into
+        // a bare '%' — a second decode then reads it as a broken escape ("%!") and throws,
+        // permanently blocking tags/duration/playback for that file. Drop the share name
+        // (first segment) and join the rest with smb's backslash separator.
+        val smbPath = uri.pathSegments.drop(1).joinToString("\\")
+
+        // Mount + open with ONE reconnect retry. The cached smbj connection can have been
+        // dropped server-side (idle NAS) without isConnected noticing; the first op then
+        // fails, so we evict the dead entry ([SmbClient.close]) and reconnect once. The
+        // idle-threshold reconnect in SmbClient.share avoids most of these, but a session
+        // dropped mid-use still lands here. Only one retry — a genuinely missing file or
+        // down host then surfaces as the error instead of looping.
+        var lastErr: Throwable? = null
+        var f: File? = null
+        for (attempt in 0..1) {
+            val disk = try {
+                SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
+            } catch (t: Throwable) {
+                lastErr = t
+                SmbClient.close(share.id)
+                continue
+            }
+            try {
+                f = disk.openFile(
+                    smbPath,
+                    EnumSet.of(AccessMask.GENERIC_READ),
+                    null,
+                    SMB2ShareAccess.ALL,
+                    SMB2CreateDisposition.FILE_OPEN,
+                    null,
+                )
+                break
+            } catch (t: Throwable) {
+                lastErr = t
+                // Only evict + retry when the failure looks connection-level (a dropped/dead
+                // session). A per-file error (FILE_NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
+                // means the connection is fine — tearing it down would poison every other
+                // concurrent read/list (e.g. an in-progress import walk) over the same share.
+                if (isConnectionError(t)) SmbClient.close(share.id) else break
+            }
         }
+        val openedFile = f ?: throw IOException("Failed to open SMB file $smbPath", lastErr)
+        file = openedFile
 
-        // URI path is "/sharename/dir/sub/file.ext" — strip leading slash + share name,
-        // decode percent-encoding, swap to smb's backslash separator.
-        val rawPath = uri.path.orEmpty().trimStart('/')
-        val afterShare = rawPath.removePrefix(share.shareName).trimStart('/')
-        val smbPath = afterShare
-            .split('/')
-            .joinToString("\\") { URLDecoder.decode(it, "UTF-8") }
-
-        val f = try {
-            disk.openFile(
-                smbPath,
-                EnumSet.of(AccessMask.GENERIC_READ),
-                null,
-                SMB2ShareAccess.ALL,
-                SMB2CreateDisposition.FILE_OPEN,
-                null,
-            )
-        } catch (t: Throwable) {
-            throw IOException("Failed to open SMB file $smbPath", t)
-        }
-        file = f
-
-        val totalLen = f.fileInformation.standardInformation.endOfFile
+        val totalLen = openedFile.fileInformation.standardInformation.endOfFile
         val position = dataSpec.position
         if (position > totalLen) throw IOException("Position $position past end-of-file $totalLen")
 
@@ -84,14 +103,8 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             dataSpec.length
         }
 
-        stream = f.inputStream.also { s ->
-            var toSkip = position
-            while (toSkip > 0L) {
-                val skipped = s.skip(toSkip)
-                if (skipped <= 0L) throw IOException("Failed to skip to offset $position")
-                toSkip -= skipped
-            }
-        }
+        // Positioned read — no whole-file skip to reach the offset (see class doc).
+        readOffset = position
 
         opened = true
         transferStarted(dataSpec)
@@ -102,26 +115,37 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
         if (length == 0) return 0
         if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
         val want = minOf(length.toLong(), bytesRemaining).toInt()
-        val n = try {
-            stream!!.read(buffer, offset, want)
-        } catch (t: IOException) {
-            throw t
-        }
+        val n = file!!.read(buffer, readOffset, offset, want)
         if (n == -1) return C.RESULT_END_OF_INPUT
+        readOffset += n
         bytesRemaining -= n
         bytesTransferred(n)
         return n
+    }
+
+    /** True when [t] reads as a transport/session failure (dead connection) rather than a
+     *  per-file SMB status. Per-file statuses (NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
+     *  must NOT evict the shared connection. We key off message text since smbj's status
+     *  enums live across packages and the socket layer throws plain IOExceptions. */
+    private fun isConnectionError(t: Throwable): Boolean {
+        val text = buildString {
+            var e: Throwable? = t
+            while (e != null) { append(e.message ?: e::class.simpleName.orEmpty()); append(' '); e = e.cause }
+        }.uppercase()
+        return "TIMEOUT" in text || "TIMED OUT" in text || "SOCKET" in text ||
+            "CONNECTION" in text || "ECONNRESET" in text || "RESET" in text ||
+            "BROKEN PIPE" in text || "EOF" in text || "TRANSPORT" in text ||
+            "USER_SESSION_DELETED" in text || "NETWORK_NAME_DELETED" in text
     }
 
     override fun getUri(): Uri? = currentUri
 
     override fun close() {
         try {
-            runCatching { stream?.close() }
             runCatching { file?.close() }
         } finally {
-            stream = null
             file = null
+            readOffset = 0L
             bytesRemaining = 0L
             currentUri = null
             if (opened) {

@@ -35,9 +35,25 @@ object SmbClient {
         SMBClient(cfg)
     }
 
-    private data class CacheEntry(val connection: Connection, val session: Session, val share: DiskShare)
+    private data class CacheEntry(
+        val connection: Connection,
+        val session: Session,
+        val share: DiskShare,
+        var lastUsedMs: Long,
+    )
 
     private val cache = ConcurrentHashMap<String, CacheEntry>()
+
+    /** A NAS silently drops an idle SMB session, but smbj's [DiskShare.isConnected]
+     *  reflects only the LOCAL socket state — a server-side idle-drop still reads as
+     *  "connected", so the next operation blocks to the 30 s soTimeout instead of
+     *  reconnecting. (This is what wedged the duration rescan: hours after launch every
+     *  read hung on the dead session.) So we also treat a cached share that's been idle
+     *  longer than this as stale and reconnect proactively — cheap (no round-trip), and
+     *  it turns the first read after an idle period into one ~600 ms reconnect instead of
+     *  a 30 s-per-read stall. During an active scan reuse stays hot (lastUsedMs refreshes
+     *  on every call), so this only fires after a genuine idle gap. */
+    private const val STALE_AFTER_IDLE_MS = 60_000L
 
     /**
      * Open or reuse a [DiskShare] for [shareId]. Throws on connect / auth / share
@@ -51,9 +67,14 @@ object SmbClient {
         shareName: String,
         creds: SmbCreds?,
     ): DiskShare {
+        val now = System.currentTimeMillis()
         cache[shareId]?.let { entry ->
-            if (entry.share.isConnected) return entry.share
-            // Stale — drop it and reopen below.
+            if (entry.share.isConnected && now - entry.lastUsedMs < STALE_AFTER_IDLE_MS) {
+                entry.lastUsedMs = now
+                return entry.share
+            }
+            // Locally closed, OR idle long enough that the server may have dropped the
+            // session — drop it and reopen below rather than risk a 30 s blocked read.
             runCatching { entry.share.close() }
             runCatching { entry.session.close() }
             runCatching { entry.connection.close() }
@@ -65,7 +86,7 @@ object SmbClient {
         } ?: AuthenticationContext.guest()
         val session = connection.authenticate(auth)
         val disk = session.connectShare(shareName) as DiskShare
-        cache[shareId] = CacheEntry(connection, session, disk)
+        cache[shareId] = CacheEntry(connection, session, disk, System.currentTimeMillis())
         return disk
     }
 

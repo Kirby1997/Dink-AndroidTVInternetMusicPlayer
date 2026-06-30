@@ -23,6 +23,11 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
@@ -105,6 +110,14 @@ fun DinkApp() {
     )
 
     // Persist tags the engine extracts while streaming (Phase 8.7) into the index.
+    // Surface playback source errors (e.g. a track whose file was moved/deleted on the
+    // share) as a toast — PlayerState auto-skips the bad track, this just tells the user.
+    LaunchedEffect(player.playbackError) {
+        val msg = player.playbackError ?: return@LaunchedEffect
+        toast.show(msg)
+        player.playbackError = null
+    }
+
     LaunchedEffect(player) {
         val app = context.applicationContext as? DinkApplication
         player.onMetadataResolved = { tags ->
@@ -228,9 +241,8 @@ fun DinkApp() {
         nav.go(t)
     }
     val previewNav: (ScreenId) -> Unit = { screen ->
-        // Rail hover: tick only when the focused item actually changes, so a fast
-        // D-pad sweep clicks per item instead of stuttering on repeated same-target events.
-        if (screen != previewTarget && screen != nav.current) navSounds.move()
+        // No move() tick here — the root onPreviewKeyEvent handler already ticks on
+        // every D-pad press, so ticking again on rail hover would double up.
         previewTarget = screen
     }
     val commitNav: (ScreenId) -> Unit = { screen ->
@@ -268,6 +280,21 @@ fun DinkApp() {
         Box(modifier = Modifier
             .fillMaxSize()
             .background(palette.bg0)
+            // Root D-pad tick: every directional key press anywhere (lists, grids,
+            // tabs, settings — not just the rail) gets a navigation click. Fires on
+            // KeyDown of the four directions only; Center/Enter is the commit click
+            // handled by select(). Never consumes (returns false) — pure feedback.
+            .onPreviewKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown && when (event.key) {
+                        Key.DirectionUp, Key.DirectionDown,
+                        Key.DirectionLeft, Key.DirectionRight -> true
+                        else -> false
+                    }
+                ) {
+                    navSounds.move()
+                }
+                false
+            }
             .semantics { testTagsAsResourceId = true }) {
             NavigationDrawer(
                 drawerContent = { drawerValue ->
