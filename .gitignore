@@ -30,3 +30,6 @@ logcat.txt
 *.zip
 Continuenextsession.txt
 .deploy-stamp
+
+# Smoke-test screenshots (regenerated locally, not source)
+tools/shots/
