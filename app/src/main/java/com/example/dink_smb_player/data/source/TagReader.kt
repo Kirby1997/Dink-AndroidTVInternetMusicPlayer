@@ -34,17 +34,29 @@ object TagReader {
 
     // Tag headers sit at the start of the file, so a healthy read returns in well under
     // a second. A long timeout only ever burns on untagged/unreadable files — and at 25k
-    // tracks that worst case dominates total rescan time. Keep it tight.
-    private const val TIMEOUT_SECONDS = 6L
+    // tracks that worst case dominates total rescan time. Keep it tight: 3s still clears
+    // a healthy read with margin on a slow NAS, but cuts the bad-file tail nearly in half.
+    private const val TIMEOUT_SECONDS = 3L
 
     /**
-     * [tagsNeeded] = false skips the embedded-tag retrieve and reads ONLY the duration.
-     * The duration rescan re-tags 25k rows; one with a real title (not filename-derived)
-     * needs only its missing duration, and the tag retrieve there is 1-6s of pure waste —
-     * it always finds nothing useful on those (the title is already as good as it gets).
-     * Skipping it is a big part of the rescan speed-up.
+     * [tagsNeeded] = false skips the embedded-tag retrieve. [durationNeeded] = false skips
+     * the duration probe. Both default true; the rescan turns each off independently per row
+     * so a file is opened over SMB ONLY for the field it's actually missing:
+     *
+     *  - a row with a real title (not filename-derived) but no duration → tagsNeeded=false:
+     *    skips the 1-3s tag retrieve, which always finds nothing useful there anyway.
+     *  - a filename-derived row that already HAS a duration → durationNeeded=false: skips a
+     *    whole second SMB open+header read (the duration probe is a separate retriever).
+     *
+     * Skipping the unneeded read halves the per-row network round-trips on rows that only
+     * miss one field, and is a big part of the rescan speed-up.
      */
-    fun read(context: Context, uri: String, tagsNeeded: Boolean = true): Tags? {
+    fun read(
+        context: Context,
+        uri: String,
+        tagsNeeded: Boolean = true,
+        durationNeeded: Boolean = true,
+    ): Tags? {
         val appContext = context.applicationContext
         val mm: MediaMetadata? = if (!tagsNeeded) null else {
             val sourceFactory = DefaultMediaSourceFactory(appContext)
@@ -77,8 +89,10 @@ object TagReader {
             }
         }
         // Duration is a separate platform-retriever probe — Media3 1.4's MetadataRetriever
-        // doesn't expose it. Header-only, byte-budgeted, time-capped, no download (see DurationReader).
-        val durationMs = DurationReader.read(appContext, uri)
+        // doesn't expose it. Header-only, byte-budgeted, time-capped, no download (see
+        // DurationReader). Skip it entirely when the caller already has a valid duration:
+        // that's a second SMB open+read saved on every row that only missed its title.
+        val durationMs = if (durationNeeded) DurationReader.read(appContext, uri) else null
         val tags = Tags(
             title = mm?.title?.toString()?.trim()?.ifBlank { null },
             artist = (mm?.artist ?: mm?.albumArtist)?.toString()?.trim()?.ifBlank { null },

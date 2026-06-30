@@ -170,7 +170,7 @@ fun SmbBrowseScreen(
                 text = when {
                     loading -> "Loading…"
                     importing -> SharesLibrary.importProgress[share.id]
-                        ?.let { "Importing into library… ${"%,d".format(it)} found" }
+                        ?.let { "Importing into library… ${"%,d".format(it.found)} found (${"%.1f".format(it.ratePerSec)}/s)" }
                         ?: "Importing into library…"
                     error != null -> "Error: $error"
                     // "here" makes clear these counts are this folder's direct contents —

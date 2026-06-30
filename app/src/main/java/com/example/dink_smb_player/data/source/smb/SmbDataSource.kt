@@ -10,7 +10,6 @@ import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
 import com.hierynomus.smbj.share.File
 import java.io.IOException
-import java.net.URLDecoder
 import java.util.EnumSet
 
 /**
@@ -48,13 +47,13 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
             ?: throw IOException("Unknown SMB share id: $sid (was the share deleted?)")
         val creds = SmbConnectionRegistry.creds(sid)
 
-        // URI path is "/sharename/dir/sub/file.ext" — strip leading slash + share name,
-        // decode percent-encoding, swap to smb's backslash separator.
-        val rawPath = uri.path.orEmpty().trimStart('/')
-        val afterShare = rawPath.removePrefix(share.shareName).trimStart('/')
-        val smbPath = afterShare
-            .split('/')
-            .joinToString("\\") { URLDecoder.decode(it, "UTF-8") }
+        // Path segments are "[sharename, dir, sub, file.ext]". Uri.pathSegments already
+        // percent-DECODES each segment, so we must NOT URLDecoder.decode again: a filename
+        // with a literal '%' is stored as "%25", which getPath/pathSegments turns back into
+        // a bare '%' — a second decode then reads it as a broken escape ("%!") and throws,
+        // permanently blocking tags/duration/playback for that file. Drop the share name
+        // (first segment) and join the rest with smb's backslash separator.
+        val smbPath = uri.pathSegments.drop(1).joinToString("\\")
 
         // Mount + open with ONE reconnect retry. The cached smbj connection can have been
         // dropped server-side (idle NAS) without isConnected noticing; the first op then

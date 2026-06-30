@@ -207,7 +207,7 @@ private fun ShareCard(
     share: SmbShare,
     trackCount: Int,
     syncing: Boolean,
-    importedSoFar: Int?,
+    importedSoFar: SharesLibrary.ImportProgress?,
     error: String?,
     modifier: Modifier = Modifier,
     onOpen: () -> Unit,
@@ -257,7 +257,8 @@ private fun ShareCard(
         Text(
             text = when {
                 error != null -> error
-                syncing && importedSoFar != null -> "Importing… ${"%,d".format(importedSoFar)} tracks"
+                syncing && importedSoFar != null ->
+                    "Importing… ${"%,d".format(importedSoFar.found)} tracks (${"%.1f".format(importedSoFar.ratePerSec)}/s)"
                 syncing -> "Importing…"
                 else -> "$trackCount tracks · ${lastSyncLabel(share.lastSyncMs)}"
             },
