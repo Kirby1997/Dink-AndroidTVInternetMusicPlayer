@@ -35,6 +35,11 @@ data class TrackEntity(
     val addedAtMs: Long,
     val lastPlayedMs: Long? = null,
     val playCount: Int = 0,
+    // Wall-clock of the last retag attempt on this row (any outcome). A normal retag skips rows
+    // that already carry one, so the unfixable residue (already-correct titles that happen to
+    // equal the filename, or genuinely untagged files) stops being re-checked on every press.
+    // null = never attempted. A forced retag ignores it. Defaulted so old snapshots deserialize.
+    val retagAttemptedMs: Long? = null,
 )
 
 @Serializable

@@ -322,21 +322,22 @@ fun SettingsScreen() {
                                 style = type.body.copy(color = palette.ink2),
                             )
                             val running = retag?.running == true
+                            // Launch on the app scope so the rescan survives leaving this screen.
+                            fun startRetag(force: Boolean) {
+                                if (running) return
+                                val appScope = (context.applicationContext as? DinkApplication)?.appScope
+                                if (appScope != null) {
+                                    appScope.launch { LibraryRepository.retagAll(context.applicationContext, force) }
+                                } else {
+                                    scope.launch { LibraryRepository.retagAll(context.applicationContext, force) }
+                                }
+                            }
                             GhostButton(
                                 label = when {
                                     running -> "Rescanning… ${retag?.done ?: 0} / ${retag?.total ?: 0}"
                                     else -> "Re-read tags from files"
                                 },
-                                onClick = {
-                                    if (!running) {
-                                        val appScope = (context.applicationContext as? DinkApplication)?.appScope
-                                        if (appScope != null) {
-                                            appScope.launch { LibraryRepository.retagAll(context.applicationContext) }
-                                        } else {
-                                            scope.launch { LibraryRepository.retagAll(context.applicationContext) }
-                                        }
-                                    }
-                                },
+                                onClick = { startRetag(force = false) },
                                 // Top focusable of Library → Up returns to the active tab.
                                 modifier = Modifier.focusProperties { left = railReq; up = activeTabFocus },
                             )
@@ -355,6 +356,20 @@ fun SettingsScreen() {
                                     )
                                 }
                             }
+                            // A normal re-read skips tracks it has already tried once (so the run
+                            // gets quick after the first pass). Force re-reads EVERY track — use it
+                            // after fixing tags at the source, or if something still looks wrong.
+                            Text(
+                                text = "Force re-reads every track, including ones already checked. " +
+                                    "Slower; use after editing tags on the server.",
+                                style = type.body.copy(color = palette.ink2),
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                            GhostButton(
+                                label = if (running) "Rescanning…" else "Force full re-tag",
+                                onClick = { startRetag(force = true) },
+                                modifier = Modifier.focusProperties { left = railReq },
+                            )
                         }
                     }
 

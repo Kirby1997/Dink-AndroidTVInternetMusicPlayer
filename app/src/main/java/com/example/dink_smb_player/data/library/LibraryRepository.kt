@@ -399,16 +399,22 @@ object LibraryRepository {
      * Reads run bounded-concurrent off the main thread; the index is persisted once at
      * the end, not per row. Call from a long-lived scope (appScope) — it can take minutes.
      */
-    suspend fun retagAll(context: Context): Int {
+    suspend fun retagAll(context: Context, force: Boolean = false): Int {
         if (_retagProgress.value?.running == true) return 0
         val dao = dao(context)
         // Remote rows that still look filename-derived (title == file stem) OR are missing
         // a duration (durationMs <= 0 — imported before duration reading existed). A row
         // with a real name AND a duration is skipped, so this is cheap to re-run and resumes
         // after an interrupt instead of re-reading 25k. The same probe fills both.
+        //
+        // Every processed row is stamped with retagAttemptedMs, and a normal run skips rows that
+        // already carry one — so the unfixable residue (correct titles that happen to equal the
+        // filename; genuinely untagged files) is read ONCE and then never re-checked. A forced
+        // run ([force]) ignores the stamp and re-reads every candidate.
         val rows = dao.snapshot().first.filter {
             it.sourceType != SourceType.Local &&
-                (looksFilenameDerived(it) || it.durationMs <= 0L || durationLooksBogus(it))
+                (force || it.retagAttemptedMs == null) &&
+                (looksFilenameDerived(it) || it.durationMs <= 0L || durationLooksBogus(it) || hasMojibake(it))
         }
         val total = rows.size
         if (total == 0) {
@@ -464,8 +470,13 @@ object LibraryRepository {
                                     tagsNeeded = tagsNeeded,
                                     durationNeeded = durationNeeded,
                                 )
-                                if (tags != null) {
-                                    val merged = row.copy(
+                                // Merge any tags we read over the existing row (unchanged when the
+                                // read found nothing), then repair any field still carrying mojibake
+                                // from a corrupt embedded tag by re-deriving it from the file path —
+                                // the same folder/filename source used at import. Self-healing: once
+                                // a row's fields are clean it no longer matches the retag filter.
+                                var merged = if (tags != null) {
+                                    row.copy(
                                         title = tags.title?.ifBlank { null } ?: row.title,
                                         artist = tags.artist?.ifBlank { null } ?: row.artist,
                                         albumTitle = tags.album?.ifBlank { null } ?: row.albumTitle,
@@ -473,11 +484,27 @@ object LibraryRepository {
                                         trackNumber = tags.trackNumber ?: row.trackNumber,
                                         durationMs = tags.durationMs?.takeIf { it > 0 } ?: row.durationMs,
                                     )
-                                    if (merged != row) {
-                                        updates.add(merged)
-                                        changed.incrementAndGet()
-                                    }
+                                } else {
+                                    row
                                 }
+                                if (looksMojibake(merged.title) || looksMojibake(merged.artist) ||
+                                    looksMojibake(merged.albumTitle)
+                                ) {
+                                    val (pdTitle, pdArtist, pdAlbum) = pathDerivedNames(row.path)
+                                    merged = merged.copy(
+                                        title = if (looksMojibake(merged.title)) pdTitle else merged.title,
+                                        artist = if (looksMojibake(merged.artist)) pdArtist else merged.artist,
+                                        albumTitle = if (looksMojibake(merged.albumTitle)) pdAlbum else merged.albumTitle,
+                                    )
+                                }
+                                // A real content change (name/duration/etc) counts toward the
+                                // "updated N" the UI shows. Regardless, stamp the row as attempted
+                                // so a normal rerun skips it — this is what stops the residue from
+                                // being re-read on every press.
+                                val contentChanged = merged != row
+                                if (contentChanged) changed.incrementAndGet()
+                                val stamped = merged.copy(retagAttemptedMs = System.currentTimeMillis())
+                                if (stamped != row) updates.add(stamped)
                             }
                             done.incrementAndGet()
                             emitProgress(running = true)
@@ -500,6 +527,36 @@ object LibraryRepository {
     private fun looksFilenameDerived(row: TrackEntity): Boolean {
         val stem = row.path.substringAfterLast('/').substringBeforeLast('.')
         return row.title.equals(stem, ignoreCase = true)
+    }
+
+    /** True when any name field carries mojibake (UTF-8 bytes that got decoded as Latin-1) —
+     *  e.g. an old import that mis-read a tag. Retag re-selects such rows and repairs them from
+     *  the path; once clean they no longer match, so this doesn't loop. */
+    private fun hasMojibake(row: TrackEntity): Boolean =
+        looksMojibake(row.title) || looksMojibake(row.artist) || looksMojibake(row.albumTitle)
+
+    private fun looksMojibake(s: String?): Boolean {
+        if (s == null) return false
+        for (i in s.indices) {
+            val c = s[i].code
+            if (c == 0xFFFD) return true // replacement char
+            // U+00C2/C3/C5 (Â/Ã/Å) followed by a Latin-1 continuation byte = UTF-8-as-Latin-1.
+            if ((c == 0xC2 || c == 0xC3 || c == 0xC5) && i + 1 < s.length && s[i + 1].code in 0x80..0xBF) return true
+        }
+        return false
+    }
+
+    /** Re-derive (title, artist, album) from a track's path the way import does: filename stem
+     *  for the title, the grandparent folder for the artist, the parent folder for the album.
+     *  Used to repair fields whose stored value is corrupt (mojibake). */
+    private fun pathDerivedNames(path: String): Triple<String, String?, String?> {
+        val parts = path.split('/').filter { it.isNotEmpty() }
+        val fileName = parts.lastOrNull() ?: path
+        return Triple(
+            fileName.substringBeforeLast('.'),
+            parts.dropLast(2).lastOrNull(),
+            parts.dropLast(1).lastOrNull(),
+        )
     }
 
     /** True when a stored duration is physically impossible for the file size — the implied

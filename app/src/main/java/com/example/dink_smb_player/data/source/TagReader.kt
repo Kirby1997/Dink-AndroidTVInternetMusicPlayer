@@ -17,6 +17,10 @@ import java.util.concurrent.TimeUnit
  * smbj or HTTP Range. `Metadata.Entry.populateMediaMetadata` decodes every tag
  * format into a single [MediaMetadata], so there's no per-format parsing here.
  *
+ * Media3's Mp3Extractor only surfaces ID3v2 tags at the FILE START. A large share of older
+ * / ExactAudioCopy-ripped MP3s carry their tags only at the END (ID3v1 / APEv2) — for those
+ * the retrieve returns nothing, and we fall back to [TagFallbackReader].
+ *
  * Blocks (network) — call from Dispatchers.IO. Returns null when the file has no
  * usable tags, the read times out, or anything goes wrong: callers then keep their
  * filename/folder-derived values.
@@ -32,11 +36,11 @@ object TagReader {
         val durationMs: Long? = null,
     )
 
-    // Tag headers sit at the start of the file, so a healthy read returns in well under
-    // a second. A long timeout only ever burns on untagged/unreadable files — and at 25k
-    // tracks that worst case dominates total rescan time. Keep it tight: 3s still clears
-    // a healthy read with margin on a slow NAS, but cuts the bad-file tail nearly in half.
-    private const val TIMEOUT_SECONDS = 3L
+    // ID3v2 headers sit at the start of the file, so a healthy read returns well under a second.
+    // A longer timeout only ever burns on untagged/unreadable files. Kept at 10s (not 3s): a slow
+    // NAS legitimately takes several seconds to serve an MP3 whose first audio frame is pushed
+    // megabytes in by a large embedded ID3v2 cover, and 3s was cutting those valid reads short.
+    private const val TIMEOUT_SECONDS = 10L
 
     /**
      * [tagsNeeded] = false skips the embedded-tag retrieve. [durationNeeded] = false skips
@@ -93,7 +97,7 @@ object TagReader {
         // DurationReader). Skip it entirely when the caller already has a valid duration:
         // that's a second SMB open+read saved on every row that only missed its title.
         val durationMs = if (durationNeeded) DurationReader.read(appContext, uri) else null
-        val tags = Tags(
+        var tags = Tags(
             title = mm?.title?.toString()?.trim()?.ifBlank { null },
             artist = (mm?.artist ?: mm?.albumArtist)?.toString()?.trim()?.ifBlank { null },
             album = mm?.albumTitle?.toString()?.trim()?.ifBlank { null },
@@ -101,6 +105,20 @@ object TagReader {
             trackNumber = mm?.trackNumber,
             durationMs = durationMs?.takeIf { it > 0 },
         )
+        // Media3 found no ID3v2 at the file start → this is likely an ID3v1/APEv2-only MP3
+        // (common in old / EAC-ripped libraries). Read the trailing tag ourselves. Gated to
+        // MP3 so non-ID3 containers (M4A/FLAC) don't pay a wasted SMB open on every row.
+        if (tagsNeeded && tags.title == null && uri.substringBefore('?').endsWith(".mp3", ignoreCase = true)) {
+            TagFallbackReader.read(appContext, uri)?.let { fb ->
+                tags = tags.copy(
+                    title = tags.title ?: fb.title,
+                    artist = tags.artist ?: fb.artist,
+                    album = tags.album ?: fb.album,
+                    year = tags.year ?: fb.year,
+                    trackNumber = tags.trackNumber ?: fb.trackNumber,
+                )
+            }
+        }
         // All-null (no tags AND no duration) → treat as nothing so the caller keeps its
         // path-derived values.
         return if (tags == Tags()) null else tags
