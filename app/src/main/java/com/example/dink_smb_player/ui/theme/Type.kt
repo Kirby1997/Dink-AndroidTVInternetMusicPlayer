@@ -13,7 +13,9 @@ data class DinkType(
     val screenTitle: TextStyle = TextStyle(
         fontFamily = SoraFamily,
         fontWeight = FontWeight.Bold,
-        fontSize = 56.sp,
+        // 56sp read oversized on a 10-foot TV and, with the header padding, pushed the
+        // Albums/Artists grid down to ~1 visible row. 36sp keeps hierarchy, reclaims height.
+        fontSize = 36.sp,
         letterSpacing = (-0.025).em,
     ),
     val sectionTitle: TextStyle = TextStyle(

@@ -54,6 +54,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
@@ -196,7 +197,7 @@ fun LibraryGroupScreen(
         value = withContext(Dispatchers.Default) { hasUntaggedTracks(songs) }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 24.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 16.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -230,7 +231,7 @@ fun LibraryGroupScreen(
             }
         }
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(12.dp))
 
         // Tap any group → its detail track list (play/shuffle/queue live there). Remember which
         // tile we opened so Back can scroll here and refocus it (see grid/list below).
@@ -267,8 +268,10 @@ fun LibraryGroupScreen(
             // instead of moving across the grid — same bug class as the Settings tab row.
             BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                 // Smaller tiles → more per row. 168dp only fit 5 across and read oversized on
-                // a 10-foot TV; 124dp packs ~7-8 so the wall-of-albums scans faster.
-                val minTile = 124.dp
+                // a 10-foot TV; 104dp packs ~8 so the wall-of-albums scans faster and more
+                // rows fit vertically (square art is as tall as a tile is wide, so narrower
+                // tiles are also shorter — the main lever on how many rows are visible).
+                val minTile = 104.dp
                 val gap = 16.dp
                 val columns = maxOf(1, ((maxWidth + gap) / (minTile + gap)).toInt())
                 // Restore scroll to where we were when we last left this facet, and save it
@@ -380,7 +383,7 @@ private fun GroupTile(
         interactionSource = interaction,
         modifier = modifier,
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (art != null) {
                 CoverArt(
                     song = rep,
@@ -391,7 +394,9 @@ private fun GroupTile(
                 )
             }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(group.title, style = type.cardTitle.copy(color = palette.ink0), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // 2 lines so narrow tiles don't clip long album/artist names to "…"; smaller
+                // cardTitle keeps the two lines from dominating the shorter tile.
+                Text(group.title, style = type.cardTitle.copy(color = palette.ink0, fontSize = 17.sp), maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text(group.subtitle, style = type.monoSmall.copy(color = palette.ink3), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
