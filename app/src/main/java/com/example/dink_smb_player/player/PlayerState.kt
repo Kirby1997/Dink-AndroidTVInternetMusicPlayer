@@ -19,10 +19,15 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.compose.runtime.snapshotFlow
+import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.LyricLine
 import com.example.dink_smb_player.data.model.Song
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.drop
 
 enum class RepeatMode { Off, All, One }
 
@@ -78,6 +83,15 @@ class PlayerState(
     var karaokeMode by mutableStateOf(false)
         private set
 
+    /** True once the app has attempted to restore the last-played session at launch
+     *  (see [rememberPlayerState]). Home waits for this before its own position-0 preload
+     *  of the resume track, so a real saved session (track + position + queue) always wins
+     *  the race over the Home shortcut. */
+    var sessionRestoreDone by mutableStateOf(false)
+        private set
+
+    internal fun markRestoreDone() { sessionRestoreDone = true }
+
     /** Transient, user-facing playback error (e.g. a track whose file vanished from the
      *  share). Set when a source fails; the UI observes it to toast, then clears it. */
     var playbackError by mutableStateOf<String?>(null)
@@ -105,6 +119,11 @@ class PlayerState(
     // rebuilds the window. Within a window, gapless + auto-advance are the engine's.
     private val engineWindow = 400
     private var engineBase = 0
+
+    // Start position (ms) to seed into the engine on the NEXT applyQueueToEngine, then
+    // cleared. Set only when resuming a persisted session so playback picks up where the
+    // user left off; normal playFrom/load start at 0.
+    private var pendingSeekMs: Long = 0L
 
     private val isWindowed: Boolean get() = _queue.size > engineWindow
 
@@ -532,13 +551,15 @@ class PlayerState(
             player.clearMediaItems()
             return
         }
+        // Consume any resume position exactly once; normal (re)apply starts at 0.
+        val startMs = pendingSeekMs.also { pendingSeekMs = 0L }
         if (isQueueAllUri()) {
             val center = currentIndex.coerceIn(0, _queue.lastIndex)
             val range = windowRange(center)
             engineBase = range.first
             val items = range.map { mediaItemFor(_queue[it]) }
             val startInWindow = (center - engineBase).coerceIn(0, items.lastIndex)
-            player.setMediaItems(items, startInWindow, 0L)
+            player.setMediaItems(items, startInWindow, startMs)
             // Repeat-All across the whole (possibly windowed) queue is driven by
             // moveTo/onTrackEnded; shuffle is baked into queue order. Engine does neither.
             player.repeatMode = engineRepeatMode()
@@ -553,7 +574,7 @@ class PlayerState(
             player.clearMediaItems()
             return
         }
-        player.setMediaItem(mediaItemFor(song))
+        player.setMediaItem(mediaItemFor(song), startMs)
         player.prepare()
         player.playWhenReady = autoplay
     }
@@ -591,6 +612,64 @@ class PlayerState(
         repeatMode == RepeatMode.All -> Player.REPEAT_MODE_ALL
         else -> Player.REPEAT_MODE_ONE
     }
+
+    // --- Session persistence ---------------------------------------------------
+
+    /** A cheap value that changes whenever the persisted-worthy STRUCTURE of the session
+     *  changes (track, order, modes, queue length) — but NOT on every position tick. The
+     *  persistence loop keys a debounced save on this; position is captured at save time. */
+    fun saveSignature(): String =
+        "${currentSong?.id}|$currentIndex|$shuffle|$repeatMode|${_queue.size}"
+
+    /** Snapshot of the current session for [PlaybackStore], or null when nothing is
+     *  playing. Windows the queue to [PlaybackStore.MAX_QUEUE] ids centred on the current
+     *  track (see PlaybackStore) and records the position, so a relaunch resumes here. */
+    fun snapshot(): PlaybackStore.Snapshot? {
+        if (_queue.isEmpty() || currentIndex !in _queue.indices) return null
+        val max = PlaybackStore.MAX_QUEUE
+        val start = if (_queue.size <= max) 0
+            else (currentIndex - max / 2).coerceIn(0, _queue.size - max)
+        val end = minOf(_queue.size, start + max)
+        return PlaybackStore.Snapshot(
+            queueIds = _queue.subList(start, end).map { it.id },
+            index = currentIndex - start,
+            positionSec = timeSec,
+            shuffle = shuffle,
+            repeat = repeatMode.name,
+        )
+    }
+
+    /** Rebuild a persisted session. Resolves ids through [byId] (rows deleted from the
+     *  library since last run just drop out); restores PAUSED and seeks to the saved
+     *  position when playback starts. No-ops if the current queue is already populated
+     *  (a live session must never be clobbered) or nothing resolves. */
+    fun restore(snapshot: PlaybackStore.Snapshot, byId: Map<String, Song>) {
+        if (_queue.isNotEmpty()) return
+        val songs = snapshot.queueIds.mapNotNull { byId[it] }
+        if (songs.isEmpty()) return
+        // Keep the current track pinned even if earlier ids dropped: find it by its old
+        // window index, then locate where it landed after the mapNotNull compaction.
+        val wantedId = snapshot.queueIds.getOrNull(snapshot.index)
+        val idx = (wantedId?.let { id -> songs.indexOfFirst { it.id == id } } ?: -1)
+            .let { if (it >= 0) it else snapshot.index.coerceIn(0, songs.lastIndex) }
+        _queue.clear()
+        _queue.addAll(songs)
+        baseOrder = songs
+        currentIndex = idx
+        val song = songs[idx]
+        currentSong = song
+        currentAlbum = albumLookup(song.albumId)
+        lyrics = emptyList()
+        shuffle = snapshot.shuffle
+        repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeat) }.getOrDefault(RepeatMode.Off)
+        val posSec = snapshot.positionSec.coerceAtLeast(0f)
+        timeSec = posSec
+        isPlaying = false
+        pendingSeekMs = (posSec * 1000).toLong()
+        // Applies now if the engine is already bound; otherwise attachEngine() re-applies
+        // with autoplay = isPlaying (false) and honours pendingSeekMs.
+        applyQueueToEngine(autoplay = false)
+    }
 }
 
 @Composable
@@ -626,6 +705,41 @@ fun rememberPlayerState(
         while (true) {
             delay(250L)
             state.pollTick()
+        }
+    }
+
+    // Resume the last session (paused), then keep it persisted. Restore waits for the
+    // library index so queue ids can resolve to real tracks, and only restores when the
+    // user hasn't already started something this launch.
+    LaunchedEffect(state) {
+        val appCtx = context.applicationContext
+        LibraryRepository.ensureRestored(appCtx)
+        if (state.currentSong == null) {
+            PlaybackStore.load(appCtx)?.let { snap ->
+                val byId = LibraryRepository.songsNow(appCtx).associateBy { it.id }
+                state.restore(snap, byId)
+            }
+        }
+        // Unblock Home's fallback preload — either we restored a session, or there was
+        // none and Home may load its resume-track shortcut.
+        state.markRestoreDone()
+        // Debounced structural saves: fires on track/order/mode changes, not on the 4x/s
+        // position tick. `drop(1)` skips the initial emission (the just-restored state).
+        snapshotFlow { state.saveSignature() }
+            .drop(1)
+            .debounce(800L)
+            .collectLatest {
+                val snap = state.snapshot()
+                if (snap != null) PlaybackStore.save(appCtx, snap) else PlaybackStore.clear(appCtx)
+            }
+    }
+
+    // Low-frequency position checkpoint so a resume lands near where playback actually
+    // is (the structural save above doesn't fire on position alone). Only while playing.
+    LaunchedEffect(state) {
+        while (true) {
+            delay(5000L)
+            if (state.isPlaying) state.snapshot()?.let { PlaybackStore.save(context.applicationContext, it) }
         }
     }
     return state

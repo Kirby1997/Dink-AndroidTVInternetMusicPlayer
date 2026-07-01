@@ -117,12 +117,31 @@ fun HomeScreen(
     val acrossFirstRequester = remember { FocusRequester() }
     val heroRequester = remember { FocusRequester() }
 
-    LaunchedEffect(feed.resumeSong.id) {
+    LaunchedEffect(feed.resumeSong.id, player.sessionRestoreDone) {
         // Preload the resume track so the mini player + Now Playing have data before the
         // user lifts a finger. Lyrics resolve via DinkApp's currentSong effect.
-        if (player.currentSong == null) {
+        // Wait for the launch session-restore to finish first: if a real session was
+        // restored (track + position + queue) currentSong is already set and this no-ops,
+        // so the richer restored state isn't clobbered by a position-0 single-track load.
+        if (player.sessionRestoreDone && player.currentSong == null) {
             player.load(feed.resumeSong, feed.resumeAlbum, emptyList(), autoplay = false)
         }
+    }
+
+    // The Hero always reflects what's ACTUALLY loaded/last-played: the live player track
+    // (restored session or whatever's playing now) wins over the index's lastPlayed guess,
+    // which was going stale and pinning the hero to an old track.
+    val resumeSong = player.currentSong ?: feed.resumeSong
+    val resumeAlbum = remember(resumeSong.id) { synthAlbumFor(resumeSong) }
+    // Continue = resume the already-loaded track at its position; only (re)load from the
+    // start when the hero is a different track than the one the player holds.
+    val onContinue: () -> Unit = {
+        if (player.currentSong?.id == resumeSong.id) {
+            if (!player.isPlaying) player.togglePlayPause()
+        } else {
+            player.load(resumeSong, resumeAlbum, emptyList())
+        }
+        onNavigate(ScreenId.NowPlaying)
     }
 
     // Column + verticalScroll so all four sections (Hero + 3 shelves) stay composed.
@@ -134,18 +153,15 @@ fun HomeScreen(
             .verticalScroll(rememberScrollState()),
     ) {
         Hero(
-            song = feed.resumeSong,
-            album = feed.resumeAlbum,
+            song = resumeSong,
+            album = resumeAlbum,
             railRequester = railRequester,
             heroRequester = heroRequester,
             downTarget = recentFirstRequester,
-            onContinue = {
-                player.load(feed.resumeSong, feed.resumeAlbum, emptyList())
-                onNavigate(ScreenId.NowPlaying)
-            },
+            onContinue = onContinue,
             onAddToQueue = {
-                player.addToQueue(feed.resumeSong)
-                onToast("Added ${feed.resumeSong.title} to queue")
+                player.addToQueue(resumeSong)
+                onToast("Added ${resumeSong.title} to queue")
             },
             onViewAlbum = { onNavigate(ScreenId.Albums) },
         )
