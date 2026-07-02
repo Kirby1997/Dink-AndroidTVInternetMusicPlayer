@@ -1,4 +1,8 @@
-@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
+@file:OptIn(
+    androidx.tv.material3.ExperimentalTvMaterial3Api::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
+)
 
 package com.example.dink_smb_player.ui.screens.library
 
@@ -15,7 +19,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -26,22 +31,30 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.focus.FocusRequester
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
@@ -67,15 +80,72 @@ data class LibraryGroup(
     val songs: List<Song>,
 )
 
-/** Hand-off for the transient [ScreenId.LibraryDetail] screen: which facet the user
- *  tapped on Albums/Artists/Folders. Mirrors the `activeBrowse*` singletons the SMB /
- *  cloud browsers use — `DinkNav` is screen-as-state and carries no arguments. */
+/** Hand-off for the transient [ScreenId.LibraryDetail] screen. A STACK of frames, so
+ *  drilling artist → album keeps the artist frame underneath: Back pops the album and
+ *  lands back on the artist's album grid before finally leaving to the list screen.
+ *  `group`/`facet`/`parent` read the top frame (kept as accessors so callers/crumbs are
+ *  unchanged). `DinkNav` is screen-as-state and carries no arguments, hence this singleton. */
 object LibraryDetailNav {
-    var group: LibraryGroup? by mutableStateOf(null)
+    data class Frame(val group: LibraryGroup, val facet: String, val parent: ScreenId)
+
+    val frames = mutableStateListOf<Frame>()
+
+    val group: LibraryGroup? get() = frames.lastOrNull()?.group
     /** Singular facet word for the crumb ("Album" / "Artist" / "Folder"). */
-    var facet: String by mutableStateOf("Album")
+    val facet: String get() = frames.lastOrNull()?.facet ?: "Album"
     /** Parent rail screen, so the drawer highlights it + Back returns there. */
-    var parent: ScreenId by mutableStateOf(ScreenId.Albums)
+    val parent: ScreenId get() = frames.lastOrNull()?.parent ?: ScreenId.Albums
+
+    /** Enter a facet fresh from a list screen — resets any nested stack. */
+    fun open(group: LibraryGroup, facet: String, parent: ScreenId) {
+        frames.clear()
+        frames.add(Frame(group, facet, parent))
+    }
+
+    /** Drill into a sub-facet (album under an artist), keeping the parent frame for Back. */
+    fun push(group: LibraryGroup, facet: String, parent: ScreenId) {
+        frames.add(Frame(group, facet, parent))
+    }
+
+    /** Pop one nested frame. Returns false when only the root frame remains (caller then
+     *  navigates back out to the list screen). */
+    fun popFrame(): Boolean {
+        if (frames.size > 1) {
+            frames.removeAt(frames.lastIndex)
+            return true
+        }
+        return false
+    }
+}
+
+/** Remembers each list facet's scroll position + which tile was opened, so returning from a
+ *  detail lands you back where you were (scrolled to, and focused on, the item you opened)
+ *  instead of at the top / on the rail. Process-lifetime; keyed by facet ("Album"/…). */
+object ListScrollMemo {
+    class Pos(
+        var index: Int = 0,
+        var offset: Int = 0,
+        var focusedKey: String? = null,
+        /** One-shot: true only when a Back into this list should refocus [focusedKey]. Keeps
+         *  rail-hover previews (which also compose the screen) from stealing focus. */
+        var armBackFocus: Boolean = false,
+    )
+    private val map = HashMap<String, Pos>()
+    fun pos(facet: String): Pos = map.getOrPut(facet) { Pos() }
+    fun saveScroll(facet: String, index: Int, offset: Int) {
+        pos(facet).also { it.index = index; it.offset = offset }
+    }
+    fun setFocused(facet: String, key: String) { pos(facet).focusedKey = key }
+    fun clearFocused(facet: String) { map[facet]?.focusedKey = null }
+    /** Called by Back when returning to a list — arms the one-shot tile refocus. */
+    fun arm(facet: String) { pos(facet).armBackFocus = true }
+    /** Facet word for a top-level list screen id, or null if it isn't one. */
+    fun facetOf(screen: ScreenId): String? = when (screen) {
+        ScreenId.Albums -> "Album"
+        ScreenId.Artists -> "Artist"
+        ScreenId.Folders -> "Folder"
+        else -> null
+    }
 }
 
 /**
@@ -127,7 +197,7 @@ fun LibraryGroupScreen(
         value = withContext(Dispatchers.Default) { hasUntaggedTracks(songs) }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 24.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 16.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -161,13 +231,13 @@ fun LibraryGroupScreen(
             }
         }
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(12.dp))
 
-        // Tap any group → its detail track list (play/shuffle/queue live there).
+        // Tap any group → its detail track list (play/shuffle/queue live there). Remember which
+        // tile we opened so Back can scroll here and refocus it (see grid/list below).
         val openDetail: (LibraryGroup) -> Unit = { group ->
-            LibraryDetailNav.group = group
-            LibraryDetailNav.facet = facet
-            LibraryDetailNav.parent = parent
+            ListScrollMemo.setFocused(facet, group.key)
+            LibraryDetailNav.open(group, facet, parent)
             onNavigate(ScreenId.LibraryDetail)
         }
 
@@ -197,30 +267,81 @@ fun LibraryGroupScreen(
             // Routing every tile's Left to the rail meant Left anywhere opened the drawer
             // instead of moving across the grid — same bug class as the Settings tab row.
             BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                val minTile = 168.dp
+                // Smaller tiles → more per row. 168dp only fit 5 across and read oversized on
+                // a 10-foot TV; 104dp packs ~8 so the wall-of-albums scans faster and more
+                // rows fit vertically (square art is as tall as a tile is wide, so narrower
+                // tiles are also shorter — the main lever on how many rows are visible).
+                val minTile = 104.dp
                 val gap = 16.dp
                 val columns = maxOf(1, ((maxWidth + gap) / (minTile + gap)).toInt())
+                // Restore scroll to where we were when we last left this facet, and save it
+                // again on the way out (Back into here should land at the same position).
+                val savedPos = remember(facet) { ListScrollMemo.pos(facet) }
+                val gridState = rememberLazyGridState(savedPos.index, savedPos.offset)
+                DisposableEffect(facet) {
+                    onDispose {
+                        ListScrollMemo.saveScroll(facet, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
+                    }
+                }
+                // When we came BACK from a detail, focus the tile we opened (it's at the restored
+                // scroll position, so focusing it doesn't jump the list). Fresh rail entries clear
+                // focusedKey (in DinkApp), so this only fires on a return.
+                val returnKey = savedPos.focusedKey
+                val tileFocus = remember { FocusRequester() }
+                LaunchedEffect(groupList) {
+                    if (savedPos.armBackFocus && returnKey != null && groupList.any { it.key == returnKey }) {
+                        savedPos.armBackFocus = false
+                        repeat(20) {
+                            delay(30)
+                            if (runCatching { tileFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                        }
+                    }
+                }
+                // D-pad Down used to dump focus on the leftmost tile whenever the next row
+                // wasn't composed yet (it scrolled, then focus search grabbed column 0). Two
+                // things keep the column now: focusRestorer() sends focus back to the tile it
+                // left rather than the grid's first child, and a bottom contentPadding keeps the
+                // row below already composed so Down has a same-column target to land on.
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(columns),
-                    modifier = Modifier.fillMaxSize(),
+                    state = gridState,
+                    modifier = Modifier.fillMaxSize().focusRestorer(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = minTile + gap),
                     horizontalArrangement = Arrangement.spacedBy(gap),
                     verticalArrangement = Arrangement.spacedBy(gap),
                 ) {
-                    itemsIndexed(groupList, key = { _, g -> g.key }) { index, group ->
+                    gridItemsIndexed(groupList, key = { _, g -> g.key }) { index, group ->
                         GroupTile(
                             group = group,
                             onClick = { openDetail(group) },
-                            modifier = if (index % columns == 0) {
-                                Modifier.focusProperties { left = railRequester }
-                            } else {
-                                Modifier
-                            },
+                            modifier = Modifier
+                                .then(if (group.key == returnKey) Modifier.focusRequester(tileFocus) else Modifier)
+                                .then(if (index % columns == 0) Modifier.focusProperties { left = railRequester } else Modifier),
                         )
                     }
                 }
             }
         } else {
+            val savedPos = remember(facet) { ListScrollMemo.pos(facet) }
+            val listState = rememberLazyListState(savedPos.index, savedPos.offset)
+            DisposableEffect(facet) {
+                onDispose {
+                    ListScrollMemo.saveScroll(facet, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+                }
+            }
+            val returnKey = savedPos.focusedKey
+            val rowFocus = remember { FocusRequester() }
+            LaunchedEffect(groupList) {
+                if (savedPos.armBackFocus && returnKey != null && groupList.any { it.key == returnKey }) {
+                    savedPos.armBackFocus = false
+                    repeat(20) {
+                        delay(30)
+                        if (runCatching { rowFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                    }
+                }
+            }
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
@@ -230,7 +351,8 @@ fun LibraryGroupScreen(
                         subtitle = group.subtitle,
                         icon = rowIcon,
                         onClick = { openDetail(group) },
-                        modifier = Modifier.focusProperties { left = railRequester },
+                        modifier = (if (group.key == returnKey) Modifier.focusRequester(rowFocus) else Modifier)
+                            .focusProperties { left = railRequester },
                     )
                 }
             }
@@ -261,7 +383,7 @@ private fun GroupTile(
         interactionSource = interaction,
         modifier = modifier,
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (art != null) {
                 CoverArt(
                     song = rep,
@@ -272,7 +394,9 @@ private fun GroupTile(
                 )
             }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(group.title, style = type.cardTitle.copy(color = palette.ink0), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                // 2 lines so narrow tiles don't clip long album/artist names to "…"; smaller
+                // cardTitle keeps the two lines from dominating the shorter tile.
+                Text(group.title, style = type.cardTitle.copy(color = palette.ink0, fontSize = 17.sp), maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text(group.subtitle, style = type.monoSmall.copy(color = palette.ink3), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
@@ -399,39 +523,152 @@ fun hasUntaggedTracks(songs: List<Song>): Boolean {
 
 // ---- Grouping helpers: one per facet, shared bucket builder. ----
 
+/**
+ * Collapse the cosmetic spelling differences that were splitting one artist/album into
+ * several buckets: case (`Slipknot`/`SlipKnot`), a leading "The", featured-artist suffixes
+ * (`Ozzy Osbourne feat. Elton John`), and ALL punctuation/spacing — so `AC/DC`, `AC-DC`
+ * and `ACDC` collapse to one key. Unicode letters are kept, so Cyrillic/CJK titles survive.
+ * Used only as the GROUPING key — the visible title is the most common raw spelling.
+ */
+private val FEAT_SUFFIX = Regex("\\s*[\\(\\[]?\\b(?:feat|ft|featuring)\\b\\.?.*$", RegexOption.IGNORE_CASE)
+// Compiled once, not per call — normKey runs 25k+ times per grouping pass.
+private val NON_ALNUM = Regex("[^\\p{L}\\p{Nd}]+")
+// Collaboration separators between DISTINCT artists: slash/semicolon/comma, " & ", " feat ".
+// Not a hyphen — that lives inside names (AC-DC) and is folded away by normKey instead.
+private val ARTIST_DELIM =
+    Regex("\\s*[/;,]\\s*|\\s+&\\s+|\\s+(?:feat|ft|featuring)\\b\\.?\\s*", RegexOption.IGNORE_CASE)
+
+// normKey runs several times per track across multiple passes (ArtistStats, keyOf, labels)
+// but there are only a few thousand DISTINCT raw strings in a 25k library — memoise so the
+// regex work is paid once per distinct string, not 100k+ times. Bounded by distinct strings.
+private val normKeyCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+// Combining marks left after NFD decomposition — dropping them folds accents to the base
+// letter (Motörhead/Mötorhead→motorhead, Queensrÿche→queensryche). Latin gains ASCII bases;
+// Cyrillic/CJK keep their letters (only their marks go, e.g. ё→е), so those still group.
+private val COMBINING = Regex("\\p{Mn}+")
+
+private fun normKey(raw: String): String = normKeyCache.getOrPut(raw) {
+    var s = raw.trim().lowercase()
+    s = COMBINING.replace(java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD), "")
+    s = FEAT_SUFFIX.replace(s, "")
+    if (s.startsWith("the ")) s = s.removePrefix("the ").trim()
+    // Strip EVERYTHING non-alphanumeric (spaces included), so separator style can't split
+    // one name into two buckets. Fallback keeps something unique for all-symbol names.
+    s = NON_ALNUM.replace(s, "")
+    s.ifBlank { raw.trim().lowercase() }
+}
+
+/** The most frequent raw spelling among a group's tracks — the canonical display label. */
+private fun <T> Iterable<T>.mostCommon(): T =
+    groupingBy { it }.eachCount().maxByOrNull { it.value }!!.key
+
 private fun buildGroups(
     songs: List<Song>,
     keyOf: (Song) -> String,
-    titleOf: (String) -> String,
+    titleOf: (String, List<Song>) -> String,
     subtitleOf: (String, List<Song>) -> String,
 ): List<LibraryGroup> =
     songs.groupBy(keyOf)
-        .map { (key, list) -> LibraryGroup(key, titleOf(key), subtitleOf(key, list), list) }
+        .map { (key, list) -> LibraryGroup(key, titleOf(key, list), subtitleOf(key, list), list) }
         .sortedBy { it.title.lowercase() }
 
-fun albumGroups(songs: List<Song>): List<LibraryGroup> = buildGroups(
-    songs,
-    keyOf = { it.albumTitle ?: "Unknown album" },
-    titleOf = { it },
-    subtitleOf = { _, list ->
-        val artist = list.map { it.artist }.distinct().singleOrNull() ?: "Various artists"
-        "$artist · ${list.size} tracks"
-    },
-)
+// ---- Artist identity: attribute collaborations to the PRIMARY artist ----
+// A track tagged "Falling in Reverse/Tech N9ne/Alex Terrible" (or with the guest listed
+// first, "Alex Terrible; Falling In Reverse; …") should file under Falling in Reverse, not
+// spawn phantom one-song artists. Split on collab separators and pick the member the library
+// knows best on their own — with a guard so a slash that's part of a NAME (AC/DC) is kept whole.
 
-fun artistGroups(songs: List<Song>): List<LibraryGroup> = buildGroups(
-    songs,
-    keyOf = { it.artist },
-    titleOf = { it },
-    subtitleOf = { _, list ->
-        val albums = list.mapNotNull { it.albumTitle }.distinct().size
-        "${list.size} tracks · $albums albums"
-    },
-)
+private val artistTokensCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+private fun artistTokens(raw: String): List<String> = artistTokensCache.getOrPut(raw) {
+    raw.split(ARTIST_DELIM).map { normKey(it) }.filter { it.isNotEmpty() }
+}
+
+/** Counts to disambiguate collaborations, computed once per grouping pass:
+ *  - [full]: how often each WHOLE artist string appears (folds AC/DC + AC-DC + ACDC → "acdc").
+ *  - [solo]: how often each token appears as the SOLE credited artist (real standalone acts). */
+private class ArtistStats(songs: List<Song>) {
+    val full = HashMap<String, Int>()
+    val solo = HashMap<String, Int>()
+    init {
+        for (s in songs) {
+            full.merge(normKey(s.artist), 1, Int::plus)
+            val toks = artistTokens(s.artist)
+            if (toks.size == 1) solo.merge(toks[0], 1, Int::plus)
+        }
+    }
+}
+
+/** Grouping key for an artist string: the whole name when it's a recognised act (so slashes
+ *  in names survive), else the best-known member of the collaboration, else the LEAD artist.
+ *  The lead fallback means a "X & Y & Z" credit where none of X/Y/Z is a known standalone act
+ *  files under X (the lead) instead of spawning a phantom "X & Y & Z" artist. */
+private fun primaryArtistKey(raw: String, stats: ArtistStats): String {
+    val whole = normKey(raw)
+    val toks = artistTokens(raw)
+    if (toks.size <= 1) return whole
+    // A known standalone act among the members wins FIRST — so "Apocalyptica, Dave Lombardo"
+    // (and every other "Apocalyptica, guest") folds into Apocalyptica even though that exact
+    // collaboration recurs. Only when NO member is a solo act do we fall back to keeping a
+    // recurring whole name (AC/DC), then to the lead token.
+    val best = toks.maxByOrNull { stats.solo[it] ?: 0 }
+    if (best != null && (stats.solo[best] ?: 0) > 0) return best
+    if ((stats.full[whole] ?: 0) >= 3) return whole   // e.g. "AC/DC" — a name, not a collab
+    return toks.first()
+}
+
+/** A clean, feat-free spelling of the part of [raw] that maps to bucket [key], or null.
+ *  Checks the whole credit first (so "AC/DC" stays whole), then each collaboration piece —
+ *  each with any "(feat …)" tail removed — so the header never shows a featured-guest tail. */
+private fun cleanedSpellingForKey(raw: String, key: String): String? {
+    val whole = FEAT_SUFFIX.replace(raw, "").trim()
+    if (whole.isNotEmpty() && normKey(whole) == key) return whole
+    return raw.split(ARTIST_DELIM)
+        .map { FEAT_SUFFIX.replace(it.trim(), "").trim() }
+        .firstOrNull { it.isNotEmpty() && normKey(it) == key }
+}
+
+/** Display label for an artist bucket: most common clean spelling of the part that maps to
+ *  the bucket (never a collaboration/featured string); falls back to raw only if nothing maps. */
+private fun artistLabel(key: String, list: List<Song>): String {
+    val cands = list.mapNotNull { cleanedSpellingForKey(it.artist, key) }
+    return (if (cands.isNotEmpty()) cands else list.map { it.artist }).mostCommon()
+}
+
+fun albumGroups(songs: List<Song>): List<LibraryGroup> {
+    val stats = ArtistStats(songs)
+    return buildGroups(
+        songs,
+        keyOf = { normKey(it.albumTitle ?: "Unknown album") },
+        titleOf = { _, list ->
+            list.mapNotNull { it.albumTitle }.takeIf { it.isNotEmpty() }?.mostCommon() ?: "Unknown album"
+        },
+        subtitleOf = { _, list ->
+            // "Various artists" only when the PRIMARY artists genuinely differ — featured
+            // guests and spelling variants no longer read as a compilation.
+            val keys = list.map { primaryArtistKey(it.artist, stats) }.distinct()
+            val artist = if (keys.size == 1) artistLabel(keys[0], list) else "Various artists"
+            "$artist · ${list.size} tracks"
+        },
+    )
+}
+
+fun artistGroups(songs: List<Song>): List<LibraryGroup> {
+    val stats = ArtistStats(songs)
+    return buildGroups(
+        songs,
+        keyOf = { primaryArtistKey(it.artist, stats) },
+        titleOf = { key, list -> artistLabel(key, list) },
+        subtitleOf = { _, list ->
+            val albums = list.mapNotNull { it.albumTitle }.map { normKey(it) }.distinct().size
+            "${list.size} tracks · $albums albums"
+        },
+    )
+}
 
 fun folderGroups(songs: List<Song>): List<LibraryGroup> = buildGroups(
     songs,
     keyOf = { it.sourcePath.substringBeforeLast('/', "").ifEmpty { "/" } },
-    titleOf = { it.substringAfterLast('/').ifEmpty { it } },
+    titleOf = { key, _ -> key.substringAfterLast('/').ifEmpty { key } },
     subtitleOf = { key, list -> "$key · ${list.size} tracks" },
 )

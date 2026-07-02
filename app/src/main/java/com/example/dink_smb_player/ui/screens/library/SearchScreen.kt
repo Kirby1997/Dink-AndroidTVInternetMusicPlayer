@@ -213,9 +213,7 @@ private fun ResultsList(
 ) {
     // Open an album/artist's track list (detail screen). The facet shapes the crumb.
     fun openDetail(group: LibraryGroup, facetLabel: String, parent: ScreenId) {
-        LibraryDetailNav.group = group
-        LibraryDetailNav.facet = facetLabel
-        LibraryDetailNav.parent = parent
+        LibraryDetailNav.open(group, facetLabel, parent)
         onNavigate(ScreenId.LibraryDetail)
     }
 

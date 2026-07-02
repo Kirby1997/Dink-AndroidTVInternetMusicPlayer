@@ -63,6 +63,7 @@ import com.example.dink_smb_player.ui.components.TopBar
 import com.example.dink_smb_player.ui.components.rememberToastState
 import com.example.dink_smb_player.ui.screens.home.HomeScreen
 import com.example.dink_smb_player.ui.screens.library.LibraryDetailNav
+import com.example.dink_smb_player.ui.screens.library.ListScrollMemo
 import com.example.dink_smb_player.ui.screens.library.LibraryDetailScreen
 import com.example.dink_smb_player.ui.screens.library.LibraryGroupScreen
 import com.example.dink_smb_player.ui.screens.library.albumGroups
@@ -132,6 +133,13 @@ fun DinkApp() {
 
     // Re-resolves when the title changes too, so enrichment (dirty filename → real
     // tag title) re-runs the lyric chain with the accurate name.
+    // Stamp lastPlayed when a real track becomes current so "Recently played" + the Home
+    // resume hero reflect what was actually played (nothing else calls markPlayed).
+    LaunchedEffect(player.currentSong?.id) {
+        val song = player.currentSong ?: return@LaunchedEffect
+        if (song.mediaUri != null) LibraryRepository.markPlayed(context, song.id)
+    }
+
     LaunchedEffect(player.currentSong?.id, player.currentSong?.title) {
         val song = player.currentSong ?: return@LaunchedEffect
         if (song.mediaUri == null && song.id != PreviewMockData.songIxion.id) return@LaunchedEffect
@@ -259,11 +267,21 @@ fun DinkApp() {
     }
 
     BackHandler(enabled = !exitDialog) {
-        // Drawer open (focused) → exit dialog. Otherwise → focus drawer.
-        if (drawerState.currentValue == DrawerValue.Open) {
-            exitDialog = true
-        } else {
-            runCatching { railRequester.requestFocus() }
+        when {
+            // Drawer open (focused) → exit dialog.
+            drawerState.currentValue == DrawerValue.Open -> exitDialog = true
+            // Nested detail (album opened under an artist) → pop back to the artist's albums.
+            nav.current == ScreenId.LibraryDetail && LibraryDetailNav.popFrame() -> navSounds.select()
+            // On a detail → return to the list we came from (Albums/Artists/Folders), where
+            // scroll + the opened tile's focus are restored. Go straight (no commitTarget) so
+            // the list's own tile-refocus wins instead of focus snapping to "Shuffle all".
+            nav.current == ScreenId.LibraryDetail -> {
+                navSounds.select()
+                ListScrollMemo.facetOf(LibraryDetailNav.parent)?.let { ListScrollMemo.arm(it) }
+                nav.go(LibraryDetailNav.parent)
+            }
+            // Otherwise (a top-level screen) → focus the rail; Back again (drawer open) exits.
+            else -> runCatching { railRequester.requestFocus() }
         }
     }
 

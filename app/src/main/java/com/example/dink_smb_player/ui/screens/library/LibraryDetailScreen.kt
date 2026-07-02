@@ -1,4 +1,8 @@
-@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
+@file:OptIn(
+    androidx.tv.material3.ExperimentalTvMaterial3Api::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+)
 
 package com.example.dink_smb_player.ui.screens.library
 
@@ -8,10 +12,12 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -19,12 +25,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -83,6 +95,21 @@ fun LibraryDetailScreen(
     val totalSec = remember(songs) { songs.sumOf { it.durationSec } }
     var menuSong by remember { mutableStateOf<Song?>(null) }
 
+    // Selecting an artist opens their ALBUMS (a wall of covers) rather than a flat track
+    // dump; tapping an album drills into that album's tracks (re-enters this screen as an
+    // Album facet). Albums / Folders still show the track list directly.
+    val isArtist = LibraryDetailNav.facet.equals("Artist", ignoreCase = true)
+    val albums = remember(group.key, isArtist) { if (isArtist) albumGroups(songs) else emptyList() }
+
+    // Whenever the shown facet changes (drilling artist → album, or Back popping album →
+    // artist), pull focus onto this screen's primary action so focus never falls to the rail.
+    LaunchedEffect(group.key) {
+        repeat(15) { attempt ->
+            kotlinx.coroutines.delay(40)
+            if (runCatching { contentFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 24.dp)) {
         // ---- Header: cover + title + counts + actions ----
         Row(
@@ -106,7 +133,8 @@ fun LibraryDetailScreen(
                 Text(LibraryDetailNav.facet.uppercase(), style = type.monoSmall.copy(color = palette.ink3))
                 Text(group.title, style = type.screenTitle.copy(color = palette.ink0), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    text = "${songs.size} tracks · ${formatLongDuration(totalSec)}",
+                    text = if (isArtist) "${albums.size} ${plural(albums.size, "album")} · ${songs.size} ${plural(songs.size, "track")}"
+                        else "${songs.size} tracks · ${formatLongDuration(totalSec)}",
                     style = type.body.copy(color = palette.ink2),
                     maxLines = 1,
                 )
@@ -142,23 +170,36 @@ fun LibraryDetailScreen(
 
         Spacer(Modifier.height(20.dp))
 
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().focusGroup(),
-            contentPadding = PaddingValues(vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            itemsIndexed(songs, key = { _, s -> s.id }) { index, song ->
-                TrackRow(
-                    index = index + 1,
-                    song = song,
-                    isPlaying = player.currentSong?.id == song.id,
-                    onClick = {
-                        player.playFrom(songs, index)
-                        onNavigate(ScreenId.NowPlaying)
-                    },
-                    onLongClick = { menuSong = song },
-                    modifier = Modifier.focusProperties { left = railRequester },
-                )
+        if (isArtist) {
+            ArtistAlbumsGrid(
+                albums = albums,
+                railRequester = railRequester,
+                onOpen = { album ->
+                    // Drill into the album, keeping the artist frame beneath so Back returns to
+                    // the artist's album grid. Same screen, so no nav.go — the frame change
+                    // recomposes here and the LaunchedEffect above moves focus to Play all.
+                    LibraryDetailNav.push(album, "Album", LibraryDetailNav.parent)
+                },
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().focusGroup(),
+                contentPadding = PaddingValues(vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                itemsIndexed(songs, key = { _, s -> s.id }) { index, song ->
+                    TrackRow(
+                        index = index + 1,
+                        song = song,
+                        isPlaying = player.currentSong?.id == song.id,
+                        onClick = {
+                            player.playFrom(songs, index)
+                            onNavigate(ScreenId.NowPlaying)
+                        },
+                        onLongClick = { menuSong = song },
+                        modifier = Modifier.focusProperties { left = railRequester },
+                    )
+                }
             }
         }
     }
@@ -170,6 +211,82 @@ fun LibraryDetailScreen(
             onToast = onToast,
             onDismiss = { menuSong = null },
         )
+    }
+}
+
+/** The artist's albums as a cover-art wall (same tile + focus behaviour as the Albums
+ *  screen: fixed columns from width so only the leftmost routes Left→rail; focusRestorer +
+ *  bottom padding keep D-pad Down in the same column across scroll). */
+@Composable
+private fun ArtistAlbumsGrid(
+    albums: List<LibraryGroup>,
+    railRequester: FocusRequester,
+    onOpen: (LibraryGroup) -> Unit,
+) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val minTile = 124.dp
+        val gap = 16.dp
+        val columns = maxOf(1, ((maxWidth + gap) / (minTile + gap)).toInt())
+        val gridState = rememberLazyGridState()
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(columns),
+            state = gridState,
+            modifier = Modifier.fillMaxSize().focusRestorer(),
+            contentPadding = PaddingValues(bottom = minTile + gap),
+            horizontalArrangement = Arrangement.spacedBy(gap),
+            verticalArrangement = Arrangement.spacedBy(gap),
+        ) {
+            gridItemsIndexed(albums, key = { _, g -> g.key }) { index, album ->
+                AlbumTile(
+                    album = album,
+                    onClick = { onOpen(album) },
+                    modifier = if (index % columns == 0) {
+                        Modifier.focusProperties { left = railRequester }
+                    } else Modifier,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlbumTile(
+    album: LibraryGroup,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val palette = LocalDinkPalette.current
+    val type = LocalDinkType.current
+    val interaction = remember { MutableInteractionSource() }
+    val rep = album.songs.firstOrNull()
+    val art = remember(album.key) { rep?.let { synthAlbumFor(it) } }
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(16.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = palette.bg1,
+            focusedContainerColor = palette.bg2,
+            contentColor = palette.ink0,
+            focusedContentColor = palette.ink0,
+        ),
+        interactionSource = interaction,
+        modifier = modifier,
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (art != null) {
+                CoverArt(
+                    song = rep,
+                    palette = art.palette,
+                    shape = art.shape,
+                    modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                    cornerRadius = 12.dp,
+                )
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(album.title, style = type.cardTitle.copy(color = palette.ink0), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("${album.songs.size} tracks", style = type.monoSmall.copy(color = palette.ink3), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
     }
 }
 
@@ -238,6 +355,8 @@ private fun TrackRow(
         }
     }
 }
+
+private fun plural(n: Int, word: String): String = if (n == 1) word else "${word}s"
 
 private fun formatDuration(sec: Int): String {
     if (sec <= 0) return "—"
