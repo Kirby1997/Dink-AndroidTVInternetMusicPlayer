@@ -32,8 +32,8 @@ android {
         applicationId = "com.dink.player"
         minSdk = 31
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.2.1"
 
         // Google OAuth client for the "TVs and Limited Input devices" client type,
         // used by the Phase 8 cloud device-flow. Kept out of source control: set

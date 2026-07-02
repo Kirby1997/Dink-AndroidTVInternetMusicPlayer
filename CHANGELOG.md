@@ -3,6 +3,15 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.2.1] - 2026-07-02
+
+### Fixed
+- **Playback no longer locks up after a network hiccup.** A transient error mid-stream
+  (for example the NAS dropping an idle SMB connection) left the player in a dead state:
+  play/pause did nothing and the only way out was picking a new song. The player now
+  re-prepares the audio engine when recovering, so the automatic skip to the next track
+  works and the play button always resumes.
+
 ## [1.2] - 2026-07-02
 
 ### Changed
