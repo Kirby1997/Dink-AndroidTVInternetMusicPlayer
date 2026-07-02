@@ -3,6 +3,27 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.2] - 2026-07-02
+
+### Changed
+- **Artists and Albums are now de-duplicated.** Grouping keys are normalised (case,
+  punctuation, diacritics, leading "The", "feat." collaborators) so the same artist or
+  album no longer appears several times under slightly different spellings. Collaboration
+  tracks are attributed to the primary artist, and the most common raw spelling is shown.
+  On a typical library this collapsed 543 artists down to 224. Keys are precomputed at
+  import so the library grid loads without recomputing them each time.
+- **Selecting an artist now opens that artist's albums** instead of a flat track list, so
+  large discographies are easier to browse. Back returns to the previous screen with your
+  scroll position and focus restored.
+
+### Added
+- **Session resume.** Relaunching Dink restores your last track, queue, and position
+  (paused) so you can pick up where you left off.
+
+### Fixed
+- Tightened the library grid: smaller titles, more rows on screen, and names no longer
+  clip. Down-navigation no longer drifts to the leftmost column.
+
 ## [1.1] - 2026-07-01
 
 ### Fixed

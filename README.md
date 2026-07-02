@@ -31,6 +31,9 @@ shared.
 
 **Library**
 - Organised by Songs, Albums, Artists, Playlists, and Folders.
+- De-duplicated Artists and Albums — spellings that differ only by case, punctuation,
+  diacritics, a leading "The", or "feat." collaborators are grouped as one. Selecting an
+  artist opens their albums, and Back restores your scroll position.
 - Accurate metadata read from embedded ID3 / Vorbis / MP4 tags (not just filenames).
 - Cover art from embedded artwork.
 - Instant search and Shuffle All.
@@ -40,6 +43,7 @@ shared.
 **Playback**
 - Media3 / ExoPlayer engine: queue, shuffle, repeat, gapless.
 - Now-playing screen with cover art.
+- Session resume — relaunching restores your last track, queue, and position (paused).
 - Windowed engine queue so shuffle-all over a whole library can't ANR.
 
 **Lyrics**
