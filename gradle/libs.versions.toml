@@ -19,6 +19,8 @@ kotlinxCoroutines = "1.9.0"
 kotlinxSerialization = "1.7.3"
 jaudiotagger = "3.0.1"
 slf4j = "1.7.36"
+junit = "4.13.2"
+mockitoKotlin = "5.4.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -43,6 +45,8 @@ androidx-media3-ui = { module = "androidx.media3:media3-ui", version.ref = "medi
 
 smbj = { module = "com.hierynomus:smbj", version.ref = "smbj" }
 slf4j-nop = { module = "org.slf4j:slf4j-nop", version.ref = "slf4j" }
+junit = { module = "junit:junit", version.ref = "junit" }
+mockito-kotlin = { module = "org.mockito.kotlin:mockito-kotlin", version.ref = "mockitoKotlin" }
 
 androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
 androidx-security-crypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }

@@ -248,7 +248,15 @@ class PlayerState(
     fun togglePlayPause() {
         val song = currentSong ?: return
         isPlaying = !isPlaying
-        if (song.mediaUri != null) engine?.playWhenReady = isPlaying
+        if (song.mediaUri != null) {
+            val player = engine
+            if (player != null) {
+                // After a source error (or stop) the engine sits in IDLE and ignores
+                // playWhenReady until prepared again — without this, play is a no-op.
+                if (isPlaying && player.playbackState == Player.STATE_IDLE) player.prepare()
+                player.playWhenReady = isPlaying
+            }
+        }
     }
 
     fun seek(sec: Float) {
@@ -532,8 +540,11 @@ class PlayerState(
         if (player != null && isQueueAllUri()) {
             val engineIdx = idx - engineBase
             if (engineIdx in 0 until player.mediaItemCount) {
-                // Target is inside the current window — seek, no re-prepare.
+                // Target is inside the current window — seek, no re-prepare needed
+                // unless the engine is IDLE (post source-error / stop), where seek +
+                // playWhenReady alone never restart playback.
                 player.seekTo(engineIdx, 0L)
+                if (player.playbackState == Player.STATE_IDLE) player.prepare()
                 player.playWhenReady = true
             } else {
                 // Outside the window — rebuild it centred on the new track.

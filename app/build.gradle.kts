@@ -78,6 +78,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    testOptions {
+        // JVM unit tests touch media3 classes whose constructors call android.os
+        // statics (e.g. PlaybackException → SystemClock); return defaults instead
+        // of throwing "not mocked".
+        unitTests.isReturnDefaultValues = true
+    }
     buildFeatures {
         compose = true
         buildConfig = true
@@ -118,6 +124,8 @@ dependencies {
     // no-op binding that silences it — we don't want library logs in logcat.
     runtimeOnly(libs.slf4j.nop)
 
+    testImplementation(libs.junit)
+    testImplementation(libs.mockito.kotlin)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
