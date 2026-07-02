@@ -2,6 +2,7 @@ package com.example.dink_smb_player.data.library
 
 import android.content.Context
 import com.example.dink_smb_player.data.index.IndexDao
+import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.index.MediaIndex
 import com.example.dink_smb_player.data.index.SourceEntity
 import com.example.dink_smb_player.data.index.SourceType
@@ -74,6 +75,13 @@ object LibraryRepository {
                 result.snapshot.sources.forEach { dao.upsertSource(it) }
                 dao.upsertTracks(result.snapshot.tracks)
                 safeToPersist = true
+                // One-time migration: snapshots written before precompute existed carry null
+                // grouping keys. Compute them once and persist so subsequent boots (and the
+                // Albums/Artists views) read ready-made keys instead of normalizing at display.
+                if (result.snapshot.tracks.any { it.artistKey == null }) {
+                    recomputeGroupingKeys(context)
+                    persist(context)
+                }
             }
             is LibraryStore.LoadResult.Corrupt -> {
                 safeToPersist = false
@@ -113,6 +121,26 @@ object LibraryRepository {
         }
         val (tracks, sources) = dao(context).snapshot()
         LibraryStore.save(context, tracks, sources)
+    }
+
+    /** Recompute the precomputed grouping keys (artistKey/albumKey/artistLabel) across the WHOLE
+     *  library and upsert only the rows that changed. Collaboration attribution depends on
+     *  library-wide solo-artist stats, so this must see every row — hence a single pass at
+     *  authoritative write boundaries (import/retag) rather than per-batch. Off-main (Default).
+     *  Does NOT persist — callers persist after, so the recompute and their other writes land in
+     *  one snapshot. */
+    private suspend fun recomputeGroupingKeys(context: Context) {
+        val dao = dao(context)
+        val all = dao.snapshot().first
+        if (all.isEmpty()) return
+        val updated = withContext(Dispatchers.Default) { LibraryGrouping.computeGroupingKeys(all) }
+        // computeGroupingKeys preserves order and returns unchanged rows by data equality, so
+        // upsert only what actually differs (typically all rows on first migration, few after).
+        val changed = all.asSequence().zip(updated.asSequence())
+            .filter { (old, new) -> old != new }
+            .map { it.second }
+            .toList()
+        if (changed.isNotEmpty()) dao.upsertTracks(changed)
     }
 
     // Process-cached, app-scoped projection of the index into the UI [Song] model.
@@ -200,6 +228,7 @@ object LibraryRepository {
             size = tracks.sumOf { it.sizeBytes },
             statusJson = null,
         )
+        recomputeGroupingKeys(context)
         persist(context)
     }
 
@@ -242,6 +271,7 @@ object LibraryRepository {
             size = total.sumOf { it.sizeBytes },
             statusJson = null,
         )
+        recomputeGroupingKeys(context)
         persist(context)
         return total.size
     }
@@ -286,6 +316,7 @@ object LibraryRepository {
             size = total.sumOf { it.sizeBytes },
             statusJson = null,
         )
+        recomputeGroupingKeys(context)
         persist(context)
     }
 
@@ -518,6 +549,10 @@ object LibraryRepository {
                 emitProgress(running = true, force = true)
             }
         }
+        // Tags (artist/album) may have changed, so the grouping keys are now stale — recompute
+        // across the whole library once and persist the corrected keys.
+        recomputeGroupingKeys(context)
+        persist(context)
         emitProgress(running = false, force = true)
         return changed.get()
     }
@@ -622,4 +657,7 @@ fun TrackEntity.toSong(): Song = Song(
     sourcePath = path,
     bitrate = bitrate ?: "—",
     mediaUri = uri,
+    artistKey = artistKey,
+    albumKey = albumKey,
+    artistLabel = artistLabel,
 )

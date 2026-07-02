@@ -37,6 +37,12 @@ data class Song(
     /** Real playable URI (SAF / file:// / smb://). When null, ExoPlayer can't play this
      *  song — the synthetic clock falls back so mock data still ticks the UI. */
     val mediaUri: String? = null,
+    /** Precomputed grouping keys (see TrackEntity / LibraryGrouping). Null on mock data and on
+     *  rows imported before precompute existed — the Albums/Artists views fall back to computing
+     *  the key on the fly for those, so grouping degrades gracefully rather than breaking. */
+    val artistKey: String? = null,
+    val albumKey: String? = null,
+    val artistLabel: String? = null,
 )
 
 /** One line of synchronised lyrics. timeSec is the start time of this line in the track. */
