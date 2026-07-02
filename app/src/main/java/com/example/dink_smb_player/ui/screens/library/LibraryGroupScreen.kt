@@ -61,6 +61,7 @@ import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
+import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.nav.ScreenId
@@ -523,40 +524,11 @@ fun hasUntaggedTracks(songs: List<Song>): Boolean {
 
 // ---- Grouping helpers: one per facet, shared bucket builder. ----
 
-/**
- * Collapse the cosmetic spelling differences that were splitting one artist/album into
- * several buckets: case (`Slipknot`/`SlipKnot`), a leading "The", featured-artist suffixes
- * (`Ozzy Osbourne feat. Elton John`), and ALL punctuation/spacing — so `AC/DC`, `AC-DC`
- * and `ACDC` collapse to one key. Unicode letters are kept, so Cyrillic/CJK titles survive.
- * Used only as the GROUPING key — the visible title is the most common raw spelling.
- */
-private val FEAT_SUFFIX = Regex("\\s*[\\(\\[]?\\b(?:feat|ft|featuring)\\b\\.?.*$", RegexOption.IGNORE_CASE)
-// Compiled once, not per call — normKey runs 25k+ times per grouping pass.
-private val NON_ALNUM = Regex("[^\\p{L}\\p{Nd}]+")
-// Collaboration separators between DISTINCT artists: slash/semicolon/comma, " & ", " feat ".
-// Not a hyphen — that lives inside names (AC-DC) and is folded away by normKey instead.
-private val ARTIST_DELIM =
-    Regex("\\s*[/;,]\\s*|\\s+&\\s+|\\s+(?:feat|ft|featuring)\\b\\.?\\s*", RegexOption.IGNORE_CASE)
-
-// normKey runs several times per track across multiple passes (ArtistStats, keyOf, labels)
-// but there are only a few thousand DISTINCT raw strings in a 25k library — memoise so the
-// regex work is paid once per distinct string, not 100k+ times. Bounded by distinct strings.
-private val normKeyCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-// Combining marks left after NFD decomposition — dropping them folds accents to the base
-// letter (Motörhead/Mötorhead→motorhead, Queensrÿche→queensryche). Latin gains ASCII bases;
-// Cyrillic/CJK keep their letters (only their marks go, e.g. ё→е), so those still group.
-private val COMBINING = Regex("\\p{Mn}+")
-
-private fun normKey(raw: String): String = normKeyCache.getOrPut(raw) {
-    var s = raw.trim().lowercase()
-    s = COMBINING.replace(java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD), "")
-    s = FEAT_SUFFIX.replace(s, "")
-    if (s.startsWith("the ")) s = s.removePrefix("the ").trim()
-    // Strip EVERYTHING non-alphanumeric (spaces included), so separator style can't split
-    // one name into two buckets. Fallback keeps something unique for all-symbol names.
-    s = NON_ALNUM.replace(s, "")
-    s.ifBlank { raw.trim().lowercase() }
-}
+// Grouping keys are PRECOMPUTED at import/retag by data.index.LibraryGrouping and stored on each
+// row (Song.artistKey/albumKey/artistLabel), so the grouping below is a plain groupBy on a stored
+// key rather than an NFD + regex normalization of 25k rows at display time. LibraryGrouping.normKey
+// is used only as a fallback for the rare row that predates precompute (null keys). See that file
+// for the collapsing rules (case/The/feat/punctuation/accents) and collaboration attribution.
 
 /** The most frequent raw spelling among a group's tracks — the canonical display label. */
 private fun <T> Iterable<T>.mostCommon(): T =
@@ -572,99 +544,43 @@ private fun buildGroups(
         .map { (key, list) -> LibraryGroup(key, titleOf(key, list), subtitleOf(key, list), list) }
         .sortedBy { it.title.lowercase() }
 
-// ---- Artist identity: attribute collaborations to the PRIMARY artist ----
-// A track tagged "Falling in Reverse/Tech N9ne/Alex Terrible" (or with the guest listed
-// first, "Alex Terrible; Falling In Reverse; …") should file under Falling in Reverse, not
-// spawn phantom one-song artists. Split on collab separators and pick the member the library
-// knows best on their own — with a guard so a slash that's part of a NAME (AC/DC) is kept whole.
+// Grouping now reads the PRECOMPUTED keys stored on each Song (filled at import/retag by
+// LibraryGrouping — collaborations already attributed to their primary artist there). The
+// `?: LibraryGrouping.normKey(...)` fallbacks only fire for a row that predates precompute; a
+// migration on the next restore fills those, after which every key is present.
 
-private val artistTokensCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+/** An artist bucket's display label: the most common precomputed clean spelling (never a
+ *  collaboration/featured string), falling back to the raw artist only for pre-precompute rows. */
+private fun artistLabelOf(list: List<Song>): String =
+    list.mapNotNull { it.artistLabel }.ifEmpty { list.map { it.artist } }.mostCommon()
 
-private fun artistTokens(raw: String): List<String> = artistTokensCache.getOrPut(raw) {
-    raw.split(ARTIST_DELIM).map { normKey(it) }.filter { it.isNotEmpty() }
-}
-
-/** Counts to disambiguate collaborations, computed once per grouping pass:
- *  - [full]: how often each WHOLE artist string appears (folds AC/DC + AC-DC + ACDC → "acdc").
- *  - [solo]: how often each token appears as the SOLE credited artist (real standalone acts). */
-private class ArtistStats(songs: List<Song>) {
-    val full = HashMap<String, Int>()
-    val solo = HashMap<String, Int>()
-    init {
-        for (s in songs) {
-            full.merge(normKey(s.artist), 1, Int::plus)
-            val toks = artistTokens(s.artist)
-            if (toks.size == 1) solo.merge(toks[0], 1, Int::plus)
-        }
-    }
-}
-
-/** Grouping key for an artist string: the whole name when it's a recognised act (so slashes
- *  in names survive), else the best-known member of the collaboration, else the LEAD artist.
- *  The lead fallback means a "X & Y & Z" credit where none of X/Y/Z is a known standalone act
- *  files under X (the lead) instead of spawning a phantom "X & Y & Z" artist. */
-private fun primaryArtistKey(raw: String, stats: ArtistStats): String {
-    val whole = normKey(raw)
-    val toks = artistTokens(raw)
-    if (toks.size <= 1) return whole
-    // A known standalone act among the members wins FIRST — so "Apocalyptica, Dave Lombardo"
-    // (and every other "Apocalyptica, guest") folds into Apocalyptica even though that exact
-    // collaboration recurs. Only when NO member is a solo act do we fall back to keeping a
-    // recurring whole name (AC/DC), then to the lead token.
-    val best = toks.maxByOrNull { stats.solo[it] ?: 0 }
-    if (best != null && (stats.solo[best] ?: 0) > 0) return best
-    if ((stats.full[whole] ?: 0) >= 3) return whole   // e.g. "AC/DC" — a name, not a collab
-    return toks.first()
-}
-
-/** A clean, feat-free spelling of the part of [raw] that maps to bucket [key], or null.
- *  Checks the whole credit first (so "AC/DC" stays whole), then each collaboration piece —
- *  each with any "(feat …)" tail removed — so the header never shows a featured-guest tail. */
-private fun cleanedSpellingForKey(raw: String, key: String): String? {
-    val whole = FEAT_SUFFIX.replace(raw, "").trim()
-    if (whole.isNotEmpty() && normKey(whole) == key) return whole
-    return raw.split(ARTIST_DELIM)
-        .map { FEAT_SUFFIX.replace(it.trim(), "").trim() }
-        .firstOrNull { it.isNotEmpty() && normKey(it) == key }
-}
-
-/** Display label for an artist bucket: most common clean spelling of the part that maps to
- *  the bucket (never a collaboration/featured string); falls back to raw only if nothing maps. */
-private fun artistLabel(key: String, list: List<Song>): String {
-    val cands = list.mapNotNull { cleanedSpellingForKey(it.artist, key) }
-    return (if (cands.isNotEmpty()) cands else list.map { it.artist }).mostCommon()
-}
-
-fun albumGroups(songs: List<Song>): List<LibraryGroup> {
-    val stats = ArtistStats(songs)
-    return buildGroups(
+fun albumGroups(songs: List<Song>): List<LibraryGroup> =
+    buildGroups(
         songs,
-        keyOf = { normKey(it.albumTitle ?: "Unknown album") },
+        keyOf = { it.albumKey ?: LibraryGrouping.normKey(it.albumTitle ?: "Unknown album") },
         titleOf = { _, list ->
             list.mapNotNull { it.albumTitle }.takeIf { it.isNotEmpty() }?.mostCommon() ?: "Unknown album"
         },
         subtitleOf = { _, list ->
             // "Various artists" only when the PRIMARY artists genuinely differ — featured
-            // guests and spelling variants no longer read as a compilation.
-            val keys = list.map { primaryArtistKey(it.artist, stats) }.distinct()
-            val artist = if (keys.size == 1) artistLabel(keys[0], list) else "Various artists"
+            // guests and spelling variants collapse to one primary key so they don't read
+            // as a compilation.
+            val keys = list.map { it.artistKey ?: LibraryGrouping.normKey(it.artist) }.distinct()
+            val artist = if (keys.size == 1) artistLabelOf(list) else "Various artists"
             "$artist · ${list.size} tracks"
         },
     )
-}
 
-fun artistGroups(songs: List<Song>): List<LibraryGroup> {
-    val stats = ArtistStats(songs)
-    return buildGroups(
+fun artistGroups(songs: List<Song>): List<LibraryGroup> =
+    buildGroups(
         songs,
-        keyOf = { primaryArtistKey(it.artist, stats) },
-        titleOf = { key, list -> artistLabel(key, list) },
+        keyOf = { it.artistKey ?: LibraryGrouping.normKey(it.artist) },
+        titleOf = { _, list -> artistLabelOf(list) },
         subtitleOf = { _, list ->
-            val albums = list.mapNotNull { it.albumTitle }.map { normKey(it) }.distinct().size
+            val albums = list.map { it.albumKey ?: LibraryGrouping.normKey(it.albumTitle ?: "") }.distinct().size
             "${list.size} tracks · $albums albums"
         },
     )
-}
 
 fun folderGroups(songs: List<Song>): List<LibraryGroup> = buildGroups(
     songs,

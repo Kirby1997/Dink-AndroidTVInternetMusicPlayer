@@ -35,6 +35,15 @@ data class TrackEntity(
     val addedAtMs: Long,
     val lastPlayedMs: Long? = null,
     val playCount: Int = 0,
+    // Grouping keys precomputed at import/retag by LibraryGrouping.computeGroupingKeys, so the
+    // Albums/Artists views collapse duplicates with a plain groupBy instead of paying NFD +
+    // regex normalization on 25k rows at display time (the section-load lag). Nullable +
+    // defaulted so pre-precompute snapshots deserialize; a one-time migration fills them on the
+    // next restore. artistKey folds collaborations to their primary artist (library-wide stats),
+    // albumKey folds cosmetic title variants, artistLabel is the clean feat-free display spelling.
+    val artistKey: String? = null,
+    val albumKey: String? = null,
+    val artistLabel: String? = null,
     // Wall-clock of the last retag attempt on this row (any outcome). A normal retag skips rows
     // that already carry one, so the unfixable residue (already-correct titles that happen to
     // equal the filename, or genuinely untagged files) stops being re-checked on every press.
