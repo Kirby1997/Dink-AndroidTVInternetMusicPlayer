@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -631,6 +632,22 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
     val start = currentIdx.coerceAtLeast(0)
     val upcoming = if (currentIdx in queue.indices) queue.drop(start) else queue
 
+    // Selecting an upcoming track makes it the CURRENT track, which re-derives
+    // `upcoming` (drop(start)) — the focused row's position vanishes or now shows a
+    // different song, so D-pad focus dies where the row used to be and the list keeps
+    // its old scroll offset. On an explicit selection (not auto-advance), snap scroll
+    // and focus to row 0, where the chosen track just landed.
+    val listState = rememberLazyListState()
+    val topRowFocus = remember { FocusRequester() }
+    var pendingFocusTop by remember { mutableStateOf(false) }
+    LaunchedEffect(currentIdx) {
+        if (pendingFocusTop) {
+            pendingFocusTop = false
+            listState.scrollToItem(0)
+            runCatching { topRowFocus.requestFocus() }
+        }
+    }
+
     Box(
         modifier = modifier
             .background(V5QueueBg)
@@ -662,6 +679,7 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
                 Text("Queue is empty", style = type.body.copy(color = V5White40))
             } else {
                 LazyColumn(
+                    state = listState,
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.fillMaxSize(),
                 ) {
@@ -676,14 +694,22 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
                             song = song,
                             album = album,
                             state = state,
-                            onClick = { player.jumpTo(actualIdx) },
+                            onClick = {
+                                // Row 0 restarts the current track — indices don't shift,
+                                // so no focus snap is queued (currentIdx never changes and
+                                // the flag would fire on a later auto-advance instead).
+                                if (actualIdx != currentIdx) pendingFocusTop = true
+                                player.jumpTo(actualIdx)
+                            },
                             // Left out of the queue returns to the transport controls,
                             // not the lyrics gap → nav drawer (which opened with no
                             // selection). Right stays cancelled (queue is the edge).
-                            modifier = Modifier.focusProperties {
-                                left = playFocus
-                                right = FocusRequester.Cancel
-                            },
+                            modifier = Modifier
+                                .then(if (i == 0) Modifier.focusRequester(topRowFocus) else Modifier)
+                                .focusProperties {
+                                    left = playFocus
+                                    right = FocusRequester.Cancel
+                                },
                         )
                     }
                 }
