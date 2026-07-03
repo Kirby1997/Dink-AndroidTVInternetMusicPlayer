@@ -914,6 +914,14 @@ private fun fallbackAlbumFor(song: Song): Album {
     val palette = FALLBACK_PALETTES[seed % FALLBACK_PALETTES.size]
     val shapes = AlbumArtShape.values()
     val shape = shapes[(seed ushr 8) % shapes.size]
+    // Source badge follows the stream's actual origin — SMB tracks were showing
+    // "LOCAL · MP3" because this fallback (hit whenever the album lookup misses,
+    // i.e. most remote tracks) hardcoded LOCAL.
+    val tag = when (song.mediaUri?.substringBefore("://")?.lowercase()) {
+        "smb" -> "SMB"
+        "gdrive" -> "CLOUD"
+        else -> "LOCAL"
+    }
     return Album(
         id = "fallback-${song.id}",
         title = song.albumTitle.orEmpty(),
@@ -921,6 +929,6 @@ private fun fallbackAlbumFor(song: Song): Album {
         year = null,
         palette = palette,
         shape = shape,
-        tag = "LOCAL",
+        tag = tag,
     )
 }
