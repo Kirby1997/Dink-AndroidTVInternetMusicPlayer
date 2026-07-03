@@ -101,6 +101,7 @@ class PlayerState(
     // of spinning through every track.
     private var consecutiveErrors = 0
     private val MAX_SKIP_ON_ERROR = 8
+    private val REASON_NOT_FOUND = "file not found on share"
 
     /** Sink for tags the engine extracts while streaming (Phase 8.7). The Composable
      *  owner sets this to persist enrichment into the library index off-thread. */
@@ -358,17 +359,46 @@ class PlayerState(
      */
     internal fun onPlaybackError(error: PlaybackException) {
         val failedTitle = currentSong?.title ?: "track"
+        val reason = errorReason(error)
         consecutiveErrors++
         val skipLimit = minOf(_queue.size, MAX_SKIP_ON_ERROR)
         val nextIdx = if (consecutiveErrors <= skipLimit) pickNextIndex(advance = 1) else null
         if (nextIdx != null) {
-            playbackError = "Skipped \"$failedTitle\" — file not found on share"
+            playbackError = "Skipped \"$failedTitle\" — $reason"
             moveTo(nextIdx)
         } else {
             // Either the queue end, or we've hit the skip budget (likely share offline).
             isPlaying = false
             engine?.stop()
-            playbackError = "Can't play \"$failedTitle\" — file not found. Re-import the folder to refresh moved files."
+            val hint = if (reason == REASON_NOT_FOUND) {
+                " Re-import the folder to refresh moved files."
+            } else ""
+            playbackError = "Can't play \"$failedTitle\" — $reason.$hint"
+        }
+    }
+
+    /**
+     * Human-readable cause for a source error. Everything used to report as
+     * "file not found", which sent users re-importing healthy folders when the real
+     * problem was a dropped connection. Media3's errorCode for a custom DataSource is
+     * usually just ERROR_CODE_IO_UNSPECIFIED, so classify off the cause-chain text
+     * (same trick as SmbClient.friendlyError / SmbDataSource.isConnectionError).
+     */
+    private fun errorReason(error: PlaybackException): String {
+        val text = buildString {
+            var e: Throwable? = error
+            while (e != null) { append(e.message ?: e::class.simpleName.orEmpty()); append(' '); e = e.cause }
+        }.uppercase()
+        return when {
+            "OBJECT_NAME_NOT_FOUND" in text || "OBJECT_PATH_NOT_FOUND" in text ||
+                "FILE_NOT_FOUND" in text || "NO SUCH FILE" in text -> REASON_NOT_FOUND
+            "ACCESS_DENIED" in text || "LOGON_FAILURE" in text -> "access denied by share"
+            "TIMEOUT" in text || "TIMED OUT" in text -> "network timeout"
+            "SOCKET" in text || "CONNECTION" in text || "RESET" in text ||
+                "BROKEN PIPE" in text || "UNREACH" in text || "TRANSPORT" in text ||
+                "EOF" in text -> "network error reaching share"
+            "MALFORMED" in text || "UNRECOGNIZED" in text || "PARS" in text -> "unplayable file"
+            else -> "playback error"
         }
     }
 

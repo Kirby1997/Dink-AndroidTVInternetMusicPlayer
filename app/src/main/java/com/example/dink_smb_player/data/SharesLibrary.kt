@@ -87,7 +87,7 @@ object SharesLibrary {
         if (activeBrowseShareId == shareId) activeBrowseShareId = null
         val appContext = context.applicationContext
         scope.launch {
-            runCatching { SmbClient.close(shareId) }
+            runCatching { SmbClient.closeAllFor(shareId) }
             LibraryRepository.removeSource(appContext, SourceType.Smb, shareId)
             EncryptedShareStore(appContext).deleteSmbCreds(shareId)
             SharePrefs(appContext).deleteShare(shareId)

@@ -47,9 +47,9 @@ class PlayerStateErrorRecoveryTest {
         }
 
         /** Puts the mocked engine into the post-error state: IDLE with playerError set. */
-        fun failSource(): PlaybackException {
+        fun failSource(message: String = "Source error", cause: Throwable? = null): PlaybackException {
             val error = PlaybackException(
-                "Source error", null, PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+                message, cause, PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
             )
             whenever(engine.playerError).thenReturn(error)
             whenever(engine.playbackState).thenReturn(Player.STATE_IDLE)
@@ -87,6 +87,33 @@ class PlayerStateErrorRecoveryTest {
         assertTrue(rig.state.isPlaying)
         verify(rig.engine).prepare()
         verify(rig.engine).setPlayWhenReady(true)
+    }
+
+    @Test
+    fun `connection error is not reported as file-not-found`() {
+        val rig = Rig(queueSize = 2)
+        rig.state.playFrom(listOf(song("a"), song("b")), 0)
+
+        rig.listener.onPlayerError(
+            rig.failSource(cause = java.io.IOException("SMB read failed", RuntimeException("Connection reset by peer"))),
+        )
+
+        val msg = requireNotNull(rig.state.playbackError)
+        assertTrue("expected network wording, got: $msg", "network" in msg)
+        assertTrue("must not blame a missing file: $msg", "not found" !in msg)
+    }
+
+    @Test
+    fun `missing file error keeps file-not-found wording`() {
+        val rig = Rig(queueSize = 2)
+        rig.state.playFrom(listOf(song("a"), song("b")), 0)
+
+        rig.listener.onPlayerError(
+            rig.failSource(cause = RuntimeException("STATUS_OBJECT_NAME_NOT_FOUND")),
+        )
+
+        val msg = requireNotNull(rig.state.playbackError)
+        assertTrue("expected not-found wording, got: $msg", "file not found" in msg)
     }
 
     @Test

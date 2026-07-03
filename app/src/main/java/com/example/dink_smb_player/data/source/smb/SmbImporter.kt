@@ -193,16 +193,20 @@ object SmbImporter {
         // walk crawl; (2) a concurrent tag-read's SmbDataSource.open can evict the cached
         // connection, which would dead-handle a captured disk. Cache hit, so this is ~free.
         // Hold a permit only for the list() round-trip, not while waiting on children,
-        // so the bounded pool never deadlocks on a deep tree.
+        // so the bounded pool never deadlocks on a deep tree. While a track streams,
+        // narrowWhilePlaying additionally caps effective listing concurrency at 2 —
+        // a full-width walk starves the player (GC churn + LAN contention).
         val entries: List<FileIdBothDirectoryInformation> = gate.withPermit {
-            fun acquire(): DiskShare =
-                SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
-            runCatching { acquire().list(smbPath) }.getOrElse {
-                // First list failed — the session may have been dropped server-side. Evict
-                // and reconnect once before giving up; a genuinely unreadable folder then
-                // still falls through to the incomplete path below.
-                SmbClient.close(share.id)
-                runCatching { acquire().list(smbPath) }.getOrNull()
+            com.example.dink_smb_player.data.source.ImportThrottle.narrowWhilePlaying {
+                fun acquire(): DiskShare =
+                    SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
+                runCatching { acquire().list(smbPath) }.getOrElse {
+                    // First list failed — the session may have been dropped server-side. Evict
+                    // and reconnect once before giving up; a genuinely unreadable folder then
+                    // still falls through to the incomplete path below.
+                    SmbClient.close(share.id)
+                    runCatching { acquire().list(smbPath) }.getOrNull()
+                }
             }
         } ?: run {
             // Unreadable folder (transient network/SMB error). Skip it so a partial walk

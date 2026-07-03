@@ -526,11 +526,14 @@ private fun V5LyricsColumn(
                     style = type.monoSmall.copy(color = V5White50, fontSize = 10.sp),
                     maxLines = 1,
                 )
-                Text(
-                    text = "$nonBlankCurrentIdx / $nonBlankTotal",
-                    style = type.monoSmall.copy(color = V5White40, fontSize = 10.sp, letterSpacing = 0.08.em),
-                    maxLines = 1,
-                )
+                // No counter when there are no lyrics — "1 / 0" reads as a glitch.
+                if (nonBlankTotal > 0) {
+                    Text(
+                        text = "$nonBlankCurrentIdx / $nonBlankTotal",
+                        style = type.monoSmall.copy(color = V5White40, fontSize = 10.sp, letterSpacing = 0.08.em),
+                        maxLines = 1,
+                    )
+                }
             }
             Spacer(Modifier.height(8.dp))
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -670,8 +673,11 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
                 style = type.cardTitle.copy(color = Color.White, fontSize = 18.sp),
             )
             Spacer(Modifier.height(4.dp))
+            // "UP NEXT" counts what's still to come — the current track (row 1)
+            // isn't "up next", so it's excluded from the count and total time.
+            val upNext = if (upcoming.isEmpty()) upcoming else upcoming.drop(1)
             Text(
-                text = "${upcoming.size} TRACKS · ${formatTime(upcoming.sumOf { it.durationSec })}",
+                text = "${upNext.size} TRACKS · ${formatTime(upNext.sumOf { it.durationSec })}",
                 style = type.monoSmall.copy(color = V5White50, fontSize = 10.sp, letterSpacing = 0.08.em),
             )
             Spacer(Modifier.height(16.dp))

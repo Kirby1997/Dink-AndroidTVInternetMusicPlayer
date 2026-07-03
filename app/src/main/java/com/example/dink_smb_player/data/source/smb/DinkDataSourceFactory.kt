@@ -13,16 +13,20 @@ import com.example.dink_smb_player.data.source.cloud.CloudDataSource
  * [SmbDataSource] (smb://) and [CloudDataSource] (gdrive://) at `open()` time.
  * ExoPlayer only calls [DataSource.Factory.createDataSource] once per MediaItem,
  * so the dispatch has to happen on the live DataSource — not on the factory.
+ *
+ * [playback] = true (the player's factory only) routes SMB reads over the
+ * dedicated playback connection — see [SmbDataSource]. Import-time consumers
+ * (TagReader, duration probes, art extraction) keep the default.
  */
-class DinkDataSourceFactory(context: Context) : DataSource.Factory {
+class DinkDataSourceFactory(context: Context, private val playback: Boolean = false) : DataSource.Factory {
 
     private val ctx = context.applicationContext
 
-    override fun createDataSource(): DataSource = MultiSchemeDataSource(ctx)
+    override fun createDataSource(): DataSource = MultiSchemeDataSource(ctx, playback)
 
-    private class MultiSchemeDataSource(context: Context) : DataSource {
+    private class MultiSchemeDataSource(context: Context, playback: Boolean) : DataSource {
         private val default: DataSource = DefaultDataSource.Factory(context).createDataSource()
-        private val smb: DataSource = SmbDataSource()
+        private val smb: DataSource = SmbDataSource(playback)
         private val cloud: DataSource = CloudDataSource()
         private var active: DataSource = default
         private val listeners = mutableListOf<TransferListener>()

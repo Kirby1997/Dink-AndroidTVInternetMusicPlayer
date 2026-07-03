@@ -21,6 +21,20 @@ import java.util.EnumSet
  * we have no reliable way to map an arbitrary smb:// URI back to creds the user
  * once entered, so [open] throws.
  *
+ * [playback] = true routes through [SmbClient]'s dedicated playback client (own
+ * TCP socket), so background walks/art/tag reads can never contend with or tear
+ * down the stream's transport. The player's factory sets it; import-time readers
+ * (TagReader, duration probes, art) keep the default general connection.
+ *
+ * Error contract: everything thrown from [open]/[read] is an [IOException].
+ * smbj surfaces many failures as [RuntimeException] subclasses
+ * (SMBRuntimeException & co.) — Media3's Loader treats a RuntimeException as an
+ * unexpected FATAL error (no retry), while an IOException goes through
+ * LoadErrorHandlingPolicy: ~3 retries with backoff, each retry re-opening the
+ * source, which reconnects via [SmbClient] and self-heals a dropped session.
+ * Wrapping is the difference between "track skipped mid-play" and a sub-second
+ * rebuffer nobody notices.
+ *
  * Seek strategy: smbj [File] supports RANDOM-ACCESS positioned reads
  * ([File.read] with a `fileOffset`), so we read from `position` directly. The old
  * approach `skip`-ped an [java.io.InputStream] to the offset, which read-and-discarded
@@ -28,10 +42,13 @@ import java.util.EnumSet
  * holds DURATION) dragged the whole file over the network and timed out, so duration
  * probes silently failed. Positioned reads make a tail seek cost only the bytes wanted.
  */
-class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
+class SmbDataSource(
+    private val playback: Boolean = false,
+) : BaseDataSource(/* isNetwork = */ true) {
 
     private var currentUri: Uri? = null
     private var file: File? = null
+    private var lease: SmbClient.ShareLease? = null
     private var readOffset: Long = 0L
     private var bytesRemaining: Long = 0L
     private var opened: Boolean = false
@@ -58,21 +75,22 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
         // Mount + open with ONE reconnect retry. The cached smbj connection can have been
         // dropped server-side (idle NAS) without isConnected noticing; the first op then
         // fails, so we evict the dead entry ([SmbClient.close]) and reconnect once. The
-        // idle-threshold reconnect in SmbClient.share avoids most of these, but a session
+        // idle-threshold reconnect in SmbClient avoids most of these, but a session
         // dropped mid-use still lands here. Only one retry — a genuinely missing file or
-        // down host then surfaces as the error instead of looping.
+        // down host then surfaces as the error instead of looping. The lease pins the
+        // cache entry against proactive idle-eviction for the life of the file handle.
         var lastErr: Throwable? = null
         var f: File? = null
         for (attempt in 0..1) {
-            val disk = try {
-                SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
+            val acquired = try {
+                SmbClient.lease(share.id, share.host, share.port, share.shareName, creds, playback)
             } catch (t: Throwable) {
                 lastErr = t
-                SmbClient.close(share.id)
+                SmbClient.close(share.id, playback)
                 continue
             }
             try {
-                f = disk.openFile(
+                f = acquired.disk.openFile(
                     smbPath,
                     EnumSet.of(AccessMask.GENERIC_READ),
                     null,
@@ -80,31 +98,42 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
                     SMB2CreateDisposition.FILE_OPEN,
                     null,
                 )
+                lease = acquired
                 break
             } catch (t: Throwable) {
                 lastErr = t
+                acquired.close()
                 // Only evict + retry when the failure looks connection-level (a dropped/dead
                 // session). A per-file error (FILE_NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
                 // means the connection is fine — tearing it down would poison every other
                 // concurrent read/list (e.g. an in-progress import walk) over the same share.
-                if (isConnectionError(t)) SmbClient.close(share.id) else break
+                if (isConnectionError(t)) SmbClient.close(share.id, playback) else break
             }
         }
-        val openedFile = f ?: throw IOException("Failed to open SMB file $smbPath", lastErr)
+        val openedFile = f
+            ?: throw (lastErr as? IOException ?: IOException("Failed to open SMB file $smbPath", lastErr))
         file = openedFile
 
-        val totalLen = openedFile.fileInformation.standardInformation.endOfFile
-        val position = dataSpec.position
-        if (position > totalLen) throw IOException("Position $position past end-of-file $totalLen")
+        try {
+            val totalLen = openedFile.fileInformation.standardInformation.endOfFile
+            val position = dataSpec.position
+            if (position > totalLen) throw IOException("Position $position past end-of-file $totalLen")
 
-        bytesRemaining = if (dataSpec.length == C.LENGTH_UNSET.toLong()) {
-            totalLen - position
-        } else {
-            dataSpec.length
+            bytesRemaining = if (dataSpec.length == C.LENGTH_UNSET.toLong()) {
+                totalLen - position
+            } else {
+                dataSpec.length
+            }
+
+            // Positioned read — no whole-file skip to reach the offset (see class doc).
+            readOffset = position
+        } catch (e: IOException) {
+            close()
+            throw e
+        } catch (t: Throwable) {
+            close()
+            throw IOException("SMB stat failed for $smbPath", t)
         }
-
-        // Positioned read — no whole-file skip to reach the offset (see class doc).
-        readOffset = position
 
         opened = true
         transferStarted(dataSpec)
@@ -114,8 +143,16 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
         if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
+        val f = file ?: throw IOException("SMB read before open() / after close()")
         val want = minOf(length.toLong(), bytesRemaining).toInt()
-        val n = file!!.read(buffer, readOffset, offset, want)
+        val n = try {
+            f.read(buffer, readOffset, offset, want)
+        } catch (e: IOException) {
+            throw e
+        } catch (t: Throwable) {
+            // smbj RuntimeExceptions must become IOExceptions — see class doc.
+            throw IOException("SMB read failed at offset $readOffset", t)
+        }
         if (n == -1) return C.RESULT_END_OF_INPUT
         readOffset += n
         bytesRemaining -= n
@@ -134,7 +171,13 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
     fun readAtOffset(fileOffset: Long, buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
         val f = file ?: throw IOException("readAtOffset before open()")
-        val n = f.read(buffer, fileOffset, offset, length)
+        val n = try {
+            f.read(buffer, fileOffset, offset, length)
+        } catch (e: IOException) {
+            throw e
+        } catch (t: Throwable) {
+            throw IOException("SMB read failed at offset $fileOffset", t)
+        }
         if (n > 0) bytesTransferred(n)
         return n // smbj returns -1 at EOF
     }
@@ -159,8 +202,10 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
     override fun close() {
         try {
             runCatching { file?.close() }
+            runCatching { lease?.close() }
         } finally {
             file = null
+            lease = null
             readOffset = 0L
             bytesRemaining = 0L
             currentUri = null
@@ -171,7 +216,7 @@ class SmbDataSource : BaseDataSource(/* isNetwork = */ true) {
         }
     }
 
-    class Factory : DataSource.Factory {
-        override fun createDataSource(): DataSource = SmbDataSource()
+    class Factory(private val playback: Boolean = false) : DataSource.Factory {
+        override fun createDataSource(): DataSource = SmbDataSource(playback)
     }
 }

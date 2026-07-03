@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.IBinder
 import android.view.KeyEvent
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.Renderer
 import androidx.media3.exoplayer.RenderersFactory
@@ -53,11 +54,29 @@ class PlayerService : MediaSessionService() {
             )
         }
         // DataSource pipeline: file:// / content:// / http(s) keep DefaultDataSource;
-        // smb:// routes through SmbDataSource (smbj). Cloud schemes will join here.
+        // smb:// routes through SmbDataSource (smbj) on the DEDICATED playback
+        // connection (playback = true) so imports/walks can't contend with the stream.
         val mediaSourceFactory = DefaultMediaSourceFactory(this)
-            .setDataSourceFactory(DinkDataSourceFactory(this))
+            .setDataSourceFactory(DinkDataSourceFactory(this, playback = true))
+        // Audio is cheap (~10 MB for 5 min of 320 kbps): buffer far ahead so playback
+        // rides out background SMB contention (a monitor walk is ~2 min) and NAS
+        // hiccups without rebuffering. Byte cap stays at DefaultLoadControl's
+        // audio default (~13 MB) — this is a 32-bit device, don't balloon the heap.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                /* minBufferMs = */ DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                /* maxBufferMs = */ 300_000,
+                /* bufferForPlaybackMs = */ DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+                /* bufferForPlaybackAfterRebufferMs = */
+                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
+            )
+            // Keep 30 s behind the playhead so a short seek-back replays from RAM
+            // instead of re-opening the SMB file.
+            .setBackBuffer(/* backBufferDurationMs = */ 30_000, /* retainBackBufferFromKeyframe = */ false)
+            .build()
         val player = ExoPlayer.Builder(this, audioOnlyRenderers)
             .setMediaSourceFactory(mediaSourceFactory)
+            .setLoadControl(loadControl)
             .setHandleAudioBecomingNoisy(true)
             .build()
         exoPlayer = player
