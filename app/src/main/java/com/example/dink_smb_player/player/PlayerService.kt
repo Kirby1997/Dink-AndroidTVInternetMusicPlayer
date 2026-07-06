@@ -8,6 +8,8 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.view.KeyEvent
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
@@ -78,6 +80,17 @@ class PlayerService : MediaSessionService() {
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             .setHandleAudioBecomingNoisy(true)
+            // Request + respect system audio focus: pause when another app (e.g. a video
+            // app) starts playing, and re-request focus on our next play(). Without this
+            // Media3 never asks for focus, so Dink talks over other apps and the two live
+            // "playing" sessions fight over the remote's media keys.
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                /* handleAudioFocus = */ true,
+            )
             .build()
         exoPlayer = player
 
