@@ -3,6 +3,22 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.2.2] - 2026-07-06
+
+### Fixed
+- **Dink now respects other apps' audio.** Starting playback in another app (for example
+  SmartTube) pauses Dink instead of both playing over each other. Previously Dink never
+  requested audio focus, so it talked over other apps and the two "playing" sessions
+  fought over the remote's media keys, making playback hard to stop. Dink stays paused
+  when the other app finishes and picks up focus again when you press play.
+- **Mid-track stream errors fixed at the root.** Playback streams over its own dedicated
+  SMB connection so background library walks, imports, cover art and tag reads can no
+  longer close the connection under a live track. Transient network errors mid-stream now
+  retry instead of skipping to the next song, and the idle-connection cleanup no longer
+  evicts a connection that still has a file open.
+- **Now Playing polish.** Focus returns to the queue after selecting an upcoming track,
+  and the source badge shows SMB/CLOUD correctly for remote tracks instead of LOCAL.
+
 ## [1.2.1] - 2026-07-02
 
 ### Fixed
