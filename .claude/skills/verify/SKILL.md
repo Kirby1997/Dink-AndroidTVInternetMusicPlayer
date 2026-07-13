@@ -43,3 +43,5 @@ SmartTube installed: `org.smarttube.stable` (and `.beta`). `monkey -p org.smartt
 
 - Deploy/verify `com.dink.player`, NOT `com.example.dink_smb_player` (orphan package trap).
 - Leave the TV paused when done — playback keeps going on the user's real TV otherwise.
+- `INSTALL_FAILED_INSUFFICIENT_STORAGE`: TV /data is 4GB and runs ~90%+ full. `adb shell pm trim-caches 2G` frees enough for an install; check with `adb shell df -h /data`.
+- If adb says `device unauthorized`, the TV is showing an "Allow USB debugging?" dialog — tick "Always allow" and accept (drivable over the existing adb input pipe: keyevent 23 toggles checkbox when focused, 20 then 23 hits Allow).

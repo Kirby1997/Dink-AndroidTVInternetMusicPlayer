@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -27,17 +28,24 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.min
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.LocalContentFocus
@@ -58,6 +66,9 @@ import com.example.dink_smb_player.ui.components.SongCard
 import com.example.dink_smb_player.ui.components.ThinLoadingBar
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 private data class HomeFeed(
     val resumeSong: Song,
@@ -147,96 +158,125 @@ fun HomeScreen(
     // Column + verticalScroll so all four sections (Hero + 3 shelves) stay composed.
     // The per-shelf FocusRequester chain breaks if a target shelf is disposed
     // (LazyColumn would do that); spatial-driven page scroll just follows focus.
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-    ) {
-        Hero(
-            song = resumeSong,
-            album = resumeAlbum,
-            railRequester = railRequester,
-            heroRequester = heroRequester,
-            downTarget = recentFirstRequester,
-            onContinue = onContinue,
-            onAddToQueue = {
-                player.addToQueue(resumeSong)
-                onToast("Added ${resumeSong.title} to queue")
-            },
-            onViewAlbum = { onNavigate(ScreenId.Albums) },
-        )
-        Spacer(Modifier.height(40.dp))
-        if (feed.recentlyPlayed.isNotEmpty()) {
-            ShelfRow(
-                title = "Recently played",
-                eyebrow = "Across all your sources",
-                onViewAll = { onNavigate(ScreenId.Songs) },
-                onEnterRequester = recentFirstRequester,
-            ) {
-                itemsIndexed(feed.recentlyPlayed) { idx, (song, album) ->
-                    SongCard(
-                        song = song,
-                        album = album,
-                        onClick = {
-                            player.playFrom(feed.recentlyPlayed.map { it.first }, idx)
-                            onNavigate(ScreenId.NowPlaying)
-                        },
-                        modifier = cardFocus(
-                            railRequester = railRequester,
-                            isLeftEdge = idx == 0,
-                            upTarget = heroRequester,
-                            downTarget = newFirstRequester,
-                        ).let { if (idx == 0) it.focusRequester(recentFirstRequester) else it },
-                    )
+    // BoxWithConstraints sits OUTSIDE the scroll so maxHeight is the real viewport:
+    // the hero must fit it entirely, otherwise focusing a hero button makes
+    // bringIntoView scroll the title's top edge off screen.
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val heroHeight = min(620.dp, maxHeight)
+        val scrollState = rememberScrollState()
+        var heroFocused by remember { mutableStateOf(false) }
+        // The TV bring-into-view spec scrolls a focused hero button toward the viewport's
+        // pivot even when it's already fully visible, shoving the title off the top. The
+        // hero fits the viewport, so pin the page to the top while focus is inside it.
+        // A one-shot scrollTo(0) loses the race — the spec's scroll launches after ours
+        // and cancels it via the scroll mutex — so keep pulling back until it settles.
+        LaunchedEffect(heroFocused) {
+            if (!heroFocused) return@LaunchedEffect
+            snapshotFlow { scrollState.value }.collect { offset ->
+                if (offset != 0) {
+                    try {
+                        scrollState.animateScrollTo(0)
+                    } catch (e: CancellationException) {
+                        // Mutex steal by the bring-into-view scroll, not our own
+                        // cancellation — stay alive and re-assert on the next change.
+                        currentCoroutineContext().ensureActive()
+                    }
                 }
             }
         }
-        if (feed.newOnShares.isNotEmpty()) {
-            ShelfRow(
-                title = "New in your library",
-                eyebrow = "Recently imported",
-                onViewAll = { onNavigate(ScreenId.Albums) },
-                onEnterRequester = newFirstRequester,
-            ) {
-                itemsIndexed(feed.newOnShares) { idx, album ->
-                    AlbumCard(
-                        album = album,
-                        onClick = { onNavigate(ScreenId.Albums) },
-                        modifier = cardFocus(
-                            railRequester = railRequester,
-                            isLeftEdge = idx == 0,
-                            upTarget = recentFirstRequester,
-                            downTarget = acrossFirstRequester,
-                        ).let { if (idx == 0) it.focusRequester(newFirstRequester) else it },
-                    )
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(scrollState),
+        ) {
+            Hero(
+                song = resumeSong,
+                album = resumeAlbum,
+                height = heroHeight,
+                railRequester = railRequester,
+                heroRequester = heroRequester,
+                downTarget = recentFirstRequester,
+                onFocusedChange = { heroFocused = it },
+                onContinue = onContinue,
+                onAddToQueue = {
+                    player.addToQueue(resumeSong)
+                    onToast("Added ${resumeSong.title} to queue")
+                },
+                onViewAlbum = { onNavigate(ScreenId.Albums) },
+            )
+            Spacer(Modifier.height(40.dp))
+            if (feed.recentlyPlayed.isNotEmpty()) {
+                ShelfRow(
+                    title = "Recently played",
+                    eyebrow = "Across all your sources",
+                    onViewAll = { onNavigate(ScreenId.Songs) },
+                    onEnterRequester = recentFirstRequester,
+                ) {
+                    itemsIndexed(feed.recentlyPlayed) { idx, (song, album) ->
+                        SongCard(
+                            song = song,
+                            album = album,
+                            onClick = {
+                                player.playFrom(feed.recentlyPlayed.map { it.first }, idx)
+                                onNavigate(ScreenId.NowPlaying)
+                            },
+                            modifier = cardFocus(
+                                railRequester = railRequester,
+                                isLeftEdge = idx == 0,
+                                upTarget = heroRequester,
+                                downTarget = newFirstRequester,
+                            ).let { if (idx == 0) it.focusRequester(recentFirstRequester) else it },
+                        )
+                    }
                 }
             }
-        }
-        if (feed.acrossShares.isNotEmpty()) {
-            ShelfRow(
-                title = "Across your sources",
-                eyebrow = "A spin through everything you've added",
-                onViewAll = { onNavigate(ScreenId.Songs) },
-                onEnterRequester = acrossFirstRequester,
-            ) {
-                itemsIndexed(feed.acrossShares) { idx, (song, album) ->
-                    SongCard(
-                        song = song,
-                        album = album,
-                        onClick = {
-                            player.playFrom(feed.acrossShares.map { it.first }, idx)
-                            onNavigate(ScreenId.NowPlaying)
-                        },
-                        modifier = cardFocus(
-                            railRequester = railRequester,
-                            isLeftEdge = idx == 0,
-                            upTarget = newFirstRequester,
-                        ).let { if (idx == 0) it.focusRequester(acrossFirstRequester) else it },
-                    )
+            if (feed.newOnShares.isNotEmpty()) {
+                ShelfRow(
+                    title = "New in your library",
+                    eyebrow = "Recently imported",
+                    onViewAll = { onNavigate(ScreenId.Albums) },
+                    onEnterRequester = newFirstRequester,
+                ) {
+                    itemsIndexed(feed.newOnShares) { idx, album ->
+                        AlbumCard(
+                            album = album,
+                            onClick = { onNavigate(ScreenId.Albums) },
+                            modifier = cardFocus(
+                                railRequester = railRequester,
+                                isLeftEdge = idx == 0,
+                                upTarget = recentFirstRequester,
+                                downTarget = acrossFirstRequester,
+                            ).let { if (idx == 0) it.focusRequester(newFirstRequester) else it },
+                        )
+                    }
                 }
             }
+            if (feed.acrossShares.isNotEmpty()) {
+                ShelfRow(
+                    title = "Across your sources",
+                    eyebrow = "A spin through everything you've added",
+                    onViewAll = { onNavigate(ScreenId.Songs) },
+                    onEnterRequester = acrossFirstRequester,
+                ) {
+                    itemsIndexed(feed.acrossShares) { idx, (song, album) ->
+                        SongCard(
+                            song = song,
+                            album = album,
+                            onClick = {
+                                player.playFrom(feed.acrossShares.map { it.first }, idx)
+                                onNavigate(ScreenId.NowPlaying)
+                            },
+                            modifier = cardFocus(
+                                railRequester = railRequester,
+                                isLeftEdge = idx == 0,
+                                upTarget = newFirstRequester,
+                            ).let { if (idx == 0) it.focusRequester(acrossFirstRequester) else it },
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(48.dp))
         }
-        Spacer(Modifier.height(48.dp))
     }
 }
 
@@ -325,9 +365,11 @@ private fun EmptyHome(onNavigate: (ScreenId) -> Unit) {
 private fun Hero(
     song: Song,
     album: Album,
+    height: Dp,
     railRequester: FocusRequester,
     heroRequester: FocusRequester,
     downTarget: FocusRequester,
+    onFocusedChange: (Boolean) -> Unit,
     onContinue: () -> Unit,
     onAddToQueue: () -> Unit,
     onViewAlbum: () -> Unit,
@@ -335,10 +377,13 @@ private fun Hero(
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
 
+    // Height is capped to the visible viewport by the caller. If the hero exceeded it,
+    // focusing a hero button would bring-into-view scroll the title off the top edge.
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(620.dp),
+            .height(height)
+            .onFocusChanged { onFocusedChange(it.hasFocus) },
     ) {
         // Blurred album-art background, scaled past the bounds so the blur edge doesn't show.
         CoverArt(
@@ -399,6 +444,10 @@ private fun Hero(
             Text(
                 text = song.title,
                 style = type.heroTitle.copy(color = palette.ink0),
+                // Long titles wrapped to 3+ lines make the hero taller than the viewport,
+                // which re-clips the title top when a hero button takes focus.
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
             Text(
                 text = buildString {
@@ -408,7 +457,6 @@ private fun Hero(
                 },
                 style = type.body.copy(color = palette.ink1),
             )
-            Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 GradientButton(
                     label = "Continue Playing",
