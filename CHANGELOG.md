@@ -3,6 +3,35 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.2.4] - 2026-07-13
+
+### Fixed
+- **Home screen no longer bounces when moving between the hero buttons.** Changing focus
+  between Continue Playing / Add to Queue / View Album kicked off a scroll tug-of-war;
+  the page now only scrolls when something is actually off screen.
+- **It's clear there's more below the hero.** The first shelf's header now peeks above
+  the fold instead of the hero filling the screen exactly; long titles use a slightly
+  smaller size on compact screens so everything fits.
+- **Album cards go to the album.** "New in your library" cards and the hero's View Album
+  button open that album's track list; Back returns to Home. Previously they dumped you
+  on the top-level Albums screen.
+- **Fresh-start play works.** The hero waits for the saved session to finish restoring,
+  so Continue Playing always acts on the real resume track — no more dead presses, and
+  no more brief flash of the alphabetically-first song ("!…") at launch.
+- **Mini player shows cover art** (the tile was always empty), and the hero's source
+  line shows the parent folder instead of the full network path.
+
+### Added
+- **The remote's play button works even when Dink isn't running.** A media-button press
+  with the app closed rebuilds the last session (queue + position) and resumes playback;
+  opening the app afterwards picks the session up without interrupting it.
+
+### Changed
+- **Faster, smoother launch.** Credential-store setup, library restore bookkeeping and
+  the local-media import moved off the UI thread; the restored (paused) queue is handed
+  to the audio engine on first play instead of during launch; the Home shelves render a
+  beat after the hero so the first paint isn't one long stall.
+
 ## [1.2.3] - 2026-07-13
 
 ### Fixed
