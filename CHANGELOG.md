@@ -3,6 +3,16 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.2.3] - 2026-07-13
+
+### Fixed
+- **Home hero no longer cuts off the song title.** Focusing Continue Playing (or the
+  other hero buttons) scrolled the page so the top of the song name — and the RESUME
+  pill and source line above it — slid off the top of the screen. The hero now sizes
+  itself to the visible area and the page stays pinned to the top while focus is in
+  the hero, so the whole resume card is always readable. Very long song titles trim
+  to two lines with an ellipsis instead of pushing the buttons off screen.
+
 ## [1.2.2] - 2026-07-06
 
 ### Fixed
