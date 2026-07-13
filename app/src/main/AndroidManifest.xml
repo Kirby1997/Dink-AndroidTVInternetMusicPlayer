@@ -57,6 +57,19 @@
             </intent-filter>
         </service>
 
+        <!-- Receives hardware MEDIA_BUTTON presses when no live MediaSession exists (app
+             swiped away / process dead): starts PlayerService, whose
+             onPlaybackResumption() rebuilds the queue from PlaybackStore. Also silences
+             the framework's "couldn't find a unique registered media button receiver"
+             warning that made key routing flaky after other media apps died. -->
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
         <!-- Volume mount/unmount fires LocalSyncWorker so MediaStore.EXTERNAL_CONTENT_URI
              gets re-queried when the user plugs in a USB drive or SD card.
              android:scheme="file" is mandatory: MEDIA_MOUNTED intents always carry a

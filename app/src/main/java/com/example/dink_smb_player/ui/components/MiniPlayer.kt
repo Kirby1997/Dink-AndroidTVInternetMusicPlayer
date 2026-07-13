@@ -36,6 +36,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 
@@ -50,6 +51,7 @@ data class MiniPlayerState(
 @Composable
 fun MiniPlayer(
     state: MiniPlayerState,
+    song: Song? = null,
     onPlayPause: () -> Unit,
     onPrev: () -> Unit,
     onNext: () -> Unit,
@@ -68,12 +70,25 @@ fun MiniPlayer(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        Box(
-            modifier = Modifier
-                .size(64.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(palette.bg2),
-        )
+        if (song != null) {
+            // Same art as the hero/cards for the same track: embedded cover when cached,
+            // else the deterministic procedural fallback. Was a blank tile before.
+            val art = remember(song.id) { synthAlbumFor(song) }
+            CoverArt(
+                song = song,
+                palette = art.palette,
+                shape = art.shape,
+                cornerRadius = 10.dp,
+                modifier = Modifier.size(64.dp),
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(palette.bg2),
+            )
+        }
         Column(modifier = Modifier.width(260.dp)) {
             Text(
                 text = state.title,

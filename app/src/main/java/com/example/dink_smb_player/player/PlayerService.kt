@@ -10,6 +10,8 @@ import android.os.IBinder
 import android.view.KeyEvent
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
@@ -21,7 +23,19 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.example.dink_smb_player.MainActivity
+import com.example.dink_smb_player.data.library.LibraryRepository
+import com.example.dink_smb_player.data.prefs.EncryptedShareStore
+import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.smb.DinkDataSourceFactory
+import com.example.dink_smb_player.data.source.smb.SmbConnectionRegistry
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 /**
  * Foreground media service that hosts the ExoPlayer + MediaSession.
@@ -36,6 +50,7 @@ class PlayerService : MediaSessionService() {
     private var exoPlayer: ExoPlayer? = null
     private var mediaSession: MediaSession? = null
     private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     inner class LocalBinder : Binder() {
         fun getPlayer(): ExoPlayer = requireNotNull(exoPlayer) {
@@ -150,6 +165,78 @@ class PlayerService : MediaSessionService() {
             }
             return super.onMediaButtonEvent(session, controllerInfo, intent)
         }
+
+        /**
+         * A media key arrived with no live playback (service just started by
+         * MediaButtonReceiver, or the engine was stopped): rebuild the last session
+         * from [PlaybackStore] so the remote's ▶ resumes where the user left off even
+         * after the app was swiped away. Same id-resolution as [PlayerState.restore];
+         * windowed because handing the engine a 1000-item queue builds that many
+         * MediaSources on this 32-bit device.
+         */
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
+            serviceScope.launch {
+                val ctx = applicationContext
+                try {
+                    val snap = PlaybackStore.load(ctx)
+                        ?: throw IllegalStateException("no saved playback session")
+                    LibraryRepository.ensureRestored(ctx)
+                    // Cold process (started by MediaButtonReceiver, no activity ever ran):
+                    // the SMB registry is empty, so every smb:// open would fail with
+                    // "Unknown SMB share id". Hydrate shares + creds from disk, same as
+                    // MonitorWorker does for its cold-process walks. Idempotent when the
+                    // activity is alive — it maintains the same registry.
+                    val shares = runCatching { SharePrefs(ctx).shares.first() }.getOrDefault(emptyList())
+                    if (shares.isNotEmpty()) SmbConnectionRegistry.update(shares)
+                    val secretStore = EncryptedShareStore(ctx)
+                    SmbConnectionRegistry.installCredLookup { sid ->
+                        runCatching { secretStore.getSmbCreds(sid) }.getOrNull()
+                    }
+                    val byId = LibraryRepository.songsNow(ctx).associateBy { it.id }
+                    val resolved = snap.queueIds.mapNotNull { byId[it] }.filter { it.mediaUri != null }
+                    if (resolved.isEmpty()) {
+                        throw IllegalStateException("saved session resolves to no playable tracks")
+                    }
+                    val wantedId = snap.queueIds.getOrNull(snap.index)
+                    val idx = resolved.indexOfFirst { it.id == wantedId }
+                        .let { if (it >= 0) it else snap.index.coerceIn(0, resolved.lastIndex) }
+                    val start = (idx - RESUME_WINDOW / 2)
+                        .coerceIn(0, (resolved.size - RESUME_WINDOW).coerceAtLeast(0))
+                    val window = resolved.subList(start, minOf(resolved.size, start + RESUME_WINDOW))
+                    val items = window.map { song ->
+                        val builder = MediaItem.Builder().setMediaId(song.id).setUri(song.mediaUri)
+                        // Local tracks carry clean MediaStore tags; remote (smb/gdrive) ones
+                        // stay metadata-less so the engine's embedded-tag parse isn't masked
+                        // (same rule as PlayerState.mediaItemFor).
+                        val scheme = song.mediaUri?.substringBefore("://")?.lowercase()
+                        if (scheme != "smb" && scheme != "gdrive") {
+                            builder.setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle(song.title)
+                                    .setArtist(song.artist)
+                                    .apply { song.albumTitle?.let { setAlbumTitle(it) } }
+                                    .build(),
+                            )
+                        }
+                        builder.build()
+                    }
+                    future.set(
+                        MediaSession.MediaItemsWithStartPosition(
+                            items,
+                            idx - start,
+                            (snap.positionSec * 1000).toLong(),
+                        ),
+                    )
+                } catch (t: Throwable) {
+                    future.setException(t)
+                }
+            }
+            return future
+        }
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
@@ -172,6 +259,7 @@ class PlayerService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        serviceScope.cancel()
         EqEngine.release()
         mediaSession?.run {
             player.release()
@@ -184,5 +272,8 @@ class PlayerService : MediaSessionService() {
 
     companion object {
         const val ACTION_BIND_LOCAL = "com.example.dink_smb_player.player.BIND_LOCAL"
+
+        /** Queue slice handed to the engine on media-button playback resumption. */
+        private const val RESUME_WINDOW = 100
     }
 }

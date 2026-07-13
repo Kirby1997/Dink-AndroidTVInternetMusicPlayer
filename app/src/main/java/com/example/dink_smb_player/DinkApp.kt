@@ -155,12 +155,17 @@ fun DinkApp() {
     LaunchedEffect(Unit) {
         // Rebuild the in-memory library index from disk first so imported SMB tracks
         // (and stats) survive a restart, then refresh local MediaStore on top.
-        LibraryRepository.ensureRestored(context)
-        PlaylistRepository.ensureRestored(context)
-        val audioPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
-        if (ContextCompat.checkSelfPermission(context, audioPerm) == PackageManager.PERMISSION_GRANTED) {
-            MediaLibrary.loadOnce(context)
+        // Whole pipeline on Default: the restore upserts and loadOnce's importSource
+        // (index merge + full persist snapshot) are pure computation that stalled the
+        // first frames when run on this LaunchedEffect's main dispatcher.
+        withContext(Dispatchers.Default) {
+            LibraryRepository.ensureRestored(context)
+            PlaylistRepository.ensureRestored(context)
+            val audioPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
+            if (ContextCompat.checkSelfPermission(context, audioPerm) == PackageManager.PERMISSION_GRANTED) {
+                MediaLibrary.loadOnce(context)
+            }
         }
     }
 
@@ -169,7 +174,9 @@ fun DinkApp() {
     // `?sid=` for any persisted share — across the whole app, not just while
     // SmbSharesScreen is composed.
     LaunchedEffect(Unit) {
-        val secretStore = EncryptedShareStore(context.applicationContext)
+        // EncryptedSharedPreferences creation does Keystore + Tink init and a prefs
+        // read — ~350ms measured on this TV. Off main; it stalled the first frames.
+        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore(context.applicationContext) }
         SmbConnectionRegistry.installCredLookup { sid -> secretStore.getSmbCreds(sid) }
         val sharePrefs = SharePrefs(context.applicationContext)
         sharePrefs.shares.collect { shares -> SmbConnectionRegistry.update(shares) }
@@ -180,7 +187,8 @@ fun DinkApp() {
     // persisted providers into the registry so CloudDataSource can resolve `?pid=`
     // app-wide — even resuming a cloud track without opening CloudScreen.
     LaunchedEffect(Unit) {
-        val secretStore = EncryptedShareStore(context.applicationContext)
+        // Same Keystore-init cost as the SMB store above — keep off main.
+        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore(context.applicationContext) }
         CloudConnectionRegistry.installTokenStore(
             get = { pid -> secretStore.getCloudToken(pid) },
             put = { pid, token -> secretStore.putCloudToken(pid, token) },
@@ -366,6 +374,7 @@ fun DinkApp() {
                         )
                         MiniPlayer(
                             state = miniState,
+                            song = player.currentSong,
                             onPlayPause = player::togglePlayPause,
                             onPrev = player::prev,
                             onNext = player::next,

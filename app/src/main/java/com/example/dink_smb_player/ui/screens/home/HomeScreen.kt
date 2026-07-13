@@ -1,7 +1,10 @@
 package com.example.dink_smb_player.ui.screens.home
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.BringIntoViewSpec
+import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -25,6 +28,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.QueueMusic
 import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -32,6 +36,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
@@ -46,10 +51,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.min
+import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
+import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.AlbumArtShape
@@ -64,6 +71,8 @@ import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.components.ShelfRow
 import com.example.dink_smb_player.ui.components.SongCard
 import com.example.dink_smb_player.ui.components.ThinLoadingBar
+import com.example.dink_smb_player.ui.screens.library.LibraryDetailNav
+import com.example.dink_smb_player.ui.screens.library.albumGroups
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.CancellationException
@@ -74,11 +83,13 @@ private data class HomeFeed(
     val resumeSong: Song,
     val resumeAlbum: Album,
     val recentlyPlayed: List<Pair<Song, Album?>>,
-    val newOnShares: List<Album>,
+    /** Album card + a representative song from it, so a click can resolve the album's
+     *  track list (the synth Album alone can't — its id is a synthetic art seed). */
+    val newOnShares: List<Pair<Album, Song>>,
     val acrossShares: List<Pair<Song, Album?>>,
 )
 
-@OptIn(ExperimentalTvMaterial3Api::class)
+@OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun HomeScreen(
     player: PlayerState,
@@ -95,13 +106,21 @@ fun HomeScreen(
     // True until the on-disk index finishes loading at boot. Distinguishes a genuinely
     // empty library from one that just hasn't been restored yet — see the feed == null branch.
     val restored by LibraryRepository.restoredState.collectAsState()
+    // initial = null (not emptyList) so "the DB hasn't answered yet" is distinguishable
+    // from "genuinely no play history". With an emptyList initial the feed fell back to
+    // library.firstOrNull() — alphabetically-first track ("!…") — and the hero flashed a
+    // wrong song on every cold launch until the real recently-played rows arrived.
     val recentPlayed by remember(context) { LibraryRepository.recentlyPlayed(context, 12) }
-        .collectAsState(initial = emptyList())
+        .collectAsState(initial = null)
     val recentAdded by remember(context) { LibraryRepository.recentlyAdded(context, 12) }
         .collectAsState(initial = emptyList())
 
+    // Per-composition seed for the "Across your sources" sample: fresh picks each visit,
+    // stable across feed rebuilds (index updates during an import walk used to reshuffle
+    // the cards mid-browse because selection was keyed on the list instance).
+    val acrossSeed = remember { kotlin.random.Random.nextInt() }
     val feed = remember(allSongs, recentPlayed, recentAdded) {
-        buildHomeFeed(allSongs, recentPlayed, recentAdded)
+        recentPlayed?.let { buildHomeFeed(allSongs, it, recentAdded, acrossSeed) }
     }
 
     // Empty library → an invitation, not a barren hero. Keeps a focusable so the drawer
@@ -115,8 +134,13 @@ fun HomeScreen(
     // and the hero. So consult the SYNCHRONOUS index count, which reflects restore the
     // instant it upserts: show EmptyHome only when restore is done AND the index is truly
     // empty; otherwise we're still settling — show loading.
-    if (feed == null) {
-        val indexEmpty = restored && LibraryRepository.trackCountNow(context) == 0
+    // Also hold the loading screen until the launch session-restore has finished:
+    // rendering the hero earlier made "Continue Playing" act on a player whose queue and
+    // engine weren't populated yet (press → nothing plays), and showed the index's stale
+    // resume guess instead of the actually-restored track.
+    if (feed == null || !player.sessionRestoreDone) {
+        val indexEmpty = restored && player.sessionRestoreDone &&
+            LibraryRepository.trackCountNow(context) == 0
         if (indexEmpty) EmptyHome(onNavigate = onNavigate) else HomeLoading()
         return
     }
@@ -128,14 +152,27 @@ fun HomeScreen(
     val acrossFirstRequester = remember { FocusRequester() }
     val heroRequester = remember { FocusRequester() }
 
-    LaunchedEffect(feed.resumeSong.id, player.sessionRestoreDone) {
+    LaunchedEffect(feed.resumeSong.id) {
         // Preload the resume track so the mini player + Now Playing have data before the
-        // user lifts a finger. Lyrics resolve via DinkApp's currentSong effect.
-        // Wait for the launch session-restore to finish first: if a real session was
-        // restored (track + position + queue) currentSong is already set and this no-ops,
-        // so the richer restored state isn't clobbered by a position-0 single-track load.
-        if (player.sessionRestoreDone && player.currentSong == null) {
+        // user lifts a finger. Lyrics resolve via DinkApp's currentSong effect. The gate
+        // above guarantees the launch session-restore already ran, so a null currentSong
+        // here really means "no saved session" — a restored one can't be clobbered.
+        if (player.currentSong == null) {
             player.load(feed.resumeSong, feed.resumeAlbum, emptyList(), autoplay = false)
+        }
+    }
+
+    // Open one album's track list (the LibraryDetail screen), resolved from a
+    // representative song by the same key normalisation the Albums screen groups with.
+    // Parent = Home so the rail highlights Home and Back lands back here, not on Albums.
+    val openAlbumDetail: (Song) -> Unit = { rep ->
+        val key = rep.albumKey ?: LibraryGrouping.normKey(rep.albumTitle ?: "Unknown album")
+        val albumSongs = allSongs.filter {
+            (it.albumKey ?: LibraryGrouping.normKey(it.albumTitle ?: "Unknown album")) == key
+        }.ifEmpty { listOf(rep) }
+        albumGroups(albumSongs).firstOrNull()?.let { group ->
+            LibraryDetailNav.open(group, "Album", ScreenId.Home)
+            onNavigate(ScreenId.LibraryDetail)
         }
     }
 
@@ -161,15 +198,54 @@ fun HomeScreen(
     // BoxWithConstraints sits OUTSIDE the scroll so maxHeight is the real viewport:
     // the hero must fit it entirely, otherwise focusing a hero button makes
     // bringIntoView scroll the title's top edge off screen.
+    // Shelves compose two frames after the hero: first-composing the hero plus ~35
+    // shelf cards in one pass was a single ~1.7s main-thread block on this TV. The
+    // hero (what the user actually looks at first) now lands immediately and the
+    // shelves follow within a blink. Focus-safe: the hero's Down target stays null
+    // until the shelf targets exist.
+    var shelvesReady by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        withFrameNanos { }
+        shelvesReady = true
+    }
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val heroHeight = min(620.dp, maxHeight)
+        // Leave a strip below the hero so the first shelf's header peeks above the fold;
+        // a hero that exactly fills the viewport hid that there is anything to scroll to.
+        val heroHeight = min(620.dp, (maxHeight - 56.dp).coerceAtLeast(240.dp))
         val scrollState = rememberScrollState()
         var heroFocused by remember { mutableStateOf(false) }
-        // The TV bring-into-view spec scrolls a focused hero button toward the viewport's
-        // pivot even when it's already fully visible, shoving the title off the top. The
-        // hero fits the viewport, so pin the page to the top while focus is inside it.
-        // A one-shot scrollTo(0) loses the race — the spec's scroll launches after ours
-        // and cancels it via the scroll mutex — so keep pulling back until it settles.
+        // The platform TV bring-into-view spec scrolls a focused child toward the
+        // viewport's pivot even when it's already fully visible. On this page that meant
+        // every hero-button focus change kicked off a pivot scroll which the pin-to-top
+        // loop below then animated back — a visible bounce on each Left/Right press.
+        // Vertically we only ever want "reveal the item": scroll zero when it's already
+        // fully on screen, else the minimum distance to its nearest edge.
+        val revealOnlySpec = remember {
+            object : BringIntoViewSpec {
+                override fun calculateScrollDistance(
+                    offset: Float,
+                    size: Float,
+                    containerSize: Float,
+                ): Float {
+                    val trailing = offset + size
+                    return when {
+                        offset >= 0f && trailing <= containerSize -> 0f
+                        offset < 0f && trailing <= containerSize -> offset
+                        trailing > containerSize && offset >= 0f -> trailing - containerSize
+                        else -> 0f // taller than the viewport — no scroll fully reveals it
+                    }
+                }
+            }
+        }
+        // Shelf rows keep the TV pivot spec for their HORIZONTAL card browsing — the
+        // look-ahead of upcoming cards is what makes D-pad row scrolling feel right.
+        val pivotSpec = LocalBringIntoViewSpec.current
+        // With the reveal-only spec, entering the hero from a shelf scrolls just enough
+        // to expose the focused button — the title above it could stay clipped. The hero
+        // fits the viewport, so pull the page to the top while focus is inside it. The
+        // spec no longer re-scrolls fully-visible items, so nothing fights this back.
         LaunchedEffect(heroFocused) {
             if (!heroFocused) return@LaunchedEffect
             snapshotFlow { scrollState.value }.collect { offset ->
@@ -177,13 +253,14 @@ fun HomeScreen(
                     try {
                         scrollState.animateScrollTo(0)
                     } catch (e: CancellationException) {
-                        // Mutex steal by the bring-into-view scroll, not our own
+                        // Mutex steal by a bring-into-view scroll, not our own
                         // cancellation — stay alive and re-assert on the next change.
                         currentCoroutineContext().ensureActive()
                     }
                 }
             }
         }
+        CompositionLocalProvider(LocalBringIntoViewSpec provides revealOnlySpec) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -195,16 +272,18 @@ fun HomeScreen(
                 height = heroHeight,
                 railRequester = railRequester,
                 heroRequester = heroRequester,
-                downTarget = recentFirstRequester,
+                downTarget = if (shelvesReady) recentFirstRequester else null,
                 onFocusedChange = { heroFocused = it },
                 onContinue = onContinue,
                 onAddToQueue = {
                     player.addToQueue(resumeSong)
                     onToast("Added ${resumeSong.title} to queue")
                 },
-                onViewAlbum = { onNavigate(ScreenId.Albums) },
+                onViewAlbum = { openAlbumDetail(resumeSong) },
             )
             Spacer(Modifier.height(40.dp))
+            if (shelvesReady) {
+            CompositionLocalProvider(LocalBringIntoViewSpec provides pivotSpec) {
             if (feed.recentlyPlayed.isNotEmpty()) {
                 ShelfRow(
                     title = "Recently played",
@@ -237,10 +316,10 @@ fun HomeScreen(
                     onViewAll = { onNavigate(ScreenId.Albums) },
                     onEnterRequester = newFirstRequester,
                 ) {
-                    itemsIndexed(feed.newOnShares) { idx, album ->
+                    itemsIndexed(feed.newOnShares) { idx, (album, repSong) ->
                         AlbumCard(
                             album = album,
-                            onClick = { onNavigate(ScreenId.Albums) },
+                            onClick = { openAlbumDetail(repSong) },
                             modifier = cardFocus(
                                 railRequester = railRequester,
                                 isLeftEdge = idx == 0,
@@ -275,8 +354,11 @@ fun HomeScreen(
                     }
                 }
             }
+            } // pivotSpec provider (shelves)
+            } // shelvesReady
             Spacer(Modifier.height(48.dp))
         }
+        } // revealOnlySpec provider (page)
     }
 }
 
@@ -368,7 +450,8 @@ private fun Hero(
     height: Dp,
     railRequester: FocusRequester,
     heroRequester: FocusRequester,
-    downTarget: FocusRequester,
+    /** Null while the shelves below are not composed yet (staggered first frame). */
+    downTarget: FocusRequester?,
     onFocusedChange: (Boolean) -> Unit,
     onContinue: () -> Unit,
     onAddToQueue: () -> Unit,
@@ -433,8 +516,13 @@ private fun Hero(
             ) {
                 ResumePill()
                 Text(
-                    text = "FROM ${song.sourcePath.uppercase()} · ${song.bitrate.uppercase()}",
+                    // Parent folder(s) only — the full //host/share/…/file.mp3 path wrapped
+                    // two lines and read like a stack trace. Format (MP3 etc.) already
+                    // appears on the tag line below, so don't repeat the bitrate here.
+                    text = "FROM ${sourceCrumb(song.sourcePath).uppercase()}",
                     style = type.monoSmall.copy(color = palette.ink2),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
             Text(
@@ -443,7 +531,14 @@ private fun Hero(
             )
             Text(
                 text = song.title,
-                style = type.heroTitle.copy(color = palette.ink0),
+                // On a short viewport (hero capped well under the 620dp design height,
+                // now minus the shelf-peek strip) the 84sp title can't co-fit with the
+                // pill, artist line and buttons at 2 lines — step it down.
+                style = if (height < 560.dp) {
+                    type.heroTitle.copy(color = palette.ink0, fontSize = 60.sp, lineHeight = 64.sp)
+                } else {
+                    type.heroTitle.copy(color = palette.ink0)
+                },
                 // Long titles wrapped to 3+ lines make the hero taller than the viewport,
                 // which re-clips the title top when a hero button takes focus.
                 maxLines = 2,
@@ -521,6 +616,31 @@ private fun formatDuration(sec: Int): String {
     return "%d:%02d".format(m, s)
 }
 
+/** Pseudo-random sample of [n] songs: the n smallest by a seeded hash of the song id.
+ *  One O(n) pass with a tiny heap — no whole-library copy/shuffle — and, because rank
+ *  depends only on (id, seed), the picks hold steady while imports mutate the list. */
+private fun sampleStable(songs: List<Song>, n: Int, seed: Int): List<Song> {
+    if (songs.size <= n) return songs
+    fun rank(song: Song): Int {
+        val h = (song.id.hashCode() xor seed) * -0x61c88647 // Fibonacci hash mix
+        return h xor (h ushr 16)
+    }
+    val worstFirst = java.util.PriorityQueue<Pair<Int, Song>>(n + 1, compareByDescending { it.first })
+    for (song in songs) {
+        val r = rank(song)
+        if (worstFirst.size < n) worstFirst.add(r to song)
+        else if (r < worstFirst.peek().first) { worstFirst.poll(); worstFirst.add(r to song) }
+    }
+    return worstFirst.sortedBy { it.first }.map { it.second }
+}
+
+/** Compact origin for the hero eyebrow: the file's last two parent folders, e.g.
+ *  "MUSE / NEW BORN (2001)" instead of the whole //host/share/…/file.mp3 path. */
+private fun sourceCrumb(path: String): String =
+    path.replace('\\', '/').split('/').filter { it.isNotBlank() }
+        .dropLast(1).takeLast(2).joinToString(" / ")
+        .ifBlank { path }
+
 // ---- Index → feed ----
 
 /** Build the Home feed from the live index. Returns null when the library is empty so
@@ -531,6 +651,7 @@ private fun buildHomeFeed(
     library: List<Song>,
     recentPlayed: List<Song>,
     recentAdded: List<Song>,
+    acrossSeed: Int,
 ): HomeFeed? {
     val resumeSong = recentPlayed.firstOrNull() ?: library.firstOrNull() ?: return null
     val resumeAlbum = synthAlbumFor(resumeSong)
@@ -546,11 +667,13 @@ private fun buildHomeFeed(
     val newAlbums = addedPool
         .distinctBy { it.albumTitle ?: it.id }
         .take(10)
-        .map { synthAlbumFor(it) }
+        .map { synthAlbumFor(it) to it }
 
-    // A stable shuffle: keyed on the call's remember above, so it doesn't reshuffle on
-    // every recomposition. Spread across the library, not just the head.
-    val across = library.shuffled().take(10)
+    // Seeded sample instead of library.shuffled(): shuffling copies + permutes the whole
+    // (possibly 25k+) library on the main thread every feed rebuild, and its picks churned
+    // whenever the index re-emitted during an import walk. Selection keyed on song id +
+    // per-visit seed is O(n), stable across rebuilds, fresh per Home visit.
+    val across = sampleStable(library, 10, acrossSeed)
 
     return HomeFeed(
         resumeSong = resumeSong,
