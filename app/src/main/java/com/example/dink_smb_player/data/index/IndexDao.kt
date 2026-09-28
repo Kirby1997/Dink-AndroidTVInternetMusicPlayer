@@ -21,12 +21,12 @@ class IndexDao internal constructor(
 
     // ---------- Tracks ----------
 
-    fun observeAllTracks(): Flow<List<TrackEntity>> = tracksState.map { it.sortedBy { t -> t.title.lowercase() } }
+    fun observeAllTracks(): Flow<List<TrackEntity>> = tracksState.map { it.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { t -> t.title }) }
 
     fun observeTracksFor(type: SourceType, id: String): Flow<List<TrackEntity>> =
         tracksState.map { tracks ->
             tracks.filter { it.sourceType == type && it.sourceId == id }
-                .sortedBy { it.title.lowercase() }
+                .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
         }
 
     fun observeAlbumTracks(albumId: String): Flow<List<TrackEntity>> =
@@ -87,11 +87,11 @@ class IndexDao internal constructor(
     // ---------- Sources ----------
 
     fun observeSources(): Flow<List<SourceEntity>> =
-        sourcesState.map { it.sortedBy { s -> s.displayName.lowercase() } }
+        sourcesState.map { it.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { s -> s.displayName }) }
 
     fun observeSourcesOfType(type: SourceType): Flow<List<SourceEntity>> =
         sourcesState.map { srcs ->
-            srcs.filter { it.type == type }.sortedBy { it.displayName.lowercase() }
+            srcs.filter { it.type == type }.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName })
         }
 
     suspend fun upsertSource(source: SourceEntity) {

@@ -529,16 +529,16 @@ private fun search(query: String, library: List<Song>, facet: SearchFacet): Sear
     fun albumGroupsFor(tracks: List<Song>): List<LibraryGroup> = tracks
         .groupBy { it.albumTitle?.takeIf { t -> t.isNotBlank() } ?: "Unknown album" }
         .map { (albumKey, list) ->
-            val sorted = list.sortedBy { it.title.lowercase() }
+            val sorted = list.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
             val artist = list.map { it.artist }.distinct().singleOrNull() ?: "Various artists"
             LibraryGroup(albumKey, albumKey, "$artist · ${list.size} tracks", sorted)
         }
-        .sortedBy { it.title.lowercase() }
+        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
 
     return when (facet) {
         SearchFacet.Songs -> SearchResults(
             songs = library.filter { matches(it.title.lowercase()) }
-                .sortedBy { it.title.lowercase() }.take(SONG_CAP),
+                .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title }).take(SONG_CAP),
             albums = emptyList(),
             artists = emptyList(),
         )
@@ -560,7 +560,7 @@ private fun search(query: String, library: List<Song>, facet: SearchFacet): Sear
                 .map { (artistKey, list) ->
                     ArtistResult(artistKey, list.size, albumGroupsFor(list))
                 }
-                .sortedBy { it.name.lowercase() }
+                .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
                 .take(ARTIST_CAP)
             SearchResults(emptyList(), emptyList(), artists)
         }

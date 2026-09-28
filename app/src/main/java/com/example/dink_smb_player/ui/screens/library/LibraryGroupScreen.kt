@@ -175,9 +175,9 @@ fun LibraryGroupScreen(
     val context = LocalContext.current
 
     val songsFlow = remember(context) { LibraryRepository.songs(context) }
-    val songs by songsFlow.collectAsState(
-        initial = remember(context) { LibraryRepository.songsNow(context) },
-    )
+    // StateFlow overload: its cached value is the initial. A songsNow() initial remapped
+    // the whole library on Main per entry and, being a new list, missed GroupMemo.
+    val songs by songsFlow.collectAsState()
     // False until the on-disk index finishes restoring at boot — drives a loading state
     // so an empty list during restore isn't mistaken for an empty library.
     val restored by LibraryRepository.restoredState.collectAsState()
@@ -542,7 +542,7 @@ private fun buildGroups(
 ): List<LibraryGroup> =
     songs.groupBy(keyOf)
         .map { (key, list) -> LibraryGroup(key, titleOf(key, list), subtitleOf(key, list), list) }
-        .sortedBy { it.title.lowercase() }
+        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
 
 // Grouping now reads the PRECOMPUTED keys stored on each Song (filled at import/retag by
 // LibraryGrouping — collaborations already attributed to their primary artist there). The

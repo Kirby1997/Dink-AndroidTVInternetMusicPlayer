@@ -18,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.delay
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -46,6 +47,7 @@ import com.example.dink_smb_player.lyrics.LyricChain
 import com.example.dink_smb_player.lyrics.LyricPrefs
 import com.example.dink_smb_player.lyrics.LyricSettings
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.example.dink_smb_player.nav.RailGroup
@@ -129,20 +131,25 @@ fun DinkApp() {
                 )
             }
         }
+        // Stamp lastPlayed/playCount once a track has genuinely been listened to (see
+        // PlayerState.onTrackPlayed) so "Recently played" + the Home resume hero reflect
+        // real plays — not a restored session, a Home preload, or tracks skipped past.
+        player.onTrackPlayed = { songId ->
+            app?.appScope?.launch(Dispatchers.Default) {
+                LibraryRepository.markPlayed(context, songId)
+            }
+        }
     }
 
     // Re-resolves when the title changes too, so enrichment (dirty filename → real
     // tag title) re-runs the lyric chain with the accurate name.
-    // Stamp lastPlayed when a real track becomes current so "Recently played" + the Home
-    // resume hero reflect what was actually played (nothing else calls markPlayed).
-    LaunchedEffect(player.currentSong?.id) {
-        val song = player.currentSong ?: return@LaunchedEffect
-        if (song.mediaUri != null) LibraryRepository.markPlayed(context, song.id)
-    }
-
     LaunchedEffect(player.currentSong?.id, player.currentSong?.title) {
         val song = player.currentSong ?: return@LaunchedEffect
         if (song.mediaUri == null && song.id != PreviewMockData.songIxion.id) return@LaunchedEffect
+        // A restored/preloaded track sits paused at launch; don't fire the provider chain
+        // (up to a dozen network lookups + parsing) into the launch window for it. Resolve
+        // once it plays or Now Playing is opened.
+        snapshotFlow { player.isPlaying || nav.current == ScreenId.NowPlaying }.first { it }
         val resolved = withContext(Dispatchers.IO) {
             val chain = LyricChain.resolve(context, song)
             if (chain.isNotEmpty()) chain
@@ -176,7 +183,7 @@ fun DinkApp() {
     LaunchedEffect(Unit) {
         // EncryptedSharedPreferences creation does Keystore + Tink init and a prefs
         // read — ~350ms measured on this TV. Off main; it stalled the first frames.
-        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore(context.applicationContext) }
+        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore.get(context.applicationContext) }
         SmbConnectionRegistry.installCredLookup { sid -> secretStore.getSmbCreds(sid) }
         val sharePrefs = SharePrefs(context.applicationContext)
         sharePrefs.shares.collect { shares -> SmbConnectionRegistry.update(shares) }
@@ -188,7 +195,7 @@ fun DinkApp() {
     // app-wide — even resuming a cloud track without opening CloudScreen.
     LaunchedEffect(Unit) {
         // Same Keystore-init cost as the SMB store above — keep off main.
-        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore(context.applicationContext) }
+        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore.get(context.applicationContext) }
         CloudConnectionRegistry.installTokenStore(
             get = { pid -> secretStore.getCloudToken(pid) },
             put = { pid, token -> secretStore.putCloudToken(pid, token) },

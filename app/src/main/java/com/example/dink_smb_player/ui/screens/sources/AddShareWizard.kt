@@ -108,7 +108,7 @@ fun AddShareWizard(
     val contentFocus = LocalContentFocus.current
     val context = LocalContext.current
     val sharePrefs = remember(context) { SharePrefs(context.applicationContext) }
-    val secretStore = remember(context) { EncryptedShareStore(context.applicationContext) }
+    val secretStore = remember(context) { EncryptedShareStore.get(context.applicationContext) }
     val scope = rememberCoroutineScope()
 
     var host by remember { mutableStateOf("") }

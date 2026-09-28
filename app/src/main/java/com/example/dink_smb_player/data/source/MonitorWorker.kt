@@ -52,7 +52,7 @@ class MonitorWorker(
         runCatching { MediaLibrary.refresh(ctx) }
 
         val prefs = SharePrefs(ctx)
-        val store = EncryptedShareStore(ctx)
+        val store = EncryptedShareStore.get(ctx)
 
         // SMB monitored folders.
         val shares = runCatching { prefs.shares.first() }.getOrDefault(emptyList())
@@ -118,6 +118,7 @@ class MonitorWorker(
          *  SMB walk over a big share is 30–90s, and the 2h periodic already covers it.
          *  Opening the app repeatedly shouldn't re-walk the whole NAS each time. */
         private val MIN_CATCHUP_GAP_MS = TimeUnit.MINUTES.toMillis(90)
+        private const val CATCHUP_DELAY_S = 60L
 
         private fun networkConstraints() = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -147,6 +148,10 @@ class MonitorWorker(
             }
             val request = OneTimeWorkRequestBuilder<MonitorWorker>()
                 .setConstraints(networkConstraints())
+                // Let launch settle first: the walk (parallel SMB lists + tag-read
+                // extractors + index merge + library rewrite) competing with the first
+                // frames, restore and Home shelves was a big part of the launch stutter.
+                .setInitialDelay(CATCHUP_DELAY_S, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(ctx)
                 .enqueueUniqueWork(UNIQUE_NAME_NOW, ExistingWorkPolicy.KEEP, request)

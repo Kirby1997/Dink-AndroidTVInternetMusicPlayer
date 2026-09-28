@@ -53,12 +53,22 @@ val LocalThemeController = staticCompositionLocalOf<ThemeController> {
     error("LocalThemeController not provided")
 }
 
+@Volatile private var preloadedThemeMode: ThemeMode? = null
+
+/** Read the stored mode before the first frame (kicked off from Application.onCreate),
+ *  so a Light/Dark choice doesn't render as System first and then flip the palette. */
+suspend fun preloadThemeMode(context: Context) {
+    preloadedThemeMode = context.themePrefsDataStore.data
+        .map { prefs -> prefs[THEME_MODE_KEY]?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() } ?: ThemeMode.System }
+        .first()
+}
+
 @Composable
 fun rememberThemeController(): ThemeController {
     val context = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
     val controller = remember {
-        ThemeController(ThemeMode.System) { value ->
+        ThemeController(preloadedThemeMode ?: ThemeMode.System) { value ->
             scope.launch { context.themePrefsDataStore.edit { it[THEME_MODE_KEY] = value.name } }
         }
     }

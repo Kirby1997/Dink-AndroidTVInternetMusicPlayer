@@ -10,8 +10,10 @@ import android.os.IBinder
 import android.view.KeyEvent
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
@@ -28,12 +30,14 @@ import com.example.dink_smb_player.data.prefs.EncryptedShareStore
 import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.smb.DinkDataSourceFactory
 import com.example.dink_smb_player.data.source.smb.SmbConnectionRegistry
+import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -116,7 +120,15 @@ class PlayerService : MediaSessionService() {
         runCatching {
             val sessionId = (getSystemService(Context.AUDIO_SERVICE) as AudioManager).generateAudioSessionId()
             player.setAudioSessionId(sessionId)
-            EqEngine.attach(this, sessionId)
+            // Creating the effect is a round-trip to audioserver plus a prefs read, and
+            // onCreate runs on main during launch (bind from the first composition).
+            // EqEngine is synchronized; a restored session is paused, so the curve lands
+            // well before the first note in practice.
+            serviceScope.launch {
+                EqEngine.attach(this@PlayerService, sessionId)
+                // Service torn down while we were attaching: don't leak the effect.
+                if (!isActive) EqEngine.release()
+            }
         }
 
         val activityIntent = Intent(this, MainActivity::class.java).apply {
@@ -129,10 +141,43 @@ class PlayerService : MediaSessionService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
-        mediaSession = MediaSession.Builder(this, player)
+        mediaSession = MediaSession.Builder(this, SessionPlayer(player))
             .setSessionActivity(sessionActivityPi)
             .setCallback(PlayTogglesCallback())
             .build()
+    }
+
+    /**
+     * What MediaSession controllers (TV remote ⏭/⏮, the system Now Playing panel,
+     * Assistant, Bluetooth) drive. Next/previous are handed to the app's [PlayerState]
+     * while an activity holds the engine: the engine only ever has a window of the
+     * queue, so a raw seekToNext() bypassed the façade (UI stuck on the skipped track)
+     * and was a dead key at the window's last item. With no activity alive there is no
+     * façade queue, so the engine's own behaviour is the right fallback.
+     */
+    private class SessionPlayer(player: Player) : ForwardingPlayer(player) {
+        private fun routed(): Transport? = transport?.takeIf { mediaItemCount > 0 }
+
+        override fun seekToNext() { routed()?.next() ?: super.seekToNext() }
+        override fun seekToNextMediaItem() { routed()?.next() ?: super.seekToNextMediaItem() }
+        override fun seekToPrevious() { routed()?.prev() ?: super.seekToPrevious() }
+        override fun seekToPreviousMediaItem() { routed()?.prev() ?: super.seekToPreviousMediaItem() }
+
+        // The engine hides next/prev at its window edges; the façade can still move.
+        override fun getAvailableCommands(): Player.Commands {
+            val base = super.getAvailableCommands()
+            if (routed() == null) return base
+            return base.buildUpon().addAll(*ROUTED_COMMANDS).build()
+        }
+
+        override fun isCommandAvailable(command: Int): Boolean =
+            super.isCommandAvailable(command) || (command in ROUTED_COMMANDS && routed() != null)
+    }
+
+    /** Next/previous as the app's queue understands them. See [SessionPlayer]. */
+    interface Transport {
+        fun next()
+        fun prev()
     }
 
     /**
@@ -178,6 +223,20 @@ class PlayerService : MediaSessionService() {
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            // Warm fast-path: an activity is alive with the session already in memory
+            // (typically a restored-paused session whose engine apply is deferred).
+            // Serve its live window instantly — no disk reload, no stale position.
+            // Callbacks arrive on the player's application thread, so reading the
+            // activity's main-thread state here is safe.
+            liveSession?.invoke()?.let { win ->
+                return Futures.immediateFuture(
+                    MediaSession.MediaItemsWithStartPosition(
+                        win.songs.map { resumptionItemFor(it) },
+                        win.startIndex,
+                        win.positionMs,
+                    ),
+                )
+            }
             val future = SettableFuture.create<MediaSession.MediaItemsWithStartPosition>()
             serviceScope.launch {
                 val ctx = applicationContext
@@ -192,7 +251,7 @@ class PlayerService : MediaSessionService() {
                     // activity is alive — it maintains the same registry.
                     val shares = runCatching { SharePrefs(ctx).shares.first() }.getOrDefault(emptyList())
                     if (shares.isNotEmpty()) SmbConnectionRegistry.update(shares)
-                    val secretStore = EncryptedShareStore(ctx)
+                    val secretStore = EncryptedShareStore.get(ctx)
                     SmbConnectionRegistry.installCredLookup { sid ->
                         runCatching { secretStore.getSmbCreds(sid) }.getOrNull()
                     }
@@ -207,23 +266,7 @@ class PlayerService : MediaSessionService() {
                     val start = (idx - RESUME_WINDOW / 2)
                         .coerceIn(0, (resolved.size - RESUME_WINDOW).coerceAtLeast(0))
                     val window = resolved.subList(start, minOf(resolved.size, start + RESUME_WINDOW))
-                    val items = window.map { song ->
-                        val builder = MediaItem.Builder().setMediaId(song.id).setUri(song.mediaUri)
-                        // Local tracks carry clean MediaStore tags; remote (smb/gdrive) ones
-                        // stay metadata-less so the engine's embedded-tag parse isn't masked
-                        // (same rule as PlayerState.mediaItemFor).
-                        val scheme = song.mediaUri?.substringBefore("://")?.lowercase()
-                        if (scheme != "smb" && scheme != "gdrive") {
-                            builder.setMediaMetadata(
-                                MediaMetadata.Builder()
-                                    .setTitle(song.title)
-                                    .setArtist(song.artist)
-                                    .apply { song.albumTitle?.let { setAlbumTitle(it) } }
-                                    .build(),
-                            )
-                        }
-                        builder.build()
-                    }
+                    val items = window.map { resumptionItemFor(it) }
                     future.set(
                         MediaSession.MediaItemsWithStartPosition(
                             items,
@@ -240,6 +283,49 @@ class PlayerService : MediaSessionService() {
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+
+    companion object {
+        const val ACTION_BIND_LOCAL = "com.example.dink_smb_player.player.BIND_LOCAL"
+
+        /** Queue slice handed to the engine on media-button playback resumption. */
+        private const val RESUME_WINDOW = 100
+
+        /** Set by [PlayerState.attachEngine] while an activity holds the engine; lets
+         *  [onPlaybackResumption] serve the live in-memory session instead of
+         *  reloading the disk snapshot. Cleared by [PlayerState.detachEngine]. */
+        @Volatile
+        var liveSession: (() -> ResumptionWindow?)? = null
+
+        /** Set by [PlayerState.attachEngine] while an activity holds the engine; see
+         *  [SessionPlayer]. Main-thread only, like the session callbacks that use it. */
+        @Volatile
+        var transport: Transport? = null
+
+        private val ROUTED_COMMANDS = intArrayOf(
+            Player.COMMAND_SEEK_TO_NEXT,
+            Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+            Player.COMMAND_SEEK_TO_PREVIOUS,
+            Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+        )
+
+        /** Local tracks carry clean MediaStore tags; remote (smb/gdrive) ones stay
+         *  metadata-less so the engine's embedded-tag parse isn't masked (same rule
+         *  as PlayerState.mediaItemFor). */
+        private fun resumptionItemFor(song: com.example.dink_smb_player.data.model.Song): MediaItem {
+            val builder = MediaItem.Builder().setMediaId(song.id).setUri(song.mediaUri)
+            val scheme = song.mediaUri?.substringBefore("://")?.lowercase()
+            if (scheme != "smb" && scheme != "gdrive") {
+                builder.setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(song.title)
+                        .setArtist(song.artist)
+                        .apply { song.albumTitle?.let { setAlbumTitle(it) } }
+                        .build(),
+                )
+            }
+            return builder.build()
+        }
+    }
 
     /**
      * MediaSessionService binds external MediaController clients via [SERVICE_INTERFACE].
@@ -270,10 +356,4 @@ class PlayerService : MediaSessionService() {
         super.onDestroy()
     }
 
-    companion object {
-        const val ACTION_BIND_LOCAL = "com.example.dink_smb_player.player.BIND_LOCAL"
-
-        /** Queue slice handed to the engine on media-button playback resumption. */
-        private const val RESUME_WINDOW = 100
-    }
 }

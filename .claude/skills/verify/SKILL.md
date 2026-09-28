@@ -5,16 +5,16 @@ description: Build, deploy, and drive Dink on the real Android TV over adb to ve
 
 # Verifying Dink on the TV
 
-Package is `com.dink.player` (activity `com.example.dink_smb_player.MainActivity`). TV at `192.168.138.95:5555` (override with `DINK_SERIAL`).
+Package is `com.dink.player` (activity `com.example.dink_smb_player.MainActivity`). TV at `192.168.255.81:5555` (override with `DINK_SERIAL`).
 
 ## Build + deploy
 
 ```bash
 ./gradlew :app:assembleDebug -q
-adb connect 192.168.138.95:5555
-adb -s 192.168.138.95:5555 install -r -t app/build/outputs/apk/debug/app-debug.apk
-adb -s 192.168.138.95:5555 shell am force-stop com.dink.player   # Apply Changes won't pick up structural edits
-adb -s 192.168.138.95:5555 shell am start -n com.dink.player/com.example.dink_smb_player.MainActivity
+adb connect 192.168.255.81:5555
+adb -s 192.168.255.81:5555 install -r -t app/build/outputs/apk/debug/app-debug.apk
+adb -s 192.168.255.81:5555 shell am force-stop com.dink.player   # Apply Changes won't pick up structural edits
+adb -s 192.168.255.81:5555 shell am start -n com.dink.player/com.example.dink_smb_player.MainActivity
 ```
 
 Wait ~10–12 s after launch for session restore before driving playback.

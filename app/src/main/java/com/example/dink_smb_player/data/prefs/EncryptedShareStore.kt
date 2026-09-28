@@ -24,7 +24,22 @@ data class CloudToken(
  *
  * NB: never log values read from this store.
  */
-class EncryptedShareStore(context: Context) {
+class EncryptedShareStore private constructor(context: Context) {
+
+    companion object {
+        @Volatile private var instance: EncryptedShareStore? = null
+
+        /**
+         * Process-wide store. Construction is Keystore + Tink init (~350 ms on the TV);
+         * building one per caller paid that repeatedly (twice concurrently at launch, again
+         * per SMB folder opened) and let two instances race the corrupt-file recovery.
+         * First call may block — call it off the main thread.
+         */
+        fun get(context: Context): EncryptedShareStore =
+            instance ?: synchronized(this) {
+                instance ?: EncryptedShareStore(context.applicationContext).also { instance = it }
+            }
+    }
 
     private val json = Json { ignoreUnknownKeys = true }
 

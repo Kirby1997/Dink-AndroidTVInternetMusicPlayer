@@ -72,12 +72,24 @@ val LocalUiScale = staticCompositionLocalOf<UiScaleController> {
     error("LocalUiScale not provided")
 }
 
+@Volatile private var preloadedUiScale: Float? = null
+
+/** Read the stored scale before the first frame (kicked off from Application.onCreate).
+ *  Otherwise every launch composed at [DefaultUiScale] and then re-laid-out the whole
+ *  app once the DataStore read landed. */
+suspend fun preloadUiScale(context: Context) {
+    preloadedUiScale = context.uiPrefsDataStore.data
+        .map { it[UI_SCALE_KEY] ?: DefaultUiScale }
+        .first()
+        .snapToStep()
+}
+
 @Composable
 fun rememberUiScaleController(): UiScaleController {
     val context = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
     val controller = remember {
-        UiScaleController(DefaultUiScale) { value ->
+        UiScaleController(preloadedUiScale ?: DefaultUiScale) { value ->
             scope.launch { context.uiPrefsDataStore.edit { it[UI_SCALE_KEY] = value } }
         }
     }

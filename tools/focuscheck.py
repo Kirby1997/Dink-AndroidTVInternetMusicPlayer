@@ -24,7 +24,7 @@ import os, re, subprocess, sys, time, xml.etree.ElementTree as ET
 
 PKG = "com.example.dink_smb_player"
 ACT = f"{PKG}/.MainActivity"
-SERIAL = os.environ.get("DINK_SERIAL", "192.168.138.95:5555")
+SERIAL = os.environ.get("DINK_SERIAL", "192.168.255.81:5555")
 SHOTS = os.path.join(os.path.dirname(__file__), "shots")
 W, H = 1920, 1080  # override resolution from `wm size`
 

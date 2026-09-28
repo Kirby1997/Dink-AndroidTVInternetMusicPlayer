@@ -218,9 +218,34 @@ object LibraryRepository {
     ) {
         if (reindexAuthoritative) safeToPersist = true
         val dao = dao(context)
+        val existing = HashMap<String, TrackEntity>()
+        for (t in dao.snapshot().first) {
+            if (t.sourceType == source.type && t.sourceId == source.id) existing[t.id] = t
+        }
+        // Rows are rebuilt from the source each time; carry over what only the index knows
+        // (first-seen time, play stats, retag marker, grouping keys). Without this every
+        // local refresh reset play history and re-dated every local track as "new".
+        val merged = tracks.map { t ->
+            val e = existing[t.id] ?: return@map t
+            t.copy(
+                addedAtMs = e.addedAtMs,
+                lastPlayedMs = e.lastPlayedMs,
+                playCount = e.playCount,
+                retagAttemptedMs = t.retagAttemptedMs ?: e.retagAttemptedMs,
+                artistKey = e.artistKey,
+                albumKey = e.albumKey,
+                artistLabel = e.artistLabel,
+            )
+        }
+        // Nothing changed (the normal case for a launch/monitor rescan): skip the upsert,
+        // the 25k-row grouping recompute and the full library-file rewrite, and don't
+        // re-emit the library to every screen.
+        if (!reindexAuthoritative && merged.size == existing.size && merged.all { existing[it.id] == it }) {
+            return
+        }
         dao.upsertSource(source)
-        dao.upsertTracks(tracks)
-        dao.pruneSource(source.type, source.id, tracks.map { it.uri })
+        dao.upsertTracks(merged)
+        dao.pruneSource(source.type, source.id, merged.map { it.uri })
         dao.updateSourceStats(
             id = source.id,
             ts = System.currentTimeMillis(),

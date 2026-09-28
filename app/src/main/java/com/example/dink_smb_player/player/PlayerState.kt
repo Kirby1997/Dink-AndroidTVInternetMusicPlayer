@@ -33,6 +33,11 @@ import kotlinx.coroutines.withContext
 
 enum class RepeatMode { Off, All, One }
 
+/** Slice of the live session handed to MediaSession playback resumption when the
+ *  activity is alive — see [PlayerState.resumptionWindow] and
+ *  [PlayerService.Companion.liveSession]. */
+data class ResumptionWindow(val songs: List<Song>, val startIndex: Int, val positionMs: Long)
+
 /** Tags the engine extracted from a streamed file (Phase 8.7). Any field may be
  *  null when the container didn't carry it. Handed to a sink that persists them. */
 data class EngineTags(
@@ -103,6 +108,8 @@ class PlayerState(
     // of spinning through every track.
     private var consecutiveErrors = 0
     private val MAX_SKIP_ON_ERROR = 8
+    private val POLL_SEC = 0.25f
+    private val PLAY_CREDIT_SEC = 30f
     private val REASON_NOT_FOUND = "file not found on share"
 
     /** Sink for tags the engine extracts while streaming (Phase 8.7). The Composable
@@ -144,9 +151,45 @@ class PlayerState(
     private var pendingEngineApply = false
 
     private fun ensureEngineQueueApplied() {
-        if (!pendingEngineApply) return
+        if (pendingEngineApply) {
+            pendingEngineApply = false
+            applyQueueToEngine(autoplay = false)
+            return
+        }
+        // Safety net: we think a queue is applied but the engine holds nothing (a
+        // resumption handoff that never reached setMediaItems, a service restart).
+        // Re-apply at the position the UI is showing instead of no-opping into a
+        // dead play button.
+        val player = engine ?: return
+        if (_queue.isNotEmpty() && currentIndex in _queue.indices &&
+            player.mediaItemCount == 0 && currentSong?.mediaUri != null
+        ) {
+            pendingSeekMs = (timeSec * 1000).toLong()
+            applyQueueToEngine(autoplay = false)
+        }
+    }
+
+    /**
+     * Serve a media-button playback resumption from the LIVE session instead of the
+     * disk snapshot: instant (no library reload in the service) and never stale.
+     * Media3 is about to hand exactly this window to the engine and play it, so this
+     * also spends the deferred restore apply and claims the window bookkeeping.
+     * Null when there's no fully-streamable session — caller falls back to disk.
+     * Main-thread only (MediaSession callbacks arrive on the player's looper).
+     */
+    fun resumptionWindow(): ResumptionWindow? {
+        if (currentIndex !in _queue.indices || !isQueueAllUri()) return null
+        val range = windowRange(currentIndex)
+        val songs = range.map { _queue[it] }
+        val posMs = if (pendingEngineApply) pendingSeekMs else (timeSec * 1000).toLong()
+        engineBase = range.first
         pendingEngineApply = false
-        applyQueueToEngine(autoplay = false)
+        pendingSeekMs = 0L
+        return ResumptionWindow(
+            songs = songs,
+            startIndex = currentIndex - range.first,
+            positionMs = posMs.coerceAtLeast(0L),
+        )
     }
 
     private val isWindowed: Boolean get() = _queue.size > engineWindow
@@ -191,13 +234,18 @@ class PlayerState(
         this.lyrics = lyrics
         timeSec = 0f
         isPlaying = autoplay
+        pendingSeekMs = 0L
         if (_queue.isEmpty()) {
             _queue.add(song)
+            baseOrder = listOf(song)
             currentIndex = 0
         } else {
             val existing = _queue.indexOfFirst { it.id == song.id }
             currentIndex = if (existing >= 0) existing else {
                 _queue.add(song)
+                // Keep the unshuffled base in step, or a later shuffle toggle rebuilds the
+                // queue without this track and plays a different song than the UI shows.
+                if (baseOrder.isNotEmpty()) baseOrder = baseOrder + song
                 _queue.lastIndex
             }
         }
@@ -222,6 +270,7 @@ class PlayerState(
         lyrics = emptyList()
         timeSec = 0f
         isPlaying = autoplay
+        pendingSeekMs = 0L
         applyQueueToEngine(autoplay)
     }
 
@@ -236,6 +285,7 @@ class PlayerState(
             lyrics = emptyList()
             timeSec = 0f
             isPlaying = true
+            pendingSeekMs = 0L
             applyQueueToEngine(autoplay = true)
             return
         }
@@ -251,6 +301,10 @@ class PlayerState(
         ) {
             player.addMediaItem(mediaItemFor(song))
         }
+        // Growing past the engine window flips Repeat-All from engine-driven to
+        // façade-driven (see engineRepeatMode); without this the engine keeps looping
+        // its old slice and the appended track never plays.
+        engine?.repeatMode = engineRepeatMode()
     }
 
     fun jumpTo(index: Int) {
@@ -284,6 +338,12 @@ class PlayerState(
                 // After a source error (or stop) the engine sits in IDLE and ignores
                 // playWhenReady until prepared again — without this, play is a no-op.
                 if (isPlaying && player.playbackState == Player.STATE_IDLE) player.prepare()
+                // Queue ran out (repeat off): the engine sits in ENDED with playWhenReady
+                // still true, so setting it again is a no-op. Replay the current track.
+                if (isPlaying && player.playbackState == Player.STATE_ENDED) {
+                    timeSec = 0f
+                    player.seekTo(player.currentMediaItemIndex, 0L)
+                }
                 player.playWhenReady = isPlaying
             }
         }
@@ -291,7 +351,8 @@ class PlayerState(
 
     fun seek(sec: Float) {
         ensureEngineQueueApplied()
-        timeSec = sec.coerceIn(0f, durationSec.toFloat())
+        // Unknown duration (streamed track not yet probed) must not clamp every seek to 0.
+        timeSec = if (durationSec > 0) sec.coerceIn(0f, durationSec.toFloat()) else sec.coerceAtLeast(0f)
         val song = currentSong
         if (song?.mediaUri != null) engine?.seekTo((timeSec * 1000).toLong())
     }
@@ -315,7 +376,9 @@ class PlayerState(
     private fun reorderAroundCurrent(shuffled: Boolean) {
         val current = currentSong ?: return
         if (_queue.isEmpty()) return
-        if (baseOrder.isEmpty()) baseOrder = _queue.toList()
+        // A base that lost track of the current song (or the queue) would rebuild a queue
+        // without it and play something other than what's shown — re-adopt the queue.
+        if (baseOrder.isEmpty() || baseOrder.none { it.id == current.id }) baseOrder = _queue.toList()
         val curInBase = baseOrder.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
         val order = if (shuffled) buildShuffled(baseOrder, curInBase) else baseOrder
         val pos = timeSec
@@ -354,6 +417,9 @@ class PlayerState(
     fun prev() {
         if (_queue.isEmpty()) return
         if (timeSec > 3f) {
+            // Restart-from-0 must also override a deferred resume position, or the
+            // next engine apply seeks straight back to the stale restored spot.
+            pendingSeekMs = 0L
             timeSec = 0f
             val song = currentSong
             if (song?.mediaUri != null) engine?.seekTo(0L)
@@ -442,10 +508,12 @@ class PlayerState(
     internal fun setEngineDurationMs(durMs: Long) {
         val song = currentSong ?: return
         if (song.mediaUri == null || durMs <= 0) return
+        val newDur = (durMs / 1000).toInt()
+        // Unchanged = the index already holds it. READY fires on every seek/rebuffer and
+        // each persist rewrites the whole library file, so only write real corrections.
+        if (newDur == song.durationSec) return
         // Persist real duration into the index (import leaves it 0 for streamed tracks).
         onMetadataResolved?.invoke(EngineTags(songId = song.id, durationMs = durMs))
-        val newDur = (durMs / 1000).toInt()
-        if (newDur == song.durationSec) return
         val updated = song.copy(durationSec = newDur)
         currentSong = updated
         val idx = currentIndex
@@ -517,7 +585,12 @@ class PlayerState(
         val song = currentSong ?: return
         val player = engine
         if (song.mediaUri != null && player != null) {
+            // Deferred restore / not-yet-applied queue: the engine is empty and reports 0,
+            // which would wipe the restored position (and make prev() skip back a track
+            // instead of restarting, and persist 0 as the resume point).
+            if (pendingEngineApply || player.mediaItemCount == 0) return
             timeSec = (player.currentPosition / 1000f).coerceAtLeast(0f)
+            creditListening()
             return
         }
         if (isPlaying) {
@@ -531,16 +604,75 @@ class PlayerState(
         }
     }
 
+    /**
+     * Mirror the engine's play INTENT into [isPlaying]. Media3's isPlaying is false while
+     * buffering, so following it flipped the button to ▶ on every skip/seek, made a press
+     * during buffering "play" instead of pause, and released [ImportThrottle] exactly
+     * when the stream was starved. Intent = wants to play and isn't stopped/finished.
+     */
+    private fun syncPlayIntent(player: Player) {
+        if (currentSong?.mediaUri == null) return
+        val state = player.playbackState
+        val wantsPlay = player.isPlaying ||
+            (player.playWhenReady && (state == Player.STATE_BUFFERING || state == Player.STATE_READY))
+        setEngineIsPlaying(wantsPlay)
+    }
+
+    // --- Play credit -----------------------------------------------------------
+    // A track counts as played (Recently played, play count) only after it has actually
+    // been listened to — not on restore, preload or a skip past it.
+    /** Invoked once per listen with the song id. Set by the owner to persist it. */
+    var onTrackPlayed: ((String) -> Unit)? = null
+    private var creditSongId: String? = null
+    private var listenedSec = 0f
+    private var credited = false
+
+    private fun resetListenCredit() {
+        creditSongId = currentSong?.id
+        listenedSec = 0f
+        credited = false
+    }
+
+    /** Called on each 250 ms poll while an engine track is loaded. */
+    private fun creditListening() {
+        val song = currentSong ?: return
+        if (song.id != creditSongId) resetListenCredit()
+        if (credited || !isPlaying || engine?.isPlaying != true) return
+        listenedSec += POLL_SEC
+        // Scrobble-style: 30 s, or half the track if it's shorter than a minute.
+        val need = if (song.durationSec in 1 until 60) song.durationSec / 2f else PLAY_CREDIT_SEC
+        if (listenedSec >= need) {
+            credited = true
+            onTrackPlayed?.invoke(song.id)
+        }
+    }
+
     fun attachEngine(player: Player) {
         if (engine === player) return
         detachEngine()
         engine = player
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
-                if (currentSong?.mediaUri != null) setEngineIsPlaying(playing)
+                // Engine came alive while our apply was still deferred (or our queue
+                // is empty): a disk-path playback resumption populated it behind the
+                // façade. Adopt it — otherwise the next guarded action rebuilds the
+                // queue over live playback and seeks back to the stale disk position.
+                if (playing && (pendingEngineApply || _queue.isEmpty()) && player.mediaItemCount > 0) {
+                    songResolver?.let { resolve ->
+                        val ids = (0 until player.mediaItemCount).map { player.getMediaItemAt(it).mediaId }
+                        adoptEngineSession(resolve(ids))
+                    }
+                }
+                syncPlayIntent(player)
+            }
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                syncPlayIntent(player)
             }
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (currentSong?.mediaUri == null) return
+                // Before the handlers below: onTrackEnded/moveTo set their own intent and
+                // must have the last word.
+                syncPlayIntent(player)
                 when (playbackState) {
                     Player.STATE_READY -> {
                         setEngineDurationMs(player.duration)
@@ -553,8 +685,23 @@ class PlayerState(
                 onPlaybackError(error)
             }
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) return
-                syncFromEngine(player.currentMediaItemIndex)
+                when (reason) {
+                    // AUTO = gapless advance. SEEK = a skip that bypassed the façade: TV
+                    // remote ⏭/⏮, the system Now Playing panel, Assistant — MediaSession
+                    // drives the engine directly. Ignoring SEEK left the UI (title, lyrics,
+                    // currentIndex, saved session) on the skipped track while the next one
+                    // played, and the following next() then restarted the same song. The
+                    // façade's own seeks set currentIndex first, so they no-op here.
+                    Player.MEDIA_ITEM_TRANSITION_REASON_AUTO,
+                    Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> {
+                        syncFromEngine(player.currentMediaItemIndex)
+                        // Gapless/seek transitions don't pass through STATE_READY, so the
+                        // new track's real duration would never replace the index guess.
+                        setEngineDurationMs(player.duration)
+                    }
+                    // Repeat-One loop: a fresh listen of the same track.
+                    Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT -> resetListenCredit()
+                }
             }
             override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
                 // Fires once the engine has parsed the stream's embedded tags.
@@ -565,6 +712,16 @@ class PlayerState(
         player.addListener(listener)
         // Shuffle is baked into _queue order, never the engine's job.
         player.shuffleModeEnabled = false
+        // Re-entering the app while the service kept playing: this façade is fresh
+        // (repeat Off), so take the user's repeat mode from the live engine rather than
+        // silently switching it off below.
+        if (_queue.isEmpty() && player.mediaItemCount > 0 && (player.isPlaying || player.playWhenReady)) {
+            repeatMode = when (player.repeatMode) {
+                Player.REPEAT_MODE_ONE -> RepeatMode.One
+                Player.REPEAT_MODE_ALL -> RepeatMode.All
+                else -> repeatMode
+            }
+        }
         player.repeatMode = engineRepeatMode()
         // An engine that arrives already playing can only be a media-button playback
         // resumption (PlayerService.onPlaybackResumption) — the UI can't have driven it
@@ -580,10 +737,21 @@ class PlayerState(
             // the launch path.
             applyQueueToEngine(autoplay = isPlaying)
         }
+        // While we hold the engine, media-button playback resumption serves the live
+        // session (fast, position-accurate) instead of reloading the disk snapshot.
+        PlayerService.liveSession = ::resumptionWindow
+        // Session next/prev (remote keys, system panel) route through the façade so
+        // windowed queues, repeat and shuffle behave exactly like the on-screen buttons.
+        PlayerService.transport = object : PlayerService.Transport {
+            override fun next() = this@PlayerState.next()
+            override fun prev() = this@PlayerState.prev()
+        }
     }
 
     fun detachEngine() {
         val player = engine ?: return
+        PlayerService.liveSession = null
+        PlayerService.transport = null
         engineListener?.let { player.removeListener(it) }
         engineListener = null
         engine = null
@@ -603,6 +771,10 @@ class PlayerState(
 
     private fun moveTo(idx: Int) {
         ensureEngineQueueApplied()
+        // A different track never inherits a resume position. If the engine wasn't bound
+        // yet, the deferred restore offset would otherwise survive to the bind-time apply
+        // and start this track at the previous track's saved position.
+        pendingSeekMs = 0L
         currentIndex = idx
         val song = _queue[idx]
         currentSong = song

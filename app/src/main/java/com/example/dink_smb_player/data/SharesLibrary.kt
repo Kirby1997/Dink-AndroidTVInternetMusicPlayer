@@ -89,7 +89,7 @@ object SharesLibrary {
         scope.launch {
             runCatching { SmbClient.closeAllFor(shareId) }
             LibraryRepository.removeSource(appContext, SourceType.Smb, shareId)
-            EncryptedShareStore(appContext).deleteSmbCreds(shareId)
+            EncryptedShareStore.get(appContext).deleteSmbCreds(shareId)
             SharePrefs(appContext).deleteShare(shareId)
         }
     }
@@ -163,7 +163,7 @@ object SharesLibrary {
         val importStartMs = System.currentTimeMillis()
         errorsByShare.remove(share.id)
         try {
-            val creds = EncryptedShareStore(context).getSmbCreds(share.id)
+            val creds = EncryptedShareStore.get(context).getSmbCreds(share.id)
             val existing = LibraryRepository.sourceTrackMap(context, SourceType.Smb, share.id)
             withContext(Dispatchers.IO) {
                 SmbImporter.enumerate(
@@ -212,7 +212,7 @@ object SharesLibrary {
 
     suspend fun sync(context: Context, share: SmbShare) {
         val prefs = SharePrefs(context.applicationContext)
-        val store = EncryptedShareStore(context.applicationContext)
+        val store = EncryptedShareStore.get(context.applicationContext)
         val creds = store.getSmbCreds(share.id)
         syncingShares[share.id] = true
         errorsByShare.remove(share.id)

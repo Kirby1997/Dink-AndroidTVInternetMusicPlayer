@@ -10,6 +10,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.aspectRatio
@@ -254,19 +255,7 @@ private fun V5LeftColumn(
     Column(
         modifier = modifier.padding(start = 20.dp, end = 12.dp, top = 24.dp, bottom = 24.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            NowPlayingPill()
-            Text(
-                text = "FROM ${shortSource(song.sourcePath).uppercase()}",
-                style = type.monoSmall.copy(color = V5White50, fontSize = 11.sp),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
+        NowPlayingPill()
         Spacer(Modifier.height(24.dp))
         CoverArt(
             song = song,
@@ -507,8 +496,10 @@ private fun V5LyricsColumn(
     val type = LocalDinkType.current
     val visible = remember(lyrics, currentIndex) { computeVisibleLyrics(lyrics, currentIndex) }
     val nonBlankTotal = remember(lyrics) { lyrics.count { it.text.isNotBlank() } }
-    val nonBlankCurrentIdx = remember(visible) {
-        visible.indexOfFirst { it.state == V5LineState.Current }.let { if (it < 0) 0 else it } + 1
+    // Ordinal of the current line among ALL non-blank lines — not its slot in the
+    // 6-line visible window (that slot is constant, which froze the counter at 3).
+    val nonBlankCurrentIdx = remember(lyrics, currentIndex) {
+        currentNonBlankOrdinal(lyrics, currentIndex)
     }
 
     BoxWithConstraints(modifier = modifier.padding(horizontal = 20.dp, vertical = 24.dp)) {
@@ -529,7 +520,7 @@ private fun V5LyricsColumn(
                 // No counter when there are no lyrics — "1 / 0" reads as a glitch.
                 if (nonBlankTotal > 0) {
                     Text(
-                        text = "$nonBlankCurrentIdx / $nonBlankTotal",
+                        text = "LINE $nonBlankCurrentIdx / $nonBlankTotal",
                         style = type.monoSmall.copy(color = V5White40, fontSize = 10.sp, letterSpacing = 0.08.em),
                         maxLines = 1,
                     )
@@ -596,6 +587,19 @@ private data class V5VisibleLine(val text: String, val state: V5LineState, val d
  * the current line index. Returns only the 6-line window around current
  * (d ∈ -2..+3) so the layout has a fixed maximum size.
  */
+/** 1-based position of the current lyric among all non-blank lines (blank-line
+ *  current resolves to the last non-blank at or before it, same as the window). */
+private fun currentNonBlankOrdinal(lyrics: List<LyricLine>, currentIdx: Int): Int {
+    if (lyrics.isEmpty()) return 1
+    val safeCi = currentIdx.coerceIn(0, lyrics.lastIndex)
+    val nonBlank = lyrics.withIndex().filter { it.value.text.isNotBlank() }
+    if (nonBlank.isEmpty()) return 1
+    val ci = nonBlank.indexOfFirst { it.index == safeCi }.let {
+        if (it >= 0) it else nonBlank.indexOfLast { e -> e.index <= safeCi }.coerceAtLeast(0)
+    }
+    return ci + 1
+}
+
 private fun computeVisibleLyrics(lyrics: List<LyricLine>, currentIdx: Int): List<V5VisibleLine> {
     if (lyrics.isEmpty()) return emptyList()
     val nonBlank = lyrics.withIndex().filter { it.value.text.isNotBlank() }
@@ -656,7 +660,21 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
             .background(V5QueueBg)
             // Left hairline border distinguishes the queue panel from the lyrics column.
             .padding(start = 1.dp)
-            .background(V5CardLine.copy(alpha = 0.0f)),
+            .background(V5CardLine.copy(alpha = 0.0f))
+            // Entering the queue lands on the current track (row 0), not whatever row
+            // is geometrically level with the transport buttons (~row 5). Only routed
+            // while row 0 is composed — scrolled away it isn't attached and requesting
+            // focus on it would throw; spatial default is fine there.
+            .focusProperties {
+                enter = {
+                    if (upcoming.isNotEmpty() && listState.firstVisibleItemIndex == 0) {
+                        topRowFocus
+                    } else {
+                        FocusRequester.Default
+                    }
+                }
+            }
+            .focusGroup(),
     ) {
         Column(
             modifier = Modifier
@@ -700,6 +718,7 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
                             song = song,
                             album = album,
                             state = state,
+                            playing = player.isPlaying,
                             onClick = {
                                 // Row 0 restarts the current track — indices don't shift,
                                 // so no focus snap is queued (currentIdx never changes and
@@ -733,6 +752,7 @@ private fun V5QueueRow(
     song: Song,
     album: Album,
     state: V5QueueRowState,
+    playing: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -772,7 +792,7 @@ private fun V5QueueRow(
         ) {
             Box(modifier = Modifier.width(28.dp), contentAlignment = Alignment.Center) {
                 if (state == V5QueueRowState.Current) {
-                    EqBars(color = Color.White)
+                    EqBars(color = Color.White, animate = playing)
                 } else {
                     Text(
                         text = index.toString().padStart(2, '0'),
@@ -809,35 +829,46 @@ private fun V5QueueRow(
     }
 }
 
-/** 4-bar EQ animation for the currently-playing queue row. */
+/** 4-bar EQ indicator for the currently-playing queue row. Animates only while
+ *  audio is actually playing; paused shows the bars frozen at fixed heights. */
 @Composable
-private fun EqBars(color: Color) {
-    val transition = rememberInfiniteTransition(label = "v5-eq")
+private fun EqBars(color: Color, animate: Boolean) {
     val phases = remember { listOf(0, 150, 300, 450) }
+    val pausedHeights = remember { listOf(0.55f, 0.95f, 0.4f, 0.75f) }
     Row(
         modifier = Modifier.height(12.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        phases.forEach { delayMs ->
-            val anim by transition.animateFloat(
-                initialValue = 0.3f,
-                targetValue = 1.0f,
-                animationSpec = infiniteRepeatable(
-                    animation = tween(durationMillis = 1000, delayMillis = delayMs, easing = LinearEasing),
-                    repeatMode = RepeatMode.Reverse,
-                ),
-                label = "v5-eq-bar-$delayMs",
-            )
-            Box(
-                modifier = Modifier
-                    .width(2.dp)
-                    .height((12 * anim).dp)
-                    .clip(RoundedCornerShape(1.dp))
-                    .background(color),
-            )
+        if (animate) {
+            val transition = rememberInfiniteTransition(label = "v5-eq")
+            phases.forEach { delayMs ->
+                val anim by transition.animateFloat(
+                    initialValue = 0.3f,
+                    targetValue = 1.0f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 1000, delayMillis = delayMs, easing = LinearEasing),
+                        repeatMode = RepeatMode.Reverse,
+                    ),
+                    label = "v5-eq-bar-$delayMs",
+                )
+                EqBar(color = color, fraction = anim)
+            }
+        } else {
+            pausedHeights.forEach { h -> EqBar(color = color, fraction = h) }
         }
     }
+}
+
+@Composable
+private fun EqBar(color: Color, fraction: Float) {
+    Box(
+        modifier = Modifier
+            .width(2.dp)
+            .height((12 * fraction).dp)
+            .clip(RoundedCornerShape(1.dp))
+            .background(color),
+    )
 }
 
 // ----------------------------------------------------------------------------
@@ -886,18 +917,6 @@ private fun formatTime(totalSec: Int): String {
     val m = totalSec / 60
     val s = totalSec % 60
     return "%d:%02d".format(m, s)
-}
-
-/**
- * MediaStore-backed local songs carry the full filesystem path in [Song.sourcePath]
- * (`/storage/emulated/0/Music/coldsilver.mp3`). The eyebrow can't fit that, so
- * collapse to just the parent dir + filename.
- */
-private fun shortSource(sourcePath: String): String {
-    if (sourcePath.isBlank()) return "LOCAL"
-    val parts = sourcePath.trimEnd('/').split('/').filter { it.isNotEmpty() }
-    val tail = parts.takeLast(2).joinToString("/")
-    return if (tail.length <= 48) tail else "…" + tail.takeLast(47)
 }
 
 private val FALLBACK_PALETTES = listOf(

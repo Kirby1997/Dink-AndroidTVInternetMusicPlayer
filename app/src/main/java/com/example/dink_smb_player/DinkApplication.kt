@@ -4,7 +4,8 @@ import android.app.Application
 import android.content.Context
 import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.MonitorWorker
-import com.example.dink_smb_player.data.source.local.LocalSyncWorker
+import com.example.dink_smb_player.ui.theme.preloadThemeMode
+import com.example.dink_smb_player.ui.theme.preloadUiScale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -40,10 +41,15 @@ class DinkApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         installLoggerFilter()
-        // Boot-time MediaStore scan. If READ_MEDIA_AUDIO hasn't been granted yet
-        // the query returns an empty cursor — safe to call unconditionally. A
-        // later grant via LocalStorageScreen re-runs refresh() explicitly.
-        LocalSyncWorker.enqueue(this)
+        // Start the tiny UI-pref reads now so the first composition already has them
+        // (see preloadUiScale); if they lose the race the UI falls back as before.
+        appScope.launch(Dispatchers.IO) {
+            runCatching { preloadThemeMode(this@DinkApplication) }
+            runCatching { preloadUiScale(this@DinkApplication) }
+        }
+        // No boot-time MediaStore scan here: this runs for every process start (media
+        // button, workers, receivers), and a UI launch already scans via DinkApp's
+        // MediaLibrary.loadOnce. Volume mounts still enqueue LocalSyncWorker.
         // Periodic re-import of monitored SMB shares + local media into the library index.
         MonitorWorker.reschedule(this)
         // One-time: adopt already-imported folders as monitored so existing libraries

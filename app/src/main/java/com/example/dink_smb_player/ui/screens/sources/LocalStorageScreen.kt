@@ -92,7 +92,7 @@ fun LocalStorageScreen(
     LaunchedEffect(hasPermission) {
         if (hasPermission && songs.isEmpty()) {
             loading = true
-            MediaLibrary.refresh(context)
+            MediaLibrary.refresh(context, force = true)
             loading = false
         }
     }
@@ -142,7 +142,7 @@ fun LocalStorageScreen(
                     onClick = {
                         scope.launch {
                             loading = true
-                            MediaLibrary.refresh(context)
+                            MediaLibrary.refresh(context, force = true)
                             loading = false
                         }
                     },

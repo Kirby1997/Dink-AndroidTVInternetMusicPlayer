@@ -106,7 +106,7 @@ fun SmbBrowseScreen(
         loading = true
         error = null
         val result = withContext(Dispatchers.IO) {
-            val creds = EncryptedShareStore(context.applicationContext).getSmbCreds(s.id)
+            val creds = EncryptedShareStore.get(context.applicationContext).getSmbCreds(s.id)
             SmbBrowser.list(s, creds, path)
         }
         result

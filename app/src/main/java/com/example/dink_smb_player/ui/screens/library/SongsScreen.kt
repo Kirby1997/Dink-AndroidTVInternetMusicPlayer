@@ -104,8 +104,8 @@ fun SongsScreen(
             }
             when (sort) {
                 SongSort.MostPlayed -> pool.sortedByDescending { it.playCount }
-                SongSort.Title -> pool.sortedBy { it.title.lowercase() }
-                SongSort.Artist -> pool.sortedBy { it.artist.lowercase() }
+                SongSort.Title -> pool.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+                SongSort.Artist -> pool.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.artist })
                 SongSort.Longest -> pool.sortedByDescending { it.durationSec }
             }
         }

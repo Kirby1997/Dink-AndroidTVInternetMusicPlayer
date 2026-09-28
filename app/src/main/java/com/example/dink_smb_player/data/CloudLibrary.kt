@@ -133,7 +133,7 @@ object CloudLibrary {
         spec: CloudProviderSpec,
         token: GoogleDriveClient.TokenResult.Success,
     ) {
-        val store = EncryptedShareStore(context)
+        val store = EncryptedShareStore.get(context)
         val prefs = SharePrefs(context)
         val expiresAtMs = System.currentTimeMillis() + token.expiresInSec * 1000L
         store.putCloudToken(spec.id, CloudToken(token.accessToken, token.refreshToken, expiresAtMs))
@@ -259,7 +259,7 @@ object CloudLibrary {
         val appContext = context.applicationContext
         scope.launch {
             LibraryRepository.removeSource(appContext, SourceType.Cloud, providerId)
-            EncryptedShareStore(appContext).deleteCloudToken(providerId)
+            EncryptedShareStore.get(appContext).deleteCloudToken(providerId)
             SharePrefs(appContext).deleteProvider(providerId)
         }
     }
