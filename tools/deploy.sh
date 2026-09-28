@@ -13,7 +13,7 @@ PKG=com.dink.player
 ACT=$PKG/com.example.dink_smb_player.MainActivity
 APK=app/build/outputs/apk/debug/app-debug.apk
 STAMP=.deploy-stamp
-SERIAL=${DINK_SERIAL:-192.168.138.95:5555}
+SERIAL=${DINK_SERIAL:-192.168.255.81:5555}
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
 
 # Android Studio (Windows) rewrites local.properties to the Windows SDK path,
