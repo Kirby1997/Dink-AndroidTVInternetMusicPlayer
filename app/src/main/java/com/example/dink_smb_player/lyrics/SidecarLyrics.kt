@@ -41,8 +41,8 @@ internal data class SidecarNames(val lrc: String?, val txt: String?)
  */
 object SidecarLyrics {
 
-    /** The track's directory, or null when its source has no listable directory (cloud,
-     *  SAF single-document URIs). */
+    /** The track's directory, or null when its source has no listable directory (SAF
+     *  single-document URIs). */
     internal fun dirFor(song: Song): SidecarDir? {
         val uri = song.mediaUri
         if (uri != null && uri.startsWith("smb://", ignoreCase = true)) {

@@ -111,6 +111,21 @@ class LibraryRestoreRaceTest {
     }
 
     @Test
+    fun `restore drops rows of the removed cloud source and rewrites the index without them`() = runBlocking {
+        val cloud = SourceEntity(id = "cloud-gdrive", type = SourceType.Cloud, displayName = "Drive", createdAtMs = 0)
+        val cloudRow = smbRow("g").copy(sourceType = SourceType.Cloud, sourceId = cloud.id, uri = "gdrive://file?pid=x")
+        val withCloud = LibraryStore.Snapshot(listOf(smbRow("a"), cloudRow, smbRow("b")), listOf(smb, cloud))
+        LibraryRepository.resetForTest(io({ LibraryStore.LoadResult.Ok(withCloud) }), dao)
+
+        LibraryRepository.ensureRestored(ctx)
+
+        assertEquals(setOf("a", "b"), tracks.value.map { it.id }.toSet())
+        // The cleaned index is written back, so the rows are gone from disk as well.
+        assertTrue("restore saved the cleaned index", saves.isNotEmpty())
+        assertEquals(setOf("a", "b"), saves.last().map { it.id }.toSet())
+    }
+
+    @Test
     fun `transient restore keeps loading, is retried, and the retry keeps rows written meanwhile`() = runBlocking {
         LibraryRepository.restoreRetryBaseMs = 60_000L // the scheduled retry stays out of the way
         val loads = AtomicInteger()

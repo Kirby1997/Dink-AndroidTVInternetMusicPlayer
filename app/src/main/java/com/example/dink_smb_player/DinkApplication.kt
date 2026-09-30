@@ -77,7 +77,7 @@ class DinkApplication : Application() {
         }
     }
 
-    /** Backfill `monitoredPaths`/`monitoredFolders` from imported folders, once. Guarded
+    /** Backfill `monitoredPaths` from imported folders, once. Guarded
      *  by a flag so a deliberate later un-monitor isn't re-enabled on the next boot. */
     private suspend fun migrateAutoMonitorOnce(context: Context) {
         val flags = context.getSharedPreferences("dink_flags", MODE_PRIVATE)
@@ -86,11 +86,6 @@ class DinkApplication : Application() {
         prefs.shares.first().forEach { share ->
             if (share.importPaths.isNotEmpty() && share.monitoredPaths.isEmpty()) {
                 prefs.updateShare(share.id) { it.copy(monitoredPaths = it.monitoredPaths.ifEmpty { it.importPaths }) }
-            }
-        }
-        prefs.providers.first().forEach { provider ->
-            if (provider.importFolders.isNotEmpty() && provider.monitoredFolders.isEmpty()) {
-                prefs.updateProvider(provider.id) { it.copy(monitoredFolders = it.monitoredFolders.ifEmpty { it.importFolders }) }
             }
         }
         flags.edit().putBoolean(FLAG_MONITOR_MIGRATED, true).apply()

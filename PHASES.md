@@ -116,6 +116,10 @@ Tried the real device flow on a TV with a configured "TVs and Limited Input devi
 
 Decision (user, 2026-06-11): **park cloud**. Google Drive set `available=false` ("Needs phone sign-in"); all providers non-actionable for now. The full cloud subsystem (browser, importer, monitor, streaming `CloudDataSource`, device-flow plumbing) stays in place and compiles — it's provider-agnostic, so it'll light up for a provider whose device flow allows broad file scopes. Future paths if revisited: **OneDrive** (Microsoft device-code flow *does* allow `Files.Read.All` — best TV fit), **Dropbox** (PKCE + manual code paste), or **Google via companion sign-in handoff** (phone does full OAuth, relays token to TV — needs a relay). Next work: Phase 8.5 (lyrics) / Phase 9 (stub screens).
 
+### Cloud REMOVED (2026-09-30)
+
+Owner decision: Drive support isn't coming (the device-flow scope wall above has no fix on a TV). The whole cloud subsystem described in this section — `data/source/cloud/**`, `CloudLibrary`, `CloudScreen`/`CloudBrowseScreen`, the `gdrive://` data source route, the cloud monitor pass, provider prefs and token storage, and the `DINK_GOOGLE_CLIENT_*` build fields — was deleted, along with the `parked/cloud` branch. `SourceType.Cloud` remains only so an old index still decodes; its rows are dropped at restore, and stored provider prefs and tokens are purged on first launch. Sources are now SMB and local/USB/SD.
+
 ## Phase 8.5 — lyrics chain landed (2026-06-11)
 
 foo_openlyrics-style online chain added behind the existing local sources. Compiles; Settings UI verified on TV (toggles render + flip + persist). **Runtime gate still open**: NetEase/QQ/Musixmatch fetch correctness needs a real track without sidecar/ID3 lyrics to play — exercise on-device.

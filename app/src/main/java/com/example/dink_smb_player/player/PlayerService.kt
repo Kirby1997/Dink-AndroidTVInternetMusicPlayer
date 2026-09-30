@@ -235,7 +235,7 @@ class PlayerService : MediaSessionService() {
         override fun isCommandAvailable(command: Int): Boolean =
             super.isCommandAvailable(command) || (command in ROUTED_COMMANDS && routed() != null)
 
-        // Remote (SMB/cloud) MediaItems carry no metadata on purpose, so the engine can
+        // Remote (SMB) MediaItems carry no metadata on purpose, so the engine can
         // surface the file's embedded tags for enrichment. A file the extractor finds no
         // tags in (ID3v1/APE-only) then published a blank title to the system Now Playing
         // card and notification. Fall back to the index's names — they come from the
@@ -477,13 +477,13 @@ class PlayerService : MediaSessionService() {
             Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
         )
 
-        /** Local tracks carry clean MediaStore tags; remote (smb/gdrive) ones stay
+        /** Local tracks carry clean MediaStore tags; remote (smb) ones stay
          *  metadata-less so the engine's embedded-tag parse isn't masked (same rule
          *  as PlayerState.mediaItemFor). */
         private fun resumptionItemFor(song: com.example.dink_smb_player.data.model.Song): MediaItem {
             val builder = MediaItem.Builder().setMediaId(song.id).setUri(song.mediaUri)
             val scheme = song.mediaUri?.substringBefore("://")?.lowercase()
-            if (scheme != "smb" && scheme != "gdrive") {
+            if (scheme != "smb") {
                 builder.setMediaMetadata(
                     MediaMetadata.Builder()
                         .setTitle(song.title)

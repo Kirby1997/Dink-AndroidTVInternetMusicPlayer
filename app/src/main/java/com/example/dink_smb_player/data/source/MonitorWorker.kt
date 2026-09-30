@@ -17,15 +17,11 @@ import com.example.dink_smb_player.data.index.SourceType
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.prefs.EncryptedShareStore
 import com.example.dink_smb_player.data.prefs.SharePrefs
-import com.example.dink_smb_player.data.source.cloud.CloudConnectionRegistry
-import com.example.dink_smb_player.data.source.cloud.CloudImporter
 import com.example.dink_smb_player.data.source.smb.SmbConnectionRegistry
 import com.example.dink_smb_player.data.source.smb.SmbImporter
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 /**
@@ -120,44 +116,6 @@ class MonitorWorker(
                         android.util.Log.w(TAG, "smb monitor failed '${share.name}'", it)
                         SourceOutcome.FAILED
                     },
-                )
-            } ?: SourceOutcome.CANCELLED
-        }
-
-        // Cloud monitored folders. We may be in a cold process where DinkApp's boot
-        // wiring never ran, so install the token store ourselves before resolving
-        // (and refreshing) access tokens.
-        CloudConnectionRegistry.installTokenStore(
-            get = { pid -> store.getCloudToken(pid) },
-            put = { pid, token -> store.putCloudToken(pid, token) },
-        )
-        val providers = runCatching { prefs.providers.first() }.getOrDefault(emptyList())
-        for (listed in providers.filter { it.monitoredFolders.isNotEmpty() }) {
-            outcomes += SourceLocks.runExclusive(listed.id) {
-                val provider = runCatching { prefs.providers.first() }.getOrDefault(emptyList())
-                    .firstOrNull { it.id == listed.id }
-                    ?.takeIf { it.monitoredFolders.isNotEmpty() }
-                    ?: return@runExclusive SourceOutcome.SKIPPED
-                val existing = LibraryRepository.sourceTrackMap(ctx, SourceType.Cloud, provider.id)
-                val result = withContext(Dispatchers.IO) {
-                    // No token = needs a reconnect by the user; retrying won't help.
-                    val token = CloudConnectionRegistry.validAccessToken(provider.id)
-                        ?: return@withContext null
-                    CloudImporter.enumerate(ctx, provider, token, provider.monitoredFolders, existing)
-                } ?: return@runExclusive SourceOutcome.SKIPPED
-                result.fold(
-                    onSuccess = { res ->
-                        val tracks = res.tracks
-                        LibraryRepository.refreshMonitored(
-                            ctx,
-                            CloudImporter.sourceEntityFor(provider, tracks.size, tracks.sumOf { it.sizeBytes }),
-                            tracks,
-                            provider.monitoredFolders.map { CloudImporter.monitoredPrefix(provider, it) },
-                            prune = res.complete,
-                        )
-                        if (res.complete) SourceOutcome.COMPLETE else SourceOutcome.INCOMPLETE
-                    },
-                    onFailure = { SourceOutcome.FAILED },
                 )
             } ?: SourceOutcome.CANCELLED
         }

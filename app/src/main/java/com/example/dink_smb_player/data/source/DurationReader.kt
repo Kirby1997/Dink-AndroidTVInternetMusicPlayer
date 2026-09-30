@@ -4,7 +4,7 @@ import android.content.Context
 import android.media.MediaMetadataRetriever
 
 /**
- * Reads a track's playback DURATION at IMPORT time — including remote SMB / cloud
+ * Reads a track's playback DURATION at IMPORT time — including remote SMB
  * tracks — WITHOUT downloading the file.
  *
  * Media3's [androidx.media3.inspector.MetadataRetriever] (used by [TagReader] for

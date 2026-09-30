@@ -9,10 +9,10 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import com.example.dink_smb_player.data.model.CloudProvider
 import com.example.dink_smb_player.data.model.SmbShare
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -25,14 +25,15 @@ private val Context.shareDataStore by preferencesDataStore(
 )
 
 private val SMB_SHARES_KEY = stringSetPreferencesKey("smb_shares_json")
-private val CLOUD_PROVIDERS_KEY = stringSetPreferencesKey("cloud_providers_json")
+// Written by the removed cloud (Google Drive) feature; only ever deleted now.
+private val LEGACY_CLOUD_PROVIDERS_KEY = stringSetPreferencesKey("cloud_providers_json")
 
 /**
- * Non-secret persistence for SMB shares + cloud providers. Stored as a set of JSON blobs
+ * Non-secret persistence for SMB shares. Stored as a set of JSON blobs
  * (one per source) inside a Preferences DataStore — small N, no need for a separate
  * Room table for what is fundamentally configuration. Secrets live in [EncryptedShareStore].
  *
- * Addresses Plan.txt pain #1: shares + providers survive process death and reboot.
+ * Addresses Plan.txt pain #1: shares survive process death and reboot.
  */
 class SharePrefs internal constructor(private val store: DataStore<Preferences>) {
 
@@ -43,10 +44,6 @@ class SharePrefs internal constructor(private val store: DataStore<Preferences>)
     val shares: Flow<List<SmbShare>> = store.data
         .catch { e -> Log.e("SharePrefs", "shares read failed, emitting empty", e); emit(emptyPreferences()) }
         .map { prefs -> decodeSet<SmbShare>(prefs[SMB_SHARES_KEY]) }
-
-    val providers: Flow<List<CloudProvider>> = store.data
-        .catch { e -> Log.e("SharePrefs", "providers read failed, emitting empty", e); emit(emptyPreferences()) }
-        .map { prefs -> decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY]) }
 
     suspend fun saveShare(share: SmbShare) {
         store.edit { prefs ->
@@ -83,32 +80,11 @@ class SharePrefs internal constructor(private val store: DataStore<Preferences>)
         }
     }
 
-    suspend fun saveProvider(provider: CloudProvider) {
-        store.edit { prefs ->
-            val current = decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
-            val next = current.filter { it.id != provider.id } + provider
-            prefs[CLOUD_PROVIDERS_KEY] = encodeSet(next)
-        }
-    }
-
-    /** [updateShare] for cloud providers: no-op (null) if the provider was deleted. */
-    suspend fun updateProvider(id: String, transform: (CloudProvider) -> CloudProvider): CloudProvider? {
-        var updated: CloudProvider? = null
-        store.edit { prefs ->
-            val current = decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
-            val existing = current.firstOrNull { it.id == id } ?: return@edit
-            val next = transform(existing).copy(id = id)
-            prefs[CLOUD_PROVIDERS_KEY] = encodeSet(current.map { if (it.id == id) next else it })
-            updated = next
-        }
-        return updated
-    }
-
-    suspend fun deleteProvider(id: String) {
-        store.edit { prefs ->
-            val current = decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
-            prefs[CLOUD_PROVIDERS_KEY] = encodeSet(current.filter { it.id != id })
-        }
+    /** Drop the provider list the removed cloud feature stored. No-op (no write) when
+     *  there is nothing to drop. */
+    suspend fun purgeLegacyCloud() {
+        if (store.data.first()[LEGACY_CLOUD_PROVIDERS_KEY] == null) return
+        store.edit { it.remove(LEGACY_CLOUD_PROVIDERS_KEY) }
     }
 
     private inline fun <reified T> decodeSet(set: Set<String>?): List<T> =

@@ -977,7 +977,6 @@ private fun fallbackAlbumFor(song: Song): Album {
     // i.e. most remote tracks) hardcoded LOCAL.
     val tag = when (song.mediaUri?.substringBefore("://")?.lowercase()) {
         "smb" -> "SMB"
-        "gdrive" -> "CLOUD"
         else -> "LOCAL"
     }
     return Album(

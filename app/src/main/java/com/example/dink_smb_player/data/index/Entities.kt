@@ -10,6 +10,11 @@ package com.example.dink_smb_player.data.index
 
 import kotlinx.serialization.Serializable
 
+/**
+ * [Cloud] is legacy: the cloud (Google Drive) source was removed, but the constant stays so
+ * an index written by an older version still decodes instead of being treated as corrupt.
+ * Its rows are dropped at restore — see [withoutLegacyCloud].
+ */
 @Serializable
 enum class SourceType { Smb, Cloud, Local }
 
@@ -76,3 +81,12 @@ data class SourceEntity(
     val sizeBytes: Long = 0,
     val statusJson: String? = null,
 )
+
+/** Tracks of the removed cloud source can no longer be played or refreshed; drop them. */
+@JvmName("tracksWithoutLegacyCloud")
+internal fun List<TrackEntity>.withoutLegacyCloud(): List<TrackEntity> =
+    if (none { it.sourceType == SourceType.Cloud }) this else filter { it.sourceType != SourceType.Cloud }
+
+@JvmName("sourcesWithoutLegacyCloud")
+internal fun List<SourceEntity>.withoutLegacyCloud(): List<SourceEntity> =
+    if (none { it.type == SourceType.Cloud }) this else filter { it.type != SourceType.Cloud }

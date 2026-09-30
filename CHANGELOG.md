@@ -3,6 +3,13 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [Unreleased]
+
+### Removed
+- The unfinished Google Drive (cloud) source. It was never reachable in a release —
+  Google's TV sign-in can't grant access to browse files — so nothing changes in the app;
+  this removes the dead code and deletes any sign-in data it may have stored.
+
 ## [1.3.0] - 2026-09-30
 
 Fixes from a full codebase audit, a second review pass and on-device testing.

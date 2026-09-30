@@ -6,7 +6,7 @@ import com.example.dink_smb_player.data.model.ArtPalette
 import com.example.dink_smb_player.data.model.Song
 
 /**
- * Deterministic procedural album art for an indexed track. Real SMB/cloud/local tracks
+ * Deterministic procedural album art for an indexed track. Real SMB/local tracks
  * carry no embedded artwork yet (TagReader reads text tags + duration, not pictures), so
  * the UI derives a stable cover from a hash. Keyed on album when known so a whole album
  * shares one cover; same seeding scheme NowPlaying + Home use, so a song looks identical

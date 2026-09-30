@@ -75,7 +75,7 @@ fun SongsScreen(
     val railRequester = LocalRailFocusRequester.current
     val contentFocus = LocalContentFocus.current
     val albumsById = remember { PreviewMockData.albums.associateBy { it.id } }
-    // Read the unified library index — every imported track (local + SMB + cloud)
+    // Read the unified library index — every imported track (local + SMB)
     // surfaces here regardless of which source screen scanned it. NO mock seed: this is
     // a real, user-facing list, so fake demo tracks must not leak into it.
     val context = LocalContext.current

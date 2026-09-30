@@ -27,7 +27,7 @@ class LocalSyncWorker(
     override suspend fun doWork(): Result {
         // Rehydrate the index from disk before refresh()'s mutate-and-persist, or a
         // cold-process run (volume mount / boot) would persist a snapshot missing
-        // every imported SMB/cloud track. See LibraryRepository.ensureRestored.
+        // every imported SMB track. See LibraryRepository.ensureRestored.
         LibraryRepository.ensureRestored(applicationContext)
         MediaLibrary.refresh(applicationContext, force = true) // a volume came or went
         return Result.success()

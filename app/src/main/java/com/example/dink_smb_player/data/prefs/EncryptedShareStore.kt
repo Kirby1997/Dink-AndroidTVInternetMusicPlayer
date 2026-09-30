@@ -12,19 +12,14 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.security.KeyStore
 
+private const val LEGACY_CLOUD_PREFIX = "cloud:"
+
 @Serializable
 data class SmbCreds(val user: String, val password: String, val domain: String? = null)
 
-@Serializable
-data class CloudToken(
-    val accessToken: String,
-    val refreshToken: String? = null,
-    val expiresAtMs: Long? = null,
-)
-
 /**
- * Persists SMB credentials and cloud OAuth tokens in EncryptedSharedPreferences.
- * Keys are namespaced by source id so a single share/provider id maps cleanly to its secret blob.
+ * Persists SMB credentials in EncryptedSharedPreferences.
+ * Keys are namespaced by source id so a single share id maps cleanly to its secret blob.
  *
  * NB: never log values read from this store.
  */
@@ -148,27 +143,18 @@ class EncryptedShareStore private constructor(context: Context) {
             .onFailure { android.util.Log.e("EncryptedShareStore", "deleteSmbCreds failed", it) }
     }
 
-    // ---------- Cloud ----------
+    // ---------- Legacy ----------
 
-    fun putCloudToken(providerId: String, token: CloudToken) {
-        // Called from the token-refresh path on playback threads — a throw there would crash.
-        runCatching { prefs.edit().putString(cloudKey(providerId), json.encodeToString(token)).apply() }
-            .onFailure { android.util.Log.e("EncryptedShareStore", "putCloudToken failed", it) }
-    }
-
-    fun getCloudToken(providerId: String): CloudToken? {
-        // Same guard as getSmbCreds: this runs on playback/refresh paths.
-        val raw = runCatching { prefs.getString(cloudKey(providerId), null) }.getOrNull() ?: return null
-        return runCatching { json.decodeFromString<CloudToken>(raw) }.getOrNull()
-    }
-
-    fun deleteCloudToken(providerId: String) {
-        runCatching { prefs.edit().remove(cloudKey(providerId)).apply() }
-            .onFailure { android.util.Log.e("EncryptedShareStore", "deleteCloudToken failed", it) }
-    }
+    /** Delete OAuth tokens the removed cloud (Google Drive) feature stored under
+     *  `cloud:<provider id>`. Returns how many were removed; no write when there are none. */
+    fun purgeLegacyCloudTokens(): Int = runCatching {
+        val stale = prefs.all.keys.filter { it.startsWith(LEGACY_CLOUD_PREFIX) }
+        if (stale.isNotEmpty()) prefs.edit().apply { stale.forEach { remove(it) } }.apply()
+        stale.size
+    }.onFailure { android.util.Log.e("EncryptedShareStore", "purgeLegacyCloudTokens failed", it) }
+        .getOrDefault(0)
 
     private fun smbKey(id: String) = "smb:$id"
-    private fun cloudKey(id: String) = "cloud:$id"
 }
 
 /**

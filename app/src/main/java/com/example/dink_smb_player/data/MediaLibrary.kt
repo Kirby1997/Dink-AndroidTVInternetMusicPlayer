@@ -21,8 +21,8 @@ import java.util.concurrent.atomic.AtomicLong
  * imported via MediaStore would only appear in the screen that scanned them.
  *
  * Phase 6.5 will extend this with per-volume (USB / SD) filtering on top of the
- * same backing list. Cloud + SMB sources land into their own per-source registries
- * managed by Phase 7 / Phase 8.
+ * same backing list. SMB sources land into their own per-source registry managed by
+ * Phase 7.
  */
 object MediaLibrary {
     val localSongs = mutableStateListOf<Song>()
@@ -40,7 +40,7 @@ object MediaLibrary {
 
     /** Re-query MediaStore. Cheap to call repeatedly — MediaStore caches the index.
      *  Also mirrors the result into the unified library index so local tracks appear
-     *  alongside imported SMB/cloud tracks in the Library screens. Concurrent callers are
+     *  alongside imported SMB tracks in the Library screens. Concurrent callers are
      *  serialized and coalesced by [RefreshGate] (LIB-17): one scan per launch. Returns the
      *  failure when the scan's result couldn't be saved to the library index (it is then in
      *  memory only); success otherwise, including a skipped or rejected scan. */

@@ -2,7 +2,6 @@ package com.example.dink_smb_player.nav
 
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Album
-import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.LibraryMusic
@@ -38,8 +37,6 @@ sealed class ScreenId(
     object LocalStorage: ScreenId("local",       "Local Storage", Icons.Outlined.SdStorage,        RailGroup.Sources, implemented = true)
     object SmbShares   : ScreenId("smb",         "SMB Shares",    Icons.Outlined.Storage,          RailGroup.Sources, implemented = true)
     object SmbBrowse   : ScreenId("smbbrowse",   "Browse Share",  Icons.Outlined.Folder,           RailGroup.Bottom,  implemented = true)
-    object Cloud       : ScreenId("cloud",       "Cloud Storage", Icons.Outlined.Cloud,            RailGroup.Sources, implemented = true)
-    object CloudBrowse : ScreenId("cloudbrowse", "Browse Cloud",  Icons.Outlined.Folder,           RailGroup.Bottom,  implemented = true)
 
     object Settings    : ScreenId("settings",    "Settings",      Icons.Outlined.Settings,         RailGroup.Bottom,  implemented = true)
     object AddShareWizard : ScreenId("addshare", "Add SMB Share", Icons.Outlined.Storage,          RailGroup.Bottom,  implemented = true)
@@ -60,10 +57,6 @@ sealed class ScreenId(
             listOf(
                 Home, Search, NowPlaying,
                 Songs, Albums, Artists, Playlists, Folders,
-                // Cloud (Google Drive) parked at the device-flow OAuth scope wall — the
-                // code lives on the `parked/cloud` branch. Omitted from the rail so the
-                // dead "not configured" screen is unreachable in release. Re-add `Cloud`
-                // here to restore the entry.
                 LocalStorage, SmbShares,
                 Settings,
             )

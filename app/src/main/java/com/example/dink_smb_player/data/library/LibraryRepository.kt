@@ -9,6 +9,7 @@ import com.example.dink_smb_player.data.index.SourceEntity
 import com.example.dink_smb_player.data.index.SourceType
 import com.example.dink_smb_player.data.index.TrackEntity
 import com.example.dink_smb_player.data.index.TrackMerges
+import com.example.dink_smb_player.data.index.withoutLegacyCloud
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.DinkApplication
 import com.example.dink_smb_player.data.source.ReadResult
@@ -42,8 +43,8 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Single source of truth for *imported* playable tracks across every source (local,
- * SMB, cloud). Wraps the previously-orphaned [MediaIndex] / [IndexDao]: source
- * screens (Local / SMB / Cloud) write here via [importSource]; library + Home
+ * SMB). Wraps the previously-orphaned [MediaIndex] / [IndexDao]: source
+ * screens (Local / SMB) write here via [importSource]; library + Home
  * screens read [songs] / [recentlyAdded] and build bounded playback queues from
  * album / artist / folder views.
  *
@@ -118,16 +119,21 @@ object LibraryRepository {
             is LibraryStore.LoadResult.Missing -> persistGate.onLoaded()
             is LibraryStore.LoadResult.Ok -> {
                 val dao = dao(context)
-                result.snapshot.sources.forEach { dao.upsertSource(it) }
+                // Rows of the removed cloud source are dropped here; the write below takes
+                // them off disk too.
+                val sources = result.snapshot.sources.withoutLegacyCloud()
+                val tracks = result.snapshot.tracks.withoutLegacyCloud()
+                val droppedCloud = sources !== result.snapshot.sources || tracks !== result.snapshot.tracks
+                sources.forEach { dao.upsertSource(it) }
                 // Seeds the live play-stats map from the rows' stored counts (LIB-15).
-                dao.restoreTracks(result.snapshot.tracks)
+                dao.restoreTracks(tracks)
                 persistGate.onLoaded()
                 // One-time migration: snapshots written before precompute existed carry null
                 // grouping keys, and ones from before LIB-6 carry title-only album keys.
                 // Recompute once and persist so subsequent boots (and the Albums/Artists views)
                 // read ready-made keys instead of normalizing at display. The raw write: we
                 // hold restoreMutex, which isn't reentrant.
-                if (migrateGroupingKeys(dao, result.snapshot.tracks)) persistNow(context)
+                if (migrateGroupingKeys(dao, tracks) || droppedCloud) persistNow(context)
             }
             is LibraryStore.LoadResult.Corrupt -> {
                 // The unreadable file(s) were quarantined aside (timestamped copies) when the
@@ -181,7 +187,7 @@ object LibraryRepository {
      * point (e.g. [com.example.dink_smb_player.data.source.MonitorWorker]) can run
      * in a cold process where the UI's boot restore never executed. Persisting an
      * unrestored index would overwrite library_index.json with a near-empty
-     * snapshot, wiping every imported SMB/cloud track that isn't re-derived from a
+     * snapshot, wiping every imported SMB track that isn't re-derived from a
      * live source. Every write path below calls this first, so a writer that races
      * the boot restore waits for it. Idempotent and cheap — guards on a process-level flag.
      */
@@ -620,7 +626,7 @@ object LibraryRepository {
     private const val BOGUS_DURATION_KBPS = 700.0
 
     /**
-     * Re-read embedded tags for every already-indexed REMOTE track (SMB/cloud) and
+     * Re-read embedded tags for every already-indexed REMOTE track (SMB) and
      * merge any improvements in place. Fixes libraries imported before tag reading
      * existed: those rows hold filename/folder-derived names, and a normal re-import
      * reuses them by id (incremental scan) so it never re-tags them. Local tracks are
@@ -874,7 +880,7 @@ object LibraryRepository {
 
     /**
      * Enrich one track's tags from metadata the player extracted while STREAMING it
-     * (Phase 8.7). SMB/cloud tracks are indexed with filename/folder-derived names;
+     * (Phase 8.7). SMB tracks are indexed with filename/folder-derived names;
      * once ExoPlayer parses the real ID3/Vorbis/MP4 tags we upgrade the row in place
      * (id is path-derived, so it's stable). No-ops when nothing actually changes, so
      * replaying an already-enriched track doesn't churn the on-disk snapshot.

@@ -59,7 +59,7 @@ object TagReadGate {
 
 /**
  * Reads embedded tags (ID3 / Vorbis comment / MP4) from a track at IMPORT time,
- * including remote SMB / cloud tracks — without downloading the file.
+ * including remote SMB tracks — without downloading the file.
  *
  * It runs Media3's [MetadataRetriever] over our own [DinkDataSourceFactory], so the
  * extractor pulls only the bytes it needs (container header / metadata atom) over
@@ -96,7 +96,7 @@ object TagReader {
     private const val TIMEOUT_SECONDS = 10L
 
     /** Media3 retrievals that may run at once: every gated bulk read ([TagReadGate.PERMITS])
-     *  plus headroom for the ungated one-at-a-time readers (embedded lyrics, cloud import). */
+     *  plus headroom for the ungated one-at-a-time readers (embedded lyrics). */
     internal const val MAX_PARALLEL_RETRIEVALS = TagReadGate.PERMITS + 10
 
     init {

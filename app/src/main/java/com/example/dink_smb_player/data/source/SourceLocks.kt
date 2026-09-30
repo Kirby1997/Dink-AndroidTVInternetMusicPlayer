@@ -12,7 +12,7 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Process-wide lifecycle guard for library sources (SMB share / cloud provider ids).
+ * Process-wide lifecycle guard for library sources (SMB share ids).
  *
  * Every job that walks a source and writes its rows — import, monitor pass, folder
  * removal — runs through [runExclusive]: one at a time per source (a per-source

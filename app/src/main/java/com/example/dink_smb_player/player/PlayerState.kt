@@ -581,7 +581,7 @@ class PlayerState(
 
     /**
      * The engine parsed the streamed file's embedded tags (ID3/Vorbis/MP4). For
-     * remote sources (SMB/cloud) the index only has filename/folder-derived names, so
+     * remote sources (SMB) the index only has filename/folder-derived names, so
      * upgrade the in-memory [Song] and hand the raw tags to [onMetadataResolved] to
      * persist. Local tracks already carry clean MediaStore tags — skip them.
      */
@@ -617,7 +617,7 @@ class PlayerState(
     }
 
     private fun isRemoteUri(uri: String): Boolean =
-        when (uri.substringBefore("://").lowercase()) { "smb", "gdrive" -> true; else -> false }
+        uri.substringBefore("://").equals("smb", ignoreCase = true)
 
     /** [engineIdx] is the engine's media-item index; map it back to the queue
      *  index through [engineBase] since the engine only holds a window. */
@@ -929,7 +929,7 @@ class PlayerState(
         val uri = song.mediaUri ?: error("mediaItemFor called for song without mediaUri")
         val builder = MediaItem.Builder().setMediaId(song.id).setUri(uri)
         // For LOCAL tracks the Song already carries clean MediaStore tags, so set them
-        // for immediate controller (BT/Auto) display. For REMOTE (SMB/cloud) tracks the
+        // for immediate controller (BT/Auto) display. For REMOTE (SMB) tracks the
         // index has only filename/folder-derived names — leave MediaItem metadata empty
         // so the engine surfaces the file's REAL embedded tags via onMediaMetadataChanged
         // (Phase 8.7 enrichment); a MediaItem override would mask them.

@@ -306,7 +306,7 @@ object Mp3DurationParser {
                 override fun close() { file.release() }
             }
         }
-        // Generic (file:// / http(s):// / gdrive://) — reopen per positioned read. Only a
+        // Generic (file:// / http(s)://) — reopen per positioned read. Only a
         // couple of reads happen, so the reopen cost is negligible here.
         val factory = DinkDataSourceFactory(context)
         val sizeDs = factory.createDataSource()

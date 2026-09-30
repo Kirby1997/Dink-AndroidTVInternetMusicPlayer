@@ -38,7 +38,7 @@ object TrackMerges {
         current?.copy(addedAtMs = incoming.addedAtMs) ?: incoming
     }
 
-    /** SMB/cloud walk (import, monitor, mid-walk flush). A new file is inserted as read. A file
+    /** SMB walk (import, monitor, mid-walk flush). A new file is inserted as read. A file
      *  whose size/mtime changed was re-read by the walk, so its tags + stamps come from [incoming].
      *  An unchanged file only refreshes its listing fields — its tags, plays and enrichment stay as
      *  they are NOW, not as the walk's snapshot saw them — unless the walk re-read it (no duration,

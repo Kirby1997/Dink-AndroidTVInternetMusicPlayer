@@ -17,7 +17,7 @@ import java.io.ByteArrayOutputStream
 
 /**
  * Pulls a track's EMBEDDED cover art (ID3 APIC / MP4 `covr` / FLAC PICTURE) — including
- * remote SMB / cloud tracks — WITHOUT downloading the whole file.
+ * remote SMB tracks — WITHOUT downloading the whole file.
  *
  * Drives the platform [MediaMetadataRetriever] over [Media3MediaDataSource] (the same
  * bridge [com.example.dink_smb_player.data.source.DurationReader] uses), so the extractor
@@ -68,7 +68,7 @@ object ArtExtractor {
      * ripped libraries store art this way instead of embedding it.
      *
      * Derives each candidate by swapping the last path segment of [sampleUri]; only
-     * `smb://` and `file://` have a meaningful sibling path (cloud uses opaque file ids),
+     * `smb://` and `file://` have a meaningful sibling path,
      * so other schemes are Absent without any network round-trips. A transient failure on
      * any candidate is an Error (the rest would fail the same way, so stop there).
      */

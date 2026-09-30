@@ -144,7 +144,7 @@ internal data class SearchResults(
 /**
  * Library-wide search across Songs / Albums / Artists. Embedded-tag metadata
  * (title, artist, albumTitle on [Song]) is the match key — same truth the library
- * facets group by — so a tag-corrected SMB/cloud track is findable by its real name,
+ * facets group by — so a tag-corrected SMB track is findable by its real name,
  * not its filename.
  *
  * TV input: the field is a tap-to-edit chip (OK opens leanback IME, Back/Done

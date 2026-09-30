@@ -47,23 +47,8 @@ android {
         }
     }
 
-    // Google OAuth client for the "TVs and Limited Input devices" client type, used by
-    // the Phase 8 cloud device-flow. Kept out of source control: set
-    // DINK_GOOGLE_CLIENT_ID / DINK_GOOGLE_CLIENT_SECRET in ~/.gradle/gradle.properties
-    // (or pass -P). Debug builds only — cloud is parked, and a secret compiled into a
-    // release APK is public (-dontobfuscate), so release always gets empty strings.
-    // Empty → CloudScreen surfaces a "not configured" notice instead of crashing.
-    val googleClientId = (project.findProperty("DINK_GOOGLE_CLIENT_ID") as String?).orEmpty()
-    val googleClientSecret = (project.findProperty("DINK_GOOGLE_CLIENT_SECRET") as String?).orEmpty()
-
     buildTypes {
-        debug {
-            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"$googleClientId\"")
-            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_SECRET", "\"$googleClientSecret\"")
-        }
         release {
-            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"\"")
-            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_SECRET", "\"\"")
             // R8 shrink + resource shrink (NO obfuscation — see proguard-rules.pro
             // -dontobfuscate). Cuts dead code + unused resources for a smaller APK while
             // keeping the build reversible.

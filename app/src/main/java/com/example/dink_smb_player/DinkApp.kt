@@ -86,13 +86,10 @@ import com.example.dink_smb_player.ui.screens.nowplaying.NowPlayingScreen
 import com.example.dink_smb_player.ui.screens.settings.SettingsScreen
 import com.example.dink_smb_player.ui.screens.sources.AddShareWizard
 import com.example.dink_smb_player.ui.screens.sources.LocalStorageScreen
-import com.example.dink_smb_player.ui.screens.sources.CloudBrowseScreen
-import com.example.dink_smb_player.ui.screens.sources.CloudScreen
 import com.example.dink_smb_player.ui.screens.sources.SmbBrowseScreen
 import com.example.dink_smb_player.ui.screens.sources.SmbSharesScreen
 import com.example.dink_smb_player.data.prefs.EncryptedShareStore
 import com.example.dink_smb_player.data.prefs.SharePrefs
-import com.example.dink_smb_player.data.source.cloud.CloudConnectionRegistry
 import com.example.dink_smb_player.data.source.smb.SmbConnectionRegistry
 import com.example.dink_smb_player.ui.sound.LocalNavSounds
 import com.example.dink_smb_player.ui.sound.rememberNavSounds
@@ -197,22 +194,13 @@ fun DinkApp() {
         val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore.get(context.applicationContext) }
         SmbConnectionRegistry.installCredLookup { sid -> secretStore.getSmbCreds(sid) }
         val sharePrefs = SharePrefs(context.applicationContext)
+        // The cloud (Google Drive) feature was removed; don't leave its OAuth tokens and
+        // provider list on disk. Both are no-ops once there is nothing left to delete.
+        withContext(Dispatchers.IO) {
+            secretStore.purgeLegacyCloudTokens()
+            sharePrefs.purgeLegacyCloud()
+        }
         sharePrefs.shares.collect { shares -> SmbConnectionRegistry.update(shares) }
-    }
-
-    // Cloud infrastructure: same shape as SMB. Install a token store (read for
-    // playback, write so a mid-session refresh persists) once, then mirror
-    // persisted providers into the registry so CloudDataSource can resolve `?pid=`
-    // app-wide — even resuming a cloud track without opening CloudScreen.
-    LaunchedEffect(Unit) {
-        // Same Keystore-init cost as the SMB store above — keep off main.
-        val secretStore = withContext(Dispatchers.IO) { EncryptedShareStore.get(context.applicationContext) }
-        CloudConnectionRegistry.installTokenStore(
-            get = { pid -> secretStore.getCloudToken(pid) },
-            put = { pid, token -> secretStore.putCloudToken(pid, token) },
-        )
-        val sharePrefs = SharePrefs(context.applicationContext)
-        sharePrefs.providers.collect { providers -> CloudConnectionRegistry.update(providers) }
     }
 
     // Hydrate the in-memory lyric-provider toggles so LyricChain (which runs
@@ -267,7 +255,7 @@ fun DinkApp() {
         commitSeq++
     }
 
-    // Screen-level BackHandlers (SmbBrowse, CloudBrowse, AddShareWizard) register later and
+    // Screen-level BackHandlers (SmbBrowse, AddShareWizard) register later and
     // so win over this one; they're gated on LocalDrawerOpen so Back in the open drawer
     // still reaches the exit dialog here (UI-22).
     // A State (not a Boolean read here) so drawer toggles don't recompose all of DinkApp.
@@ -418,8 +406,6 @@ private fun ScreenHost(
         ScreenId.LocalStorage -> LocalStorageScreen(player = player, onNavigate = onNavigate)
         ScreenId.SmbShares -> SmbSharesScreen(player = player, onNavigate = onNavigate, onToast = onToast)
         ScreenId.SmbBrowse -> SmbBrowseScreen(player = player, onNavigate = onNavigate, onToast = onToast)
-        ScreenId.Cloud -> CloudScreen(player = player, onNavigate = onNavigate, onToast = onToast)
-        ScreenId.CloudBrowse -> CloudBrowseScreen(player = player, onNavigate = onNavigate, onToast = onToast)
         // AddShareWizard hands off to whatever target it chose (SmbShares on Cancel,
         // SmbBrowse on Save).
         ScreenId.AddShareWizard -> AddShareWizard(onDone = onNavigate, onToast = onToast)
@@ -468,7 +454,6 @@ internal fun resolveBack(drawerOpen: Boolean, current: ScreenId, detailFrames: I
  *  drawer correctly and to ensure railRequester always attaches to a RailItem. */
 private fun railCurrentFor(screen: ScreenId): ScreenId = when (screen) {
     ScreenId.AddShareWizard, ScreenId.SmbBrowse -> ScreenId.SmbShares
-    ScreenId.CloudBrowse -> ScreenId.Cloud
     ScreenId.LibraryDetail -> LibraryDetailNav.parent
     else -> screen
 }

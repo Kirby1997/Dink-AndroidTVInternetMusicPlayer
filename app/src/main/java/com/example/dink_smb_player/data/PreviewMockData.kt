@@ -4,12 +4,9 @@ import com.example.dink_smb_player.BuildConfig
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.AlbumArtShape
 import com.example.dink_smb_player.data.model.ArtPalette
-import com.example.dink_smb_player.data.model.AuthMethod
-import com.example.dink_smb_player.data.model.CloudProvider
 import com.example.dink_smb_player.data.model.ConnectionStatus
 import com.example.dink_smb_player.data.model.LocalVolume
 import com.example.dink_smb_player.data.model.LyricLine
-import com.example.dink_smb_player.data.model.ProviderGlyph
 import com.example.dink_smb_player.data.model.SmbProtocol
 import com.example.dink_smb_player.data.model.SmbShare
 import com.example.dink_smb_player.data.model.Song
@@ -151,7 +148,7 @@ object PreviewMockData {
         albumTitle = albumRiverGrid.title,
         durationSec = 198,
         playCount = 7,
-        sourcePath = "gdrive/curated/idm",
+        sourcePath = "nas/curated/idm",
         bitrate = "FLAC",
     )
 
@@ -163,7 +160,7 @@ object PreviewMockData {
         albumTitle = albumRiverGrid.title,
         durationSec = 175,
         playCount = 134,
-        sourcePath = "gdrive/curated/idm",
+        sourcePath = "nas/curated/idm",
         bitrate = "FLAC",
     )
 
@@ -256,32 +253,6 @@ object PreviewMockData {
         syncSchedule = SyncSchedule.Auto,
     )
 
-    val providerGDrive = CloudProvider(
-        id = "cloud-gdrive",
-        name = "Google Drive",
-        auth = AuthMethod.OAuthDeviceFlow,
-        status = ConnectionStatus.Connected,
-        account = "jj@wilkinsons.me.uk",
-        trackCount = 2_140,
-        cacheSize = "12.4 GB / 64 GB",
-        lastSyncMs = System.currentTimeMillis() - 600_000L,
-        glyph = ProviderGlyph.Triangle,
-        syncSchedule = SyncSchedule.Hourly,
-    )
-
-    val providerDropboxExpired = CloudProvider(
-        id = "cloud-dropbox",
-        name = "Dropbox",
-        auth = AuthMethod.OAuthPkce,
-        status = ConnectionStatus.Expired,
-        account = "jacob",
-        trackCount = 412,
-        cacheSize = "2.1 GB / 64 GB",
-        lastSyncMs = System.currentTimeMillis() - 86_400_000L,
-        glyph = ProviderGlyph.Diamond,
-        syncSchedule = SyncSchedule.Daily,
-    )
-
     val volumeInternal = LocalVolume(
         id = "local-internal",
         label = "Internal",
@@ -330,6 +301,5 @@ object PreviewMockData {
         albumKitePages,
     )
     val shares: List<SmbShare> = listOf(shareAttic)
-    val providers: List<CloudProvider> = listOf(providerGDrive, providerDropboxExpired)
     val volumes: List<LocalVolume> = listOf(volumeInternal, volumeUsb)
 }

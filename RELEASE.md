@@ -69,7 +69,7 @@ $ANDROID_HOME/build-tools/<ver>/apksigner verify --print-certs \
 - [ ] `versionCode` bumped
 - [ ] Real icon + banner (done — regenerate via `python3 tools/make_icon.py`, or
       replace with AI art, see below)
-- [ ] Cloud feature hidden (done — parked on `parked/cloud` branch)
+- [ ] No cloud feature (done — the unfinished Google Drive source was removed)
 - [ ] Creds excluded from backup (done — `data_extraction_rules.xml`)
 - [ ] Privacy policy hosted + URL in listing
 - [ ] Tested release APK on a real Android TV / Shield

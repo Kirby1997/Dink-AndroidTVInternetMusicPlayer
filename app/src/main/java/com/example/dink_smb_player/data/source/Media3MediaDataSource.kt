@@ -15,7 +15,7 @@ import com.example.dink_smb_player.data.source.smb.ReadAheadBuffer
 
 /**
  * [MediaDataSource] adapter over a Media3 [androidx.media3.datasource.DataSource]
- * (smb:// / gdrive:// / file:// / http(s)://, dispatched by [DinkDataSourceFactory]).
+ * (smb:// / file:// / http(s)://, dispatched by [DinkDataSourceFactory]).
  * Lets the platform [android.media.MediaMetadataRetriever] read a remote track's
  * header / metadata atom over smbj or HTTP Range — no full download.
  *
@@ -25,7 +25,7 @@ import com.example.dink_smb_player.data.source.smb.ReadAheadBuffer
  * 512KB read-ahead buffer. Inside an [SmbProbe.session] that handle is the one the other
  * probes of the same file share, and its size (from the listing) answers [getSize]. The old code re-opened the SMB file (a full SMB CREATE
  * round-trip) on every non-sequential read, which cost ~636 opens for one duration probe and
- * timed it out. Other schemes (http Range / gdrive) can't reposition a live stream, so they
+ * timed it out. Other schemes (http Range) can't reposition a live stream, so they
  * keep the re-open-on-seek fallback. A byte [budgetBytes] caps total transfer so a probe can
  * never fall through to pulling a whole file (past budget → EOF; the retriever stops).
  *
@@ -57,7 +57,7 @@ internal class Media3MediaDataSource(
     // smb:// is genuinely random-access (one open handle, positioned reads). The platform
     // duration scanner issues hundreds of scattered reads; serving each by re-opening the file
     // cost a full SMB CREATE per seek (~636 per probe → 20s timeout). For smb we open ONCE and
-    // random-access via one open handle. Other schemes (http Range / gdrive) can't
+    // random-access via one open handle. Other schemes (http Range) can't
     // reposition a live stream, so they keep the re-open-on-seek fallback below.
     private val isSmb = uri.startsWith("smb", ignoreCase = true)
     private var smbFile: ProbeFile? = null
@@ -163,7 +163,7 @@ internal class Media3MediaDataSource(
             return if (n <= 0) -1 else n // -1 is a GENUINE EOF from smbj → valid, NOT truncated
         }
 
-        // Generic fallback (http / gdrive / file): re-open on seek; reuse handle when sequential.
+        // Generic fallback (http / file): re-open on seek; reuse handle when sequential.
         if (openDs == null || position != cursor) {
             closeOpen()
             val ds = factory.createDataSource()

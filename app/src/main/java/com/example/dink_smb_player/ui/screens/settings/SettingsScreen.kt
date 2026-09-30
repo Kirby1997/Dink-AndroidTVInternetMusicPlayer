@@ -344,7 +344,7 @@ fun SettingsScreen() {
                             Text(text = "Library", style = type.cardTitle.copy(color = palette.ink0))
                             Text(
                                 text = "Re-read embedded tags (title / artist / album / year) AND track length " +
-                                    "from every imported SMB and cloud track and update the library in place. Use " +
+                                    "from every imported SMB track and update the library in place. Use " +
                                     "this if names still show filenames or folders, or if track lengths read 0:00 " +
                                     "(library imported before lengths were read). Play counts are preserved. Runs " +
                                     "in the background; leaving this screen is fine.",

@@ -1,14 +1,14 @@
 # Dink — Privacy Policy
 
-_Last updated: 28 September 2026_
+_Last updated: 30 September 2026_
 
 Dink ("the app") is a music player for Android TV. This policy explains what the app does
 with your data. The short version: **Dink does not collect, store, or share your personal
 data on any server we control. There is no account, no analytics, and no advertising.**
 
 ## Data stored on your device
-- **Network credentials** (usernames and passwords for SMB/network shares, and any cloud
-  tokens) are stored **encrypted on your device** using Android's hardware-backed
+- **Network credentials** (usernames and passwords for SMB/network shares) are stored
+  **encrypted on your device** using Android's hardware-backed
   keystore. They are never transmitted to us and are excluded from device backups.
 - **Your music library index and app settings** are stored locally so the app remembers
   your sources and preferences.

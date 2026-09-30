@@ -39,7 +39,7 @@ fun ExitConfirmDialog(
     ConfirmDialog(
         eyebrow = "EXIT DINK",
         title = "Stop listening and close the app?",
-        body = "Playback will stop. SMB shares, cloud connections and your library stay saved.",
+        body = "Playback will stop. SMB shares and your library stay saved.",
         cancelLabel = "Keep listening",
         confirmLabel = "Exit",
         onCancel = onCancel,
