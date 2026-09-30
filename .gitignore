@@ -8,6 +8,14 @@ local.properties
 /.idea/workspace.xml
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
+# per-machine IDE state (shared project settings — code style, inspections, run configs — stay tracked)
+/.idea/deploymentTargetSelector.xml
+/.idea/deviceManager.xml
+/.idea/misc.xml
+/.idea/compiler.xml
+/.idea/gradle.xml
+/.idea/AndroidProjectSystem.xml
+/.idea/vcs.xml
 .DS_Store
 /build
 /app/build
@@ -29,6 +37,9 @@ logcat.txt
 *.mp3
 *.zip
 Continuenextsession.txt
+Plan.txt
+logo_drive_*.png
+/AndroidTV SMB Music Player/
 .deploy-stamp
 
 # Smoke-test screenshots (regenerated locally, not source)
