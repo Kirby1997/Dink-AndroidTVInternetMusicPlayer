@@ -12,11 +12,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import kotlinx.serialization.json.encodeToStream
-import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 
 /**
  * Disk persistence for the in-memory library index. The index ([com.example.dink_smb_player.data.index.MediaIndex])
@@ -26,10 +22,12 @@ import java.nio.file.StandardCopyOption
  * Single JSON file in filesDir — fine for the track counts a TV music library holds.
  * Swap for the Room table once KSP supports AGP 9. Always touched off the main thread.
  *
- * Writes are atomic (temp file + ATOMIC_MOVE) and serialized through [ioLock] so a
+ * Writes are atomic (temp file + fsync + ATOMIC_MOVE) and serialized through [ioLock] so a
  * crash mid-write or two concurrent persisters (UI boot refresh racing a worker)
  * can never leave a torn/half file — torn files are what previously failed to parse
- * on restart and let an empty snapshot clobber a full library.
+ * on restart and let an empty snapshot clobber a full library. A known-good
+ * `library_index.bak.json` is rotated once per process and used when the main file is
+ * unreadable; unreadable files are kept as timestamped `*.corrupt-<ms>.json` copies.
  */
 object LibraryStore {
 
@@ -41,65 +39,63 @@ object LibraryStore {
 
     /** Outcome of [load]. Distinguishing [Missing] (legit first run) from [Corrupt]
      *  (file present but unreadable) is critical: the caller must NOT overwrite a
-     *  corrupt file with an empty index — that is how the library got wiped. */
+     *  corrupt file with an empty index — that is how the library got wiped.
+     *  [Transient] (I/O error or OOM, after retries) says nothing about the file's
+     *  contents: the caller must not write, and should retry the load later.
+     *  [Corrupt.quarantined]: the unreadable file(s) were moved aside, so writing no longer
+     *  overwrites anything recoverable. */
     sealed interface LoadResult {
-        data class Ok(val snapshot: Snapshot) : LoadResult
+        data class Ok(val snapshot: Snapshot, val fromBackup: Boolean = false) : LoadResult
         data object Missing : LoadResult
-        data class Corrupt(val error: Throwable) : LoadResult
+        data class Corrupt(val error: Throwable, val quarantined: Boolean = false) : LoadResult
+        data class Transient(val error: Throwable) : LoadResult
     }
 
     private val json = Json { ignoreUnknownKeys = true }
     private val ioLock = Mutex()
 
-    private fun file(context: Context): File =
-        File(context.applicationContext.filesDir, "library_index.json")
+    @Volatile private var guarded: GuardedJsonFile<Snapshot>? = null
 
+    private fun guarded(context: Context): GuardedJsonFile<Snapshot> =
+        guarded ?: synchronized(this) {
+            guarded ?: guardedFile(context.applicationContext.filesDir).also { guarded = it }
+        }
+
+    // Stream the encode straight to the file instead of building one giant String first —
+    // halves peak heap and avoids a full extra copy of a multi-MB snapshot on every persist.
+    // Parse straight off a buffered file stream too — never materialises the whole file as
+    // a String, so cold-boot restore of a big index is faster and uses far less peak memory.
     @OptIn(ExperimentalSerializationApi::class)
-    suspend fun save(context: Context, tracks: List<TrackEntity>, sources: List<SourceEntity>) =
-        withContext(Dispatchers.IO) {
-            ioLock.withLock {
-                runCatching {
-                    val f = file(context)
-                    val tmp = File(f.parentFile, "${f.name}.tmp")
-                    // Stream the encode straight to the file instead of building one giant
-                    // String first — halves peak heap and avoids a full extra copy of a
-                    // multi-MB snapshot on every persist.
-                    BufferedOutputStream(FileOutputStream(tmp)).use { out ->
-                        json.encodeToStream(Snapshot(tracks, sources), out)
-                    }
-                    // Atomic replace: a reader (or the next boot) sees either the old
-                    // complete file or the new complete file, never a partial write.
-                    Files.move(
-                        tmp.toPath(), f.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
-                    )
-                }.onFailure { t ->
-                    android.util.Log.e("LibraryStore", "save failed: ${tracks.size} tracks, ${sources.size} sources", t)
-                }
-                Unit
+    internal fun guardedFile(dir: File): GuardedJsonFile<Snapshot> = GuardedJsonFile(
+        file = File(dir, "library_index.json"),
+        tag = "LibraryStore",
+        decode = { json.decodeFromStream<Snapshot>(it) },
+        encode = { snap, out -> json.encodeToStream(snap, out) },
+    )
+
+    /** Success only once the snapshot is durably on disk. [snapshot] is taken INSIDE [ioLock]
+     *  (LIB-12): two persisters that each captured the index before queueing on the lock could
+     *  otherwise finish out of order and leave the OLDER snapshot on disk. */
+    suspend fun save(
+        context: Context,
+        snapshot: () -> Pair<List<TrackEntity>, List<SourceEntity>>,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        ioLock.withLock {
+            val (tracks, sources) = snapshot()
+            guarded(context).saveResult(Snapshot(tracks, sources)).onFailure {
+                android.util.Log.e("LibraryStore", "save failed: ${tracks.size} tracks, ${sources.size} sources")
             }
         }
+    }
 
-    @OptIn(ExperimentalSerializationApi::class)
     suspend fun load(context: Context): LoadResult = withContext(Dispatchers.IO) {
-        ioLock.withLock {
-            val f = file(context)
-            if (!f.exists()) return@withContext LoadResult.Missing
-            // Parse straight off a buffered file stream — never materialises the whole
-            // file as a String, so cold-boot restore of a big index is faster and uses
-            // far less peak memory (the long pole before Home can show any track).
-            runCatching { f.inputStream().buffered().use { json.decodeFromStream<Snapshot>(it) } }.fold(
-                onSuccess = { LoadResult.Ok(it) },
-                onFailure = { t ->
-                    // Preserve the unreadable file for inspection/recovery instead of
-                    // letting it get silently overwritten by an empty snapshot.
-                    runCatching {
-                        f.copyTo(File(f.parentFile, "library_index.corrupt.json"), overwrite = true)
-                    }
-                    android.util.Log.e("LibraryStore", "load failed; preserved as library_index.corrupt.json", t)
-                    LoadResult.Corrupt(t)
-                },
-            )
-        }
+        ioLock.withLock { toLoadResult(guarded(context).loadWithRetry()) }
+    }
+
+    internal fun toLoadResult(r: GuardedJsonFile.Load<Snapshot>): LoadResult = when (r) {
+        is GuardedJsonFile.Load.Ok -> LoadResult.Ok(r.value, r.fromBackup)
+        GuardedJsonFile.Load.Missing -> LoadResult.Missing
+        is GuardedJsonFile.Load.Corrupt -> LoadResult.Corrupt(r.error, r.quarantined)
+        is GuardedJsonFile.Load.Transient -> LoadResult.Transient(r.error)
     }
 }

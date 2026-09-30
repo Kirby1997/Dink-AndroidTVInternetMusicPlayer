@@ -1,122 +1,130 @@
 package com.example.dink_smb_player.lyrics
 
-import android.content.Context
 import android.net.Uri
-import android.provider.DocumentsContract
-import com.example.dink_smb_player.data.model.LyricLine
 import com.example.dink_smb_player.data.model.Song
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * Reads a `.lrc` file sitting next to the media file. First port of the
- * foo_openlyrics provider chain — sidecar > ID3 > online (Phase 8.5).
- *
- * Resolution order:
- *   1. Filesystem path (file:// URIs, MediaStore's DATA column) — replace extension with `.lrc`.
- *   2. SAF document URIs — locate sibling document with same display name + `.lrc` suffix.
- * MediaStore content URIs without a `sourcePath` are not resolved here; v1 relies
- * on MediaStoreAudio populating `sourcePath` from the DATA column.
+ * The directory a track lives in, as far as sidecar lookup needs it: listed ONCE per
+ * resolve, then only the matching `.lrc` / `.txt` is read. Implemented for local files
+ * ([LocalSidecarDir]) and SMB shares ([SmbSidecarDir]) — sidecars on SMB, the main
+ * source, used to go through java.io.File and were never found (LYR-1).
+ */
+internal interface SidecarDir {
+    /** The track's own file name, extension included. */
+    val audioName: String
+
+    /** File names in the directory. Throws on a transient failure (NAS unreachable). */
+    suspend fun list(): List<String>
+
+    /** Bytes of [name] in the directory (capped at [MAX_SIDECAR_BYTES]); null if unreadable. */
+    suspend fun read(name: String): ByteArray?
+
+    companion object {
+        /** A lyric file is a few KB; anything past this isn't one worth reading. */
+        const val MAX_SIDECAR_BYTES = 1024 * 1024
+    }
+}
+
+/** Names of the sidecars found next to a track (either may be null). */
+internal data class SidecarNames(val lrc: String?, val txt: String?)
+
+/**
+ * Sidecar `.lrc` / `.txt` lyric files next to the media file (foo_openlyrics-style —
+ * user-curated, so they rank first). Matching, against ONE directory listing:
+ *   1. `{basename}.lrc` — same name as the audio file, case-insensitive.
+ *   2. A file whose name is the track's title (optionally `Artist - Title`, optionally
+ *      with a leading track number) once case / punctuation / spacing are ignored —
+ *      see [nameMatches]. Handles "Slipknot - Wait And Bleed.lrc" next to "WaitAndBleed.mp3".
  */
 object SidecarLyrics {
 
-    fun load(context: Context, song: Song): List<LyricLine> {
-        val text = readSidecarText(context, song) ?: return emptyList()
-        return runCatching { LrcParser.parse(text) }.getOrDefault(emptyList())
-    }
-
-    private fun readSidecarText(context: Context, song: Song): String? {
-        val fsText = readFromFilesystem(song.sourcePath)
-        if (fsText != null) return fsText
-
-        // Same-directory fallback by title/artist (handles "Slipknot - Wait
-        // And Bleed.lrc" next to "WaitAndBleed.mp3").
-        val byTitle = findSiblingByTitle(song.sourcePath, song.title, song.artist, arrayOf(".lrc", ".LRC"))
-        if (byTitle != null) {
-            val read = runCatching { byTitle.readText() }.getOrNull()
-            if (read != null) return read
+    /** The track's directory, or null when its source has no listable directory (cloud,
+     *  SAF single-document URIs). */
+    internal fun dirFor(song: Song): SidecarDir? {
+        val uri = song.mediaUri
+        if (uri != null && uri.startsWith("smb://", ignoreCase = true)) {
+            return SmbSidecarDir.parse(uri)
         }
-
-        val uriStr = song.mediaUri ?: return null
-        val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return null
-        return when (uri.scheme) {
-            "file" -> uri.path?.let(::readFromFilesystem)
-            "content" -> readFromSafSibling(context, uri)
-            else -> null
+        val path = when {
+            uri != null && uri.startsWith("file://", ignoreCase = true) -> Uri.parse(uri).path
+            else -> song.sourcePath
         }
-    }
-
-    private fun readFromFilesystem(path: String?): String? {
         if (path.isNullOrBlank()) return null
-        for (ext in arrayOf(".lrc", ".LRC")) {
-            val candidate = replaceExtension(path, ext)
-            val file = File(candidate)
-            if (file.exists() && file.canRead()) {
-                return runCatching { file.readText() }.getOrNull()
-            }
-        }
-        return null
+        val file = File(path)
+        if (!file.isFile) return null
+        return LocalSidecarDir(file, song.title, song.artist)
     }
+
+    /** Pick the `.lrc` and `.txt` sidecars for a track out of one directory listing. */
+    internal fun locate(names: List<String>, audioName: String, title: String, artist: String): SidecarNames {
+        val base = audioName.substringBeforeLast('.', audioName)
+        fun find(ext: String): String? {
+            val files = names.filter { it.length > ext.length && it.endsWith(ext, ignoreCase = true) }
+            return files.firstOrNull { it.dropLast(ext.length).equals(base, ignoreCase = true) }
+                ?: files.firstOrNull { nameMatches(it.dropLast(ext.length), title, artist) }
+        }
+        return SidecarNames(lrc = find(".lrc"), txt = find(".txt"))
+    }
+
+    private val TRACK_NO_PREFIX = Regex("""^\d{1,3}\s*[-._)]?\s*""")
 
     /**
-     * Fallback when `{basename}.lrc` isn't present. Tries:
-     *   1. Explicit candidates built from title/artist (`Title.lrc`,
-     *      `Artist - Title.lrc`, common separators). File.exists()-only — works
-     *      on Android 13+ scoped storage where File.listFiles() is blocked.
-     *   2. If listFiles() *is* permitted (older API or MANAGE_EXTERNAL_STORAGE),
-     *      do a case- and separator-insensitive contains-match on the title.
+     * True when a sidecar basename is the same name as the track once case,
+     * punctuation and spacing are ignored: `Title`, `Artist - Title`, either with
+     * a leading track number (`01 - Title`, `01. Artist - Title`).
      */
-    fun findSiblingByTitle(
-        songPath: String,
-        title: String,
-        artist: String,
-        exts: Array<String>,
-    ): File? {
-        if (songPath.isBlank() || title.isBlank()) return null
-        val mediaFile = File(songPath)
-        val dir = mediaFile.parentFile ?: return null
-
-        for (basename in buildCandidates(title, artist)) {
-            for (ext in exts) {
-                val f = File(dir, basename + ext)
-                if (f.exists() && f.canRead()) return f
-            }
-        }
-
-        val needle = normalize(title)
-        if (needle.isBlank()) return null
-        val matches = runCatching {
-            dir.listFiles { f ->
-                f.isFile && exts.any { e -> f.name.endsWith(e, ignoreCase = true) } &&
-                    normalize(f.nameWithoutExtension).contains(needle)
-            }
-        }.getOrNull() ?: return null
-        return matches.firstOrNull()
+    internal fun nameMatches(fileBase: String, title: String, artist: String): Boolean {
+        val t = normalize(title)
+        if (t.isBlank()) return false
+        val a = normalize(artist)
+        val wanted = if (a.isBlank()) setOf(t) else setOf(t, a + t)
+        return normalize(fileBase) in wanted ||
+            normalize(fileBase.replace(TRACK_NO_PREFIX, "")) in wanted
     }
 
-    private fun buildCandidates(title: String, artist: String): List<String> {
-        val out = mutableListOf<String>()
-        if (title.isNotBlank()) out += title
-        if (artist.isNotBlank() && title.isNotBlank()) {
-            out += "$artist - $title"
-            out += "$artist-$title"
-            out += "${artist}_${title}"
+    /** Explicit sidecar names to probe when a directory can't be listed (Android 13+
+     *  scoped storage blocks File.listFiles() but not File.exists()). */
+    internal fun probeCandidates(audioName: String, title: String, artist: String): List<String> {
+        val bases = LinkedHashSet<String>()
+        bases += audioName.substringBeforeLast('.', audioName)
+        if (title.isNotBlank()) {
+            bases += title
+            if (artist.isNotBlank()) {
+                bases += "$artist - $title"
+                bases += "$artist-$title"
+                bases += "${artist}_$title"
+            }
         }
-        return out
+        return bases.flatMap { b -> listOf(".lrc", ".LRC", ".txt", ".TXT").map { b + it } }
     }
+
+    // Unicode-aware so CJK / accented titles don't normalise to "" and never match.
+    private val NON_ALNUM = Regex("""[^\p{L}\p{N}]+""")
 
     private fun normalize(s: String): String =
-        s.lowercase().replace(Regex("[^a-z0-9]+"), "")
+        s.lowercase().replace(NON_ALNUM, "")
+}
 
-    private fun readFromSafSibling(context: Context, uri: Uri): String? {
-        // SAF tree URIs expose siblings via DocumentsContract.buildChildDocumentsUriUsingTree.
-        // Single-document URIs (ACTION_OPEN_DOCUMENT) generally can't resolve siblings without
-        // a parent tree, so this is a best-effort lookup.
-        return null
+/** A local directory (file:// or a MediaStore DATA path). */
+internal class LocalSidecarDir(
+    private val audio: File,
+    private val title: String,
+    private val artist: String,
+) : SidecarDir {
+    override val audioName: String = audio.name
+
+    override suspend fun list(): List<String> = withContext(Dispatchers.IO) {
+        val dir = audio.parentFile ?: return@withContext emptyList()
+        runCatching { dir.list()?.toList() }.getOrNull()
+            ?: SidecarLyrics.probeCandidates(audioName, title, artist).filter { File(dir, it).isFile }
     }
 
-    private fun replaceExtension(path: String, newExt: String): String {
-        val slash = path.lastIndexOf('/')
-        val dot = path.lastIndexOf('.')
-        return if (dot > slash) path.substring(0, dot) + newExt else "$path$newExt"
+    override suspend fun read(name: String): ByteArray? = withContext(Dispatchers.IO) {
+        val f = File(audio.parentFile ?: return@withContext null, name)
+        if (!f.isFile || !f.canRead() || f.length() > SidecarDir.MAX_SIDECAR_BYTES) null
+        else runCatching { f.readBytes() }.getOrNull()
     }
 }

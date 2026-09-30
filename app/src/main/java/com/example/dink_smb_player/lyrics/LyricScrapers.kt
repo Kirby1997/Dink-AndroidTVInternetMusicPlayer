@@ -29,7 +29,8 @@ object LyricsifyLyrics : OnlineLyricProvider {
     override val id = "lyricsify"
     override val label = "Lyricsify"
     override val defaultEnabled = true
-    override fun fetch(song: Song): OnlineLyrics {
+    override val syncedCapable = true
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val url = "https://www.lyricsify.com/lyrics/${LyricHtml.slugDash(song.artist)}/${LyricHtml.slugDash(song.title)}"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()
@@ -45,7 +46,8 @@ object LetrasLyrics : OnlineLyricProvider {
     override val id = "letras"
     override val label = "Letras"
     override val defaultEnabled = false
-    override fun fetch(song: Song): OnlineLyrics {
+    override val syncedCapable = true
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val url = "https://www.letras.com/${LyricHtml.slugDash(song.artist)}/${LyricHtml.slugDash(song.title)}/"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()
@@ -61,21 +63,23 @@ object DarkLyrics : OnlineLyricProvider {
     override val id = "darklyrics"
     override val label = "DarkLyrics"
     override val defaultEnabled = true
-    override fun fetch(song: Song): OnlineLyrics {
+    override suspend fun fetch(song: Song): OnlineLyrics {
         val album = song.albumTitle?.takeIf { it.isNotBlank() } ?: return OnlineLyrics()
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
-        val url = "http://www.darklyrics.com/lyrics/${LyricHtml.slugAlnum(song.artist)}/${LyricHtml.slugAlnum(album)}.html"
+        val url = "https://www.darklyrics.com/lyrics/${LyricHtml.slugAlnum(song.artist)}/${LyricHtml.slugAlnum(album)}.html"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()
         val body = LyricHtml.between(html, "class=\"lyrics\"", "<div class=\"thanks\"") ?: html
         // Each track section starts at <h3>...Title...</h3>; pick the one matching our
         // title and take the text up to the next <h3>.
-        val wantedSlug = LyricHtml.slugAlnum(song.title)
+        // Headings read "1. Title"; compare the title part by normalised EQUALITY — a
+        // contains-match let "Alone" win for a track titled "One" (LYR-5).
         val sections = body.split(Regex("(?i)<h3"))
         for (sec in sections) {
             val headEnd = sec.indexOf("</h3>", ignoreCase = true)
             if (headEnd < 0) continue
-            val heading = LyricHtml.htmlToText(sec.substring(0, headEnd))
-            if (LyricHtml.slugAlnum(heading).contains(wantedSlug) && wantedSlug.isNotBlank()) {
+            val heading = LyricHtml.htmlToText(sec.substring(sec.indexOf('>') + 1, headEnd))
+                .replace(DARK_TRACK_NO, "")
+            if (LyricMatch.titleMatches(song.title, heading)) {
                 val text = LyricHtml.htmlToText(sec.substring(headEnd + 5))
                 if (text.isNotBlank()) return OnlineLyrics(plain = plainToLines(text))
             }
@@ -83,6 +87,8 @@ object DarkLyrics : OnlineLyricProvider {
         return OnlineLyrics()
     }
 }
+
+private val DARK_TRACK_NO = Regex("""^\s*\d+\s*\.\s*""")
 
 /** Metal Archives — plain, metal. AJAX search → release id → lyrics fragment. */
 object MetalArchivesLyrics : OnlineLyricProvider {
@@ -94,16 +100,26 @@ object MetalArchivesLyrics : OnlineLyricProvider {
         "X-Requested-With" to "XMLHttpRequest",
         "Referer" to "https://www.metal-archives.com/",
     )
-    override fun fetch(song: Song): OnlineLyrics {
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val album = song.albumTitle.orEmpty()
         val searchUrl = "https://www.metal-archives.com/search/ajax-advanced/searching/songs" +
             "?bandName=${enc(song.artist)}&releaseTitle=${enc(album)}&songTitle=${enc(song.title)}"
         val searchBody = LyricHttp.get(searchUrl, headers) ?: return OnlineLyrics()
+        // Rows: [band, album, type, title, lyrics link]. Scan the top hits for one whose
+        // title/band actually match rather than trusting row 0 (LYR-5).
         val id = runCatching {
             val rows = JSONObject(searchBody).optJSONArray("aaData") ?: return OnlineLyrics()
-            if (rows.length() == 0) return OnlineLyrics()
-            val linkHtml = rows.getJSONArray(0).optString(4)
+            val candidates = (0 until minOf(rows.length(), LyricMatch.TOP_N)).map { i ->
+                val row = rows.getJSONArray(i)
+                LyricMatch.Candidate(
+                    title = LyricHtml.htmlToText(row.optString(3)),
+                    artist = LyricHtml.htmlToText(row.optString(0)),
+                    durationSec = null,
+                    payload = row.optString(4),
+                )
+            }
+            val linkHtml = LyricMatch.pick(song, candidates)?.payload ?: return OnlineLyrics()
             Regex("lyricsLink_(\\d+)").find(linkHtml)?.groupValues?.get(1)
         }.getOrNull() ?: return OnlineLyrics()
         val lyricsHtml = LyricHttp.get("https://www.metal-archives.com/release/ajax-view-lyrics/id/$id", headers)
@@ -119,7 +135,7 @@ object AZLyrics : OnlineLyricProvider {
     override val id = "azlyrics"
     override val label = "AZLyrics"
     override val defaultEnabled = false
-    override fun fetch(song: Song): OnlineLyrics {
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val url = "https://www.azlyrics.com/lyrics/${LyricHtml.slugAlnum(song.artist)}/${LyricHtml.slugAlnum(song.title)}.html"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()
@@ -135,7 +151,7 @@ object SongLyrics : OnlineLyricProvider {
     override val id = "songlyrics"
     override val label = "SongLyrics"
     override val defaultEnabled = false
-    override fun fetch(song: Song): OnlineLyrics {
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val url = "https://www.songlyrics.com/${LyricHtml.slugSongLyrics(song.artist)}/${LyricHtml.slugSongLyrics(song.title)}-lyrics/"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()
@@ -152,7 +168,7 @@ object BandcampLyrics : OnlineLyricProvider {
     override val id = "bandcamp"
     override val label = "Bandcamp"
     override val defaultEnabled = false
-    override fun fetch(song: Song): OnlineLyrics {
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val url = "https://${LyricHtml.slugAlnum(song.artist)}.bandcamp.com/track/${LyricHtml.slugDash(song.title)}"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()
@@ -168,7 +184,7 @@ object LyricFindLyrics : OnlineLyricProvider {
     override val id = "lyricfind"
     override val label = "LyricFind"
     override val defaultEnabled = false
-    override fun fetch(song: Song): OnlineLyrics {
+    override suspend fun fetch(song: Song): OnlineLyrics {
         if (song.title.isBlank() || song.artist.isBlank()) return OnlineLyrics()
         val url = "https://lyrics.lyricfind.com/lyrics/${LyricHtml.slugDash(song.artist)}-${LyricHtml.slugDash(song.title)}"
         val html = LyricHttp.get(url, mapOf("User-Agent" to BROWSER_UA)) ?: return OnlineLyrics()

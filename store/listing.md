@@ -24,8 +24,9 @@ BUILT FOR THE REMOTE
 • Now-playing screen with cover art.
 
 LYRICS
-• Synced (karaoke-style) and plain lyrics, from embedded tags, .lrc sidecar files, or a
-  range of online lyric providers. Turn individual sources on or off in Settings.
+• Synced (karaoke-style) and plain lyrics from embedded tags and .lrc sidecar files.
+  Optional online lyric lookups (off until you switch them on), with each provider
+  toggleable in Settings.
 
 SOUND
 • Built-in equalizer with presets plus a full graphic EQ.

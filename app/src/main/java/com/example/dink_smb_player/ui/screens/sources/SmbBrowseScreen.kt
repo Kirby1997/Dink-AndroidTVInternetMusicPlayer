@@ -28,7 +28,9 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -46,15 +48,20 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.example.dink_smb_player.ui.components.LocalToast
 import com.example.dink_smb_player.LocalContentFocus
+import com.example.dink_smb_player.LocalDrawerOpen
+import com.example.dink_smb_player.data.source.SourceLocks
 import com.example.dink_smb_player.LocalRailFocusRequester
 import com.example.dink_smb_player.data.SharesLibrary
+import com.example.dink_smb_player.data.model.SmbShare
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.data.prefs.EncryptedShareStore
 import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.smb.SmbBrowser
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.player.PlayerState
+import com.example.dink_smb_player.ui.components.ConfirmDialog
 import com.example.dink_smb_player.ui.components.GhostButton
 import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
@@ -81,10 +88,29 @@ fun SmbBrowseScreen(
     val railRequester = LocalRailFocusRequester.current
     val contentFocus = LocalContentFocus.current
     val context = LocalContext.current
+    val toast = LocalToast.current
     val sharePrefs = remember(context) { SharePrefs(context.applicationContext) }
     val shares by sharePrefs.shares.collectAsState(initial = emptyList())
     val activeId = SharesLibrary.activeBrowseShareId
-    val share = remember(activeId, shares) { shares.firstOrNull { it.id == activeId } }
+    val storedShare = remember(activeId, shares) { shares.firstOrNull { it.id == activeId } }
+    // While a delete is in flight the share leaves SharePrefs a moment before we navigate
+    // away; keep rendering the last copy so the screen doesn't flash "No share selected"
+    // (and drop focus to the rail) in that gap.
+    var lastShare by remember { mutableStateOf<SmbShare?>(null) }
+    SideEffect { if (storedShare != null) lastShare = storedShare }
+    val deleting = activeId != null && SharesLibrary.deletingShares[activeId] == true
+    val share = storedShare ?: lastShare?.takeIf { deleting && it.id == activeId }
+
+    // Pending destructive action awaiting the user's confirm (null = no dialog).
+    var confirm by remember { mutableStateOf<PendingConfirm?>(null) }
+
+    // False once this screen leaves composition. A delete's onDone can land long after the
+    // user moved on (a dead NAS); it must not then navigate (commitNav steals focus).
+    val screenAlive = remember { java.util.concurrent.atomic.AtomicBoolean(true) }
+    DisposableEffect(Unit) {
+        screenAlive.set(true)
+        onDispose { screenAlive.set(false) }
+    }
 
     // Current folder path (backslash, relative to share root; "" = root) + the
     // listing for it. Loaded off the main thread; reload key includes path.
@@ -103,6 +129,14 @@ fun SmbBrowseScreen(
 
     LaunchedEffect(share?.id, path) {
         val s = share ?: return@LaunchedEffect
+        // Drop the previous folder's rows up front: left in place they stayed clickable
+        // under the new crumb while loading, and under "Error" if the listing failed.
+        // Park focus on the header first so removing a focused row can't strand it on
+        // the rail; the settle effect below moves it to the new first row.
+        if (entries.isNotEmpty()) {
+            runCatching { contentFocus.requestFocus() }
+            entries = emptyList()
+        }
         loading = true
         error = null
         val result = withContext(Dispatchers.IO) {
@@ -111,7 +145,10 @@ fun SmbBrowseScreen(
         }
         result
             .onSuccess { entries = it }
-            .onFailure { error = it.message ?: it::class.simpleName }
+            .onFailure {
+                entries = emptyList()
+                error = it.message ?: it::class.simpleName
+            }
         loading = false
     }
 
@@ -131,18 +168,35 @@ fun SmbBrowseScreen(
     // Report the real (recursive) import result when an import finishes, since the
     // folder header only shows this folder's direct contents.
     var wasImporting by remember(share?.id) { mutableStateOf(false) }
+    // Folder the user started importing from this screen (null = unknown: started elsewhere
+    // or before this visit), and whether a Remove-from-library has cancelled that import.
+    // A cancelled import also clears the importing flag; reporting it as "Imported N" (a
+    // stale N) or as a failure was wrong — the Remove's own toast says what happened.
+    var importingPath by remember(share?.id) { mutableStateOf<String?>(null) }
+    var cancelledByRemove by remember(share?.id) { mutableStateOf(false) }
     LaunchedEffect(importing) {
         if (wasImporting && !importing) {
             val id = share?.id
-            val err = id?.let { SharesLibrary.errorsByShare[it] }
-            if (err != null) onToast("Import failed: $err")
-            else onToast("Imported ${id?.let { SharesLibrary.lastImportedCount[it] } ?: 0} tracks (incl. subfolders)")
+            when (val t = importEndToast(
+                cancelledByRemove = cancelledByRemove,
+                error = id?.let { SharesLibrary.errorsByShare[it] },
+                count = id?.let { SharesLibrary.lastImportedCount[it] },
+                // A share delete cancels its import too; the delete reports itself.
+                deleting = id?.let { SharesLibrary.deletingShares[it] == true } ?: false,
+            )) {
+                is ImportEndToast.Failed -> toast.error("Import failed: ${t.error}")
+                is ImportEndToast.Done -> onToast("Imported ${t.count} tracks (incl. subfolders)")
+                null -> Unit
+            }
+            cancelledByRemove = false
+            importingPath = null
         }
         wasImporting = importing
     }
 
     // Back: climb out of the folder tree one level, then return to the share list.
-    BackHandler(enabled = true) {
+    // Not while the drawer is open: Back there is the app's exit dialog (UI-22).
+    BackHandler(enabled = !LocalDrawerOpen.current.value) {
         if (path.isNotEmpty()) path = path.substringBeforeLast('\\', "")
         else onNavigate(ScreenId.SmbShares)
     }
@@ -168,6 +222,7 @@ fun SmbBrowseScreen(
             Text(crumb, style = type.sectionTitle.copy(color = palette.ink0), maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 text = when {
+                    deleting -> "Deleting share…"
                     loading -> "Loading…"
                     importing -> SharesLibrary.importProgress[share.id]
                         ?.let { "Importing into library… ${"%,d".format(it.found)} found (${"%.1f".format(it.ratePerSec)}/s)" }
@@ -183,6 +238,16 @@ fun SmbBrowseScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // Share-level status, e.g. a monitored folder that's gone from the NAS.
+            val shareError = SharesLibrary.errorsByShare[share.id]
+            if (shareError != null && !deleting && !importing) {
+                Text(
+                    text = shareError,
+                    style = type.bodySmall.copy(color = palette.warn),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
 
         // Row 1 — navigation + folder actions.
@@ -208,6 +273,7 @@ fun SmbBrowseScreen(
                 label = if (path in share.importPaths) "Re-import (+ subfolders)" else "Import (+ subfolders)",
                 leadingIcon = Icons.Filled.Add,
                 onClick = {
+                    importingPath = path
                     SharesLibrary.importFolder(context, share, path)
                     val name = if (path.isEmpty()) "${share.name} (whole share)" else path.replace('\\', '/')
                     onToast("Importing $name and everything below it…")
@@ -245,21 +311,14 @@ fun SmbBrowseScreen(
                 GhostButton(
                     label = "Remove from library",
                     leadingIcon = Icons.Filled.Delete,
-                    onClick = {
-                        SharesLibrary.removeImportedFolder(context, share, path)
-                        onToast("Removed $folderLabel from library")
-                    },
+                    onClick = { if (!deleting) confirm = PendingConfirm.RemoveFolder(path, folderLabel) },
                     height = 44.dp,
                 )
             }
             GhostButton(
                 label = "Delete share",
                 leadingIcon = Icons.Filled.Delete,
-                onClick = {
-                    SharesLibrary.deleteShare(context, share.id)
-                    onToast("${share.name} removed")
-                    onNavigate(ScreenId.SmbShares)
-                },
+                onClick = { if (!deleting) confirm = PendingConfirm.DeleteShare },
                 height = 44.dp,
             )
         }
@@ -317,6 +376,94 @@ fun SmbBrowseScreen(
             }
         }
     }
+
+    when (val pending = confirm) {
+        null -> Unit
+        is PendingConfirm.RemoveFolder -> ConfirmDialog(
+            eyebrow = "REMOVE FROM LIBRARY",
+            title = "Remove ${pending.label} from your library?",
+            body = "Its tracks leave your library and it stops being monitored. " +
+                "Nothing is deleted from ${share.name}; you can import it again any time.",
+            cancelLabel = "Cancel",
+            confirmLabel = "Remove",
+            onCancel = { confirm = null },
+            onConfirm = {
+                confirm = null
+                // The button goes away with the folder's import flag — park focus on the
+                // header first so it can't fall back to the rail.
+                runCatching { contentFocus.requestFocus() }
+                if (removeCancelsImport(importing, importingPath, pending.smbPath)) cancelledByRemove = true
+                SharesLibrary.removeImportedFolder(context, share, pending.smbPath) { err ->
+                    if (err == null) onToast("Removed ${pending.label} from library")
+                    else toast.error("Couldn't remove ${pending.label}: ${err.message ?: err::class.simpleName}")
+                }
+            },
+        )
+        PendingConfirm.DeleteShare -> ConfirmDialog(
+            eyebrow = "DELETE SHARE",
+            title = "Delete ${share.name}?",
+            body = "Its ${share.trackCount} tracks leave your library and the saved login is erased. " +
+                "Files on the NAS are not touched.",
+            cancelLabel = "Cancel",
+            confirmLabel = "Delete",
+            onCancel = { confirm = null },
+            onConfirm = {
+                confirm = null
+                val name = share.name
+                val deletedId = share.id
+                // The delete cancels an import in flight: don't report that as "Imported N"
+                // or "Import failed" — the delete's own toast says what happened.
+                if (importing) cancelledByRemove = true
+                // Toast + leave only once the delete has actually finished — and leave only if
+                // this screen is still up, showing that share.
+                SharesLibrary.deleteShare(context, deletedId) { err ->
+                    if (err == null) {
+                        onToast("$name removed")
+                        if (leaveAfterDelete(screenAlive.get(), SharesLibrary.activeBrowseShareId, deletedId)) {
+                            onNavigate(ScreenId.SmbShares)
+                        }
+                    } else {
+                        toast.error("Couldn't delete $name: ${err.message ?: err::class.simpleName}")
+                    }
+                }
+            },
+        )
+    }
+}
+
+/** What to report when an import stops. Null = say nothing (a Remove or a share delete
+ *  cancelled it). */
+internal sealed interface ImportEndToast {
+    data class Done(val count: Int) : ImportEndToast
+    data class Failed(val error: String) : ImportEndToast
+}
+
+internal fun importEndToast(
+    cancelledByRemove: Boolean,
+    error: String?,
+    count: Int?,
+    deleting: Boolean = false,
+): ImportEndToast? = when {
+    cancelledByRemove || deleting -> null
+    error != null -> ImportEndToast.Failed(error)
+    else -> ImportEndToast.Done(count ?: 0)
+}
+
+/** Whether removing [removedPath] cancels the running import: SharesLibrary cancels
+ *  imports of overlapping folders. Unknown import folder → assume it does. */
+internal fun removeCancelsImport(importing: Boolean, importingPath: String?, removedPath: String): Boolean =
+    importing && (importingPath == null || SourceLocks.pathsOverlap(importingPath, removedPath))
+
+/** Whether a finished share delete should navigate back to the share list: only while this
+ *  browse screen is still composed ([screenAlive]) AND showing the deleted share. The delete
+ *  nulls [browsedShareId] when it was the deleted one; another id means the user moved on. */
+internal fun leaveAfterDelete(screenAlive: Boolean, browsedShareId: String?, deletedId: String): Boolean =
+    screenAlive && (browsedShareId == null || browsedShareId == deletedId)
+
+/** A destructive browse-screen action waiting on [ConfirmDialog]. */
+private sealed interface PendingConfirm {
+    data class RemoveFolder(val smbPath: String, val label: String) : PendingConfirm
+    data object DeleteShare : PendingConfirm
 }
 
 @Composable

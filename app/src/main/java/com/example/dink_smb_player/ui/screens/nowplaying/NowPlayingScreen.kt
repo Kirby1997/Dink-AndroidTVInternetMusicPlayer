@@ -37,6 +37,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.GraphicEq
+import androidx.compose.material.icons.outlined.MusicNote
 import androidx.compose.material.icons.outlined.Repeat
 import androidx.compose.material.icons.outlined.RepeatOne
 import androidx.compose.material.icons.outlined.Shuffle
@@ -44,6 +45,7 @@ import androidx.compose.material.icons.outlined.SkipNext
 import androidx.compose.material.icons.outlined.SkipPrevious
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -77,12 +79,14 @@ import com.example.dink_smb_player.data.model.AlbumArtShape
 import com.example.dink_smb_player.data.model.ArtPalette
 import com.example.dink_smb_player.data.model.LyricLine
 import com.example.dink_smb_player.data.model.Song
+import com.example.dink_smb_player.lyrics.LyricsStatus
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.player.RepeatMode as PlayerRepeatMode
 import com.example.dink_smb_player.ui.screens.settings.SettingsNav
 import com.example.dink_smb_player.ui.components.AlbumArt
 import com.example.dink_smb_player.ui.components.CoverArt
+import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 
@@ -110,7 +114,7 @@ private val V5CardLine = Color(0x0DFFFFFF)
 fun NowPlayingScreen(player: PlayerState, onNavigate: (ScreenId) -> Unit = {}) {
     val song = player.currentSong
     if (song == null) {
-        EmptyState()
+        EmptyState(onNavigate)
         return
     }
     val album = player.currentAlbum ?: remember(song.id) { fallbackAlbumFor(song) }
@@ -199,6 +203,9 @@ private fun V5Layout(
     lyricsFocus: FocusRequester,
     onOpenEq: () -> Unit,
 ) {
+    // currentLyricIndex reads timeSec; reading it directly here would recompose all three
+    // columns on every 250 ms tick. derivedStateOf only invalidates when the line changes.
+    val currentLyricIndex by remember(player) { derivedStateOf { player.currentLyricIndex } }
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val w = maxWidth
         // Spec is 520dp/flex/460dp at 1920×1080. Below that, all three columns
@@ -220,7 +227,8 @@ private fun V5Layout(
             )
             V5LyricsColumn(
                 lyrics = player.lyrics,
-                currentIndex = player.currentLyricIndex,
+                status = player.lyricsStatus,
+                currentIndex = currentLyricIndex,
                 modifier = Modifier.weight(if (useFixed) 1f else 0.42f).fillMaxHeight(),
             )
             V5QueueColumn(
@@ -490,11 +498,21 @@ private fun V5PlayButton(isPlaying: Boolean, onClick: () -> Unit, modifier: Modi
 @Composable
 private fun V5LyricsColumn(
     lyrics: List<LyricLine>,
+    status: LyricsStatus,
     currentIndex: Int,
     modifier: Modifier = Modifier,
 ) {
     val type = LocalDinkType.current
-    val visible = remember(lyrics, currentIndex) { computeVisibleLyrics(lyrics, currentIndex) }
+    // Untimed lyrics (plain text with an unknown duration, or the instrumental marker) have
+    // every line at t=0, so the time-based index lands on the LAST line. Show them from
+    // the top with no highlight and no line counter instead (LYR-13).
+    val timed = remember(lyrics) { lyrics.any { it.timeSec > 0f } }
+    val shownIndex = if (timed) currentIndex else 0
+    val visible = remember(lyrics, shownIndex, timed) {
+        computeVisibleLyrics(lyrics, shownIndex).let { v ->
+            if (timed) v else v.map { if (it.state == V5LineState.Current) it.copy(state = V5LineState.Next) else it }
+        }
+    }
     val nonBlankTotal = remember(lyrics) { lyrics.count { it.text.isNotBlank() } }
     // Ordinal of the current line among ALL non-blank lines — not its slot in the
     // 6-line visible window (that slot is constant, which froze the counter at 3).
@@ -518,7 +536,7 @@ private fun V5LyricsColumn(
                     maxLines = 1,
                 )
                 // No counter when there are no lyrics — "1 / 0" reads as a glitch.
-                if (nonBlankTotal > 0) {
+                if (nonBlankTotal > 0 && timed) {
                     Text(
                         text = "LINE $nonBlankCurrentIdx / $nonBlankTotal",
                         style = type.monoSmall.copy(color = V5White40, fontSize = 10.sp, letterSpacing = 0.08.em),
@@ -530,7 +548,7 @@ private fun V5LyricsColumn(
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 if (visible.isEmpty()) {
                     Text(
-                        text = if (lyrics.isEmpty()) "No lyrics available for this track" else "Lyrics loading…",
+                        text = if (status == LyricsStatus.Loading) "Lyrics loading…" else "No lyrics available for this track",
                         style = type.body.copy(color = V5White40),
                     )
                 } else {
@@ -632,12 +650,19 @@ private fun computeVisibleLyrics(lyrics: List<LyricLine>, currentIdx: Int): List
 @Composable
 private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifier: Modifier = Modifier) {
     val type = LocalDinkType.current
-    val queue = player.queue
     val currentIdx = player.currentIndex
     // The queue view purges already-played tracks: show the current track at the top,
     // then everything still to come. (The underlying queue is untouched so prev() works.)
     val start = currentIdx.coerceAtLeast(0)
-    val upcoming = if (currentIdx in queue.indices) queue.drop(start) else queue
+    // Recomputed only when the queue contents or current index change, not on every
+    // recomposition (e.g. play/pause), so a long queue isn't re-copied each time.
+    val upcoming by remember(player) {
+        derivedStateOf {
+            val q = player.queue
+            val ci = player.currentIndex
+            if (ci in q.indices) q.drop(ci.coerceAtLeast(0)) else q.toList()
+        }
+    }
 
     // Selecting an upcoming track makes it the CURRENT track, which re-derives
     // `upcoming` (drop(start)) — the focused row's position vanishes or now shows a
@@ -707,7 +732,8 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                     modifier = Modifier.fillMaxSize(),
                 ) {
-                    items(upcoming.size) { i ->
+                    // Stable per-queue-slot keys so rows (and focus) survive list changes.
+                    items(upcoming.size, key = { start + it }) { i ->
                         val actualIdx = start + i
                         val song = upcoming[i]
                         val album = player.albumFor(song) ?: fallbackAlbumFor(song)
@@ -900,8 +926,9 @@ private fun Modifier.v5Background(): Modifier = this
     )
 
 @Composable
-private fun EmptyState() {
+private fun EmptyState(onNavigate: (ScreenId) -> Unit) {
     val type = LocalDinkType.current
+    val railRequester = LocalRailFocusRequester.current
     Box(
         modifier = Modifier.fillMaxSize().v5Background(),
         contentAlignment = Alignment.Center,
@@ -909,6 +936,18 @@ private fun EmptyState() {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("NOTHING PLAYING", style = type.monoSmall.copy(color = V5White40, fontSize = 11.sp))
             Text("Pick a song from Home", style = type.cardTitle.copy(color = V5White80))
+            Spacer(Modifier.height(16.dp))
+            // A focus target: with nothing focusable a drawer commit had nowhere to land,
+            // so the drawer stayed open over an empty screen (UI-19). Also the way forward.
+            GradientButton(
+                label = "Browse songs",
+                leadingIcon = Icons.Outlined.MusicNote,
+                onClick = { onNavigate(ScreenId.Songs) },
+                height = 48.dp,
+                modifier = Modifier
+                    .focusRequester(LocalContentFocus.current)
+                    .focusProperties { left = railRequester },
+            )
         }
     }
 }

@@ -13,7 +13,12 @@ import com.example.dink_smb_player.data.model.WordTiming
  *  - A2-enhanced inline word timings — `<mm:ss.xx>word`.
  *  - Metadata tags (`[ti:`, `[ar:`, `[al:`, `[by:`, `[offset:`, `[length:`, `[re:`, `[ve:`) are skipped.
  *
- * Offset tag (`[offset:+250]`, in milliseconds) is honoured globally.
+ * Offset tag (`[offset:+250]`, in milliseconds) is honoured globally. Per the LRC
+ * convention a positive offset makes lyrics appear *sooner* (`t - offset`).
+ *
+ * Sidecar files arrive in whatever encoding the tagger wrote — read them through
+ * [decode] (BOM / UTF-16 sniffing) rather than `readText()`, and [parse] drops any
+ * stray U+FEFF so the first timestamp still matches.
  */
 object LrcParser {
 
@@ -22,16 +27,45 @@ object LrcParser {
     private val META_TAG = Regex("""^\[(ti|ar|al|by|offset|length|re|ve|au|id):.*]$""", RegexOption.IGNORE_CASE)
     private val OFFSET_TAG = Regex("""^\[offset:\s*([+-]?\d+)\s*]$""", RegexOption.IGNORE_CASE)
 
+    private const val BOM = '\uFEFF'
+
+    /**
+     * Decode raw lyric-file bytes. Honours a UTF-8 / UTF-16 BOM, sniffs BOM-less
+     * UTF-16 (ASCII-heavy LRC leaves every other byte zero), else UTF-8.
+     */
+    fun decode(bytes: ByteArray): String {
+        fun b(i: Int) = bytes[i].toInt() and 0xFF
+        if (bytes.size >= 3 && b(0) == 0xEF && b(1) == 0xBB && b(2) == 0xBF) {
+            return String(bytes, 3, bytes.size - 3, Charsets.UTF_8)
+        }
+        if (bytes.size >= 2 && b(0) == 0xFF && b(1) == 0xFE) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16LE)
+        }
+        if (bytes.size >= 2 && b(0) == 0xFE && b(1) == 0xFF) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16BE)
+        }
+        val n = minOf(bytes.size, 256) and 1.inv()
+        if (n >= 4) {
+            var evenZeros = 0
+            var oddZeros = 0
+            for (i in 0 until n) if (bytes[i].toInt() == 0) { if (i % 2 == 0) evenZeros++ else oddZeros++ }
+            val half = n / 2
+            if (oddZeros * 10 >= half * 7 && evenZeros * 10 < half) return String(bytes, Charsets.UTF_16LE).trimStart(BOM)
+            if (evenZeros * 10 >= half * 7 && oddZeros * 10 < half) return String(bytes, Charsets.UTF_16BE).trimStart(BOM)
+        }
+        return String(bytes, Charsets.UTF_8).trimStart(BOM)
+    }
+
     fun parse(text: String): List<LyricLine> {
         val out = mutableListOf<LyricLine>()
         var offsetSec = 0f
 
         text.lineSequence().forEach { raw ->
-            val line = raw.trim()
+            val line = raw.trim().trimStart(BOM).trim()
             if (line.isEmpty()) return@forEach
 
             OFFSET_TAG.matchEntire(line)?.let {
-                offsetSec = it.groupValues[1].toInt() / 1000f
+                offsetSec = (it.groupValues[1].toIntOrNull() ?: 0) / 1000f
                 return@forEach
             }
             if (META_TAG.matchEntire(line) != null) return@forEach
@@ -58,7 +92,7 @@ object LrcParser {
         }
 
         val shifted = if (offsetSec != 0f) {
-            out.map { it.copy(timeSec = (it.timeSec + offsetSec).coerceAtLeast(0f)) }
+            out.map { it.copy(timeSec = (it.timeSec - offsetSec).coerceAtLeast(0f)) }
         } else {
             out
         }

@@ -22,12 +22,17 @@
 
 # ---- smbj (SMB client) ----
 # smbj resolves SMB dialects / providers reflectively and rides on the mbassador event
-# bus (also reflection) + Bouncy Castle for crypto / ASN.1. Keep them whole.
+# bus (also reflection). Keep them whole.
 -keep class com.hierynomus.** { *; }
 -keep class net.engio.mbassy.** { *; }
--keep class org.bouncycastle.** { *; }
 -dontwarn com.hierynomus.**
 -dontwarn net.engio.mbassy.**
+# Bouncy Castle: no keep. smbj's BCSecurityProvider (the default on Android) only
+# `new`s lightweight-API classes (MD4/MD5/SHA-256/512 digests, HMac, CMac, AES/DES/RC4
+# engines, CCM/GCM modes, KDFCounterBytesGenerator, *Parameters) and neither it nor
+# those classes use reflection or the JCA provider, so R8 traces everything it needs
+# from the kept com.hierynomus.** code. The rest of bcprov (JCA provider, PQC, X.509,
+# ASN.1) is unreachable and shrunk away. NTLM's ASN.1/SPNEGO is com.hierynomus.asn1.
 -dontwarn org.bouncycastle.**
 
 # ---- slf4j (smbj transitive; no-op binding at runtime) ----
@@ -38,10 +43,10 @@
 -dontwarn org.jaudiotagger.**
 
 # ---- Media3 / ExoPlayer ----
-# Media3 ships consumer rules, but the extractor classes are instantiated reflectively
-# by DefaultExtractorsFactory — keep them so audio still plays in a shrunk build.
--keep class androidx.media3.** { *; }
--dontwarn androidx.media3.**
+# No rules needed: the core extractors/renderers are constructed directly, and the only
+# reflective lookups (optional FLAC/Opus/MIDI/FFmpeg extension classes, which we don't
+# ship) are covered by the consumer rules bundled in each media3 AAR. PlayerService and
+# MediaButtonReceiver are kept via the manifest.
 
 # ---- WorkManager + Room (MonitorWorker / LocalSyncWorker) ----
 # WorkManager is bootstrapped by androidx.startup and backed by a Room database

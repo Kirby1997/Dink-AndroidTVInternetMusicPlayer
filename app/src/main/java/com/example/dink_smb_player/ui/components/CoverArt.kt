@@ -57,7 +57,9 @@ fun CoverArt(
 fun rememberCoverBitmap(song: Song?): ImageBitmap? {
     val context = LocalContext.current
     // Only remote/playable tracks can be probed; mock songs (no uri) stay procedural.
-    val key = remember(song?.id, song?.albumTitle, song?.artist) { song?.let { AlbumArtCache.keyFor(it) } }
+    val key = remember(song?.id, song?.albumKey, song?.artistKey, song?.albumTitle, song?.artist) {
+        song?.let { AlbumArtCache.keyFor(it) }
+    }
     val uri = song?.mediaUri
     var bitmap by remember(key) { mutableStateOf(key?.let { AlbumArtCache.peek(it)?.asImageBitmap() }) }
     LaunchedEffect(key, uri) {

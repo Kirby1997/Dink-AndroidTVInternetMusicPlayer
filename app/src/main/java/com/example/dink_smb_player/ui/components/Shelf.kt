@@ -78,7 +78,11 @@ fun ShelfRow(
                 .focusGroup()
                 .let { base ->
                     if (onEnterRequester != null) {
-                        base.focusProperties { enter = { onEnterRequester } }
+                        // Only while the first card is composed: scrolled away, it's disposed
+                        // and routing to its requester throws (UI-1). Spatial default then.
+                        base.focusProperties {
+                            enter = { shelfFirstCardTarget(state.firstVisibleItemIndex, onEnterRequester) }
+                        }
                     } else base
                 },
             content = content,
@@ -86,6 +90,16 @@ fun ShelfRow(
         Spacer(Modifier.height(28.dp))
     }
 }
+
+/**
+ * Focus destination for "go to this shelf's first card". The card's [FocusRequester] is
+ * only attached while LazyRow item 0 is composed; once the row scrolls past it the item is
+ * disposed and routing focus there throws "FocusRequester is not initialized". So route to
+ * it only while it's the first visible item, else fall back to spatial search
+ * ([FocusRequester.Default]), which lands on the nearest visible card of that shelf.
+ */
+fun shelfFirstCardTarget(firstVisibleItemIndex: Int, firstCard: FocusRequester): FocusRequester =
+    if (firstVisibleItemIndex == 0) firstCard else FocusRequester.Default
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable

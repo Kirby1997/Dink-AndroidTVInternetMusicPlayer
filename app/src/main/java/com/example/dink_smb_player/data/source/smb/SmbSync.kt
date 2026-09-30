@@ -4,17 +4,13 @@ import com.example.dink_smb_player.data.index.SourceType
 import com.example.dink_smb_player.data.library.trackIdFor
 import com.example.dink_smb_player.data.model.SmbShare
 import com.example.dink_smb_player.data.model.Song
-import com.example.dink_smb_player.data.prefs.SmbCreds
-import com.hierynomus.msfscc.FileAttributes
-import com.hierynomus.msfscc.fileinformation.FileIdBothDirectoryInformation
-import com.hierynomus.smbj.share.DiskShare
 import java.net.URLEncoder
 
 /**
- * Walks an [SmbShare] and produces a [Song] list pointing at smb:// URIs that
- * [SmbDataSource] can later read for playback. No tag parsing in Phase 7 —
- * filename → title, parent dir → album, grandparent dir → artist. The
- * jaudiotagger-over-smbj pass lands in Phase 8.5 alongside the lyrics chain.
+ * SMB path helpers shared by the importer ([SmbImporter]) and the folder browser
+ * ([SmbBrowser]): the audio-extension filter, the playable smb:// URI, and a
+ * filename-derived [Song] for browse-and-play before a file is indexed. (The old
+ * whole-share walk that lived here was replaced by [SmbImporter.enumerate].)
  *
  * mediaUri shape: `smb://host:port/share/dir/sub/file.mp3` (path components are
  * URL-encoded so spaces / unicode survive Media3's URI parsing).
@@ -22,43 +18,6 @@ import java.net.URLEncoder
 object SmbSync {
 
     private val AUDIO_EXT = setOf("mp3", "flac", "ogg", "oga", "opus", "m4a", "wav", "aac", "wma")
-    private const val MAX_DEPTH = 8
-    private const val MAX_FILES = 50_000
-
-    fun enumerate(share: SmbShare, creds: SmbCreds?): Result<List<Song>> = runCatching {
-        val disk = SmbClient.share(share.id, share.host, share.port, share.shareName, creds)
-        val out = mutableListOf<Song>()
-        walk(disk, share, "", 0, out)
-        out
-    }
-
-    private fun walk(
-        disk: DiskShare,
-        share: SmbShare,
-        smbPath: String,
-        depth: Int,
-        out: MutableList<Song>,
-    ) {
-        if (depth > MAX_DEPTH || out.size >= MAX_FILES) return
-        val entries: List<FileIdBothDirectoryInformation> = try {
-            disk.list(smbPath)
-        } catch (e: Throwable) {
-            // Permission-denied / not-listable folders — skip rather than blow up the whole sync.
-            return
-        }
-        for (entry in entries) {
-            val name = entry.fileName
-            if (name == "." || name == "..") continue
-            val isDir = (entry.fileAttributes and FileAttributes.FILE_ATTRIBUTE_DIRECTORY.value) != 0L
-            val childSmbPath = if (smbPath.isEmpty()) name else "$smbPath\\$name"
-            if (isDir) {
-                walk(disk, share, childSmbPath, depth + 1, out)
-            } else if (isAudio(name)) {
-                out += songFor(share, childSmbPath)
-                if (out.size >= MAX_FILES) return
-            }
-        }
-    }
 
     internal fun isAudio(name: String): Boolean {
         val dot = name.lastIndexOf('.')

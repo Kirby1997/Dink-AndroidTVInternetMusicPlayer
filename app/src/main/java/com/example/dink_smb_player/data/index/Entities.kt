@@ -33,6 +33,8 @@ data class TrackEntity(
     val uri: String,
     val sizeBytes: Long,
     val addedAtMs: Long,
+    // Play stats. Persisted per row (the on-disk JSON), but live values are in IndexDao.playStats:
+    // rows are loaded stripped of them and IndexDao.persistSnapshot fills them back in (LIB-15).
     val lastPlayedMs: Long? = null,
     val playCount: Int = 0,
     // Grouping keys precomputed at import/retag by LibraryGrouping.computeGroupingKeys, so the
@@ -40,7 +42,8 @@ data class TrackEntity(
     // regex normalization on 25k rows at display time (the section-load lag). Nullable +
     // defaulted so pre-precompute snapshots deserialize; a one-time migration fills them on the
     // next restore. artistKey folds collaborations to their primary artist (library-wide stats),
-    // albumKey folds cosmetic title variants, artistLabel is the clean feat-free display spelling.
+    // albumKey is "<albumArtistKey>|<normalized title>" (LIB-6: album artist + title, compilations
+    // under "variousartists"), artistLabel is the clean feat-free display spelling.
     val artistKey: String? = null,
     val albumKey: String? = null,
     val artistLabel: String? = null,
@@ -49,7 +52,18 @@ data class TrackEntity(
     // equal the filename, or genuinely untagged files) stops being re-checked on every press.
     // null = never attempted. A forced retag ignores it. Defaulted so old snapshots deserialize.
     val retagAttemptedMs: Long? = null,
+    // Which retag logic wrote retagAttemptedMs. Stamps from before the reader distinguished
+    // "no tags" from a transient read error (version 0) may mark files that merely failed to
+    // read, so a normal retag treats them as unstamped once. Bump RETAG_VERSION in
+    // LibraryRepository to re-read the residue after a reader improvement.
+    val retagVersion: Int = 0,
+    // Source file's last-modified time (epoch ms) as last seen by the walk; null = unknown.
+    // Paired with retagAttemptedMs so a file changed in place can be re-tagged (SRC-8).
+    val fileMtimeMs: Long? = null,
 )
+
+/** Live play stats of one track (see IndexDao.playStats). */
+data class PlayStat(val count: Int, val lastPlayedMs: Long?)
 
 @Serializable
 data class SourceEntity(

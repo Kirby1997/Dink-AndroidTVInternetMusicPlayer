@@ -46,7 +46,9 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.example.dink_smb_player.ui.components.LocalToast
 import com.example.dink_smb_player.LocalContentFocus
+import com.example.dink_smb_player.LocalDrawerOpen
 import com.example.dink_smb_player.LocalRailFocusRequester
 import com.example.dink_smb_player.data.CloudLibrary
 import com.example.dink_smb_player.data.model.CloudFolderRef
@@ -81,6 +83,7 @@ fun CloudBrowseScreen(
     val railRequester = LocalRailFocusRequester.current
     val contentFocus = LocalContentFocus.current
     val context = LocalContext.current
+    val toast = LocalToast.current
     val sharePrefs = remember(context) { SharePrefs(context.applicationContext) }
     val providers by sharePrefs.providers.collectAsState(initial = emptyList())
     val activeId = CloudLibrary.activeBrowseProviderId
@@ -127,13 +130,14 @@ fun CloudBrowseScreen(
         if (wasImporting && !importing) {
             val id = provider?.id
             val err = id?.let { CloudLibrary.errorsByProvider[it] }
-            if (err != null) onToast("Import failed: $err")
+            if (err != null) toast.error("Import failed: $err")
             else onToast("Imported ${id?.let { CloudLibrary.lastImportedCount[it] } ?: 0} tracks (incl. subfolders)")
         }
         wasImporting = importing
     }
 
-    BackHandler(enabled = true) {
+    // Not while the drawer is open: Back there is the app's exit dialog (UI-22).
+    BackHandler(enabled = !LocalDrawerOpen.current.value) {
         if (stack.size > 1) stack = stack.dropLast(1) else onNavigate(ScreenId.Cloud)
     }
 

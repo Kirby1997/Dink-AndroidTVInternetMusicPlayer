@@ -3,6 +3,54 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [Unreleased]
+
+Fixes from a full codebase audit.
+
+### Playback
+- **Playback runs in the background service**, so the remote's media keys and a cold
+  start work reliably even without the app on screen; skipping, shuffle and the resume
+  position are recorded more reliably.
+- **Fewer stream drops on SMB.** Stale connections are detected and replaced instead of
+  hanging, a missing file is skipped in under a second, and reads are buffered ahead for
+  smoother start and seek.
+- Updated the audio engine (Media3 1.11).
+
+### Library and sources
+- **Your library can't be wiped by a flaky network or a slow boot.** Imports and monitor
+  passes only remove tracks after a complete scan, library saves are safer (fsync, backup
+  copy, corrupt-file recovery), and an empty local-media scan at launch no longer removes
+  your local tracks.
+- **Play counts and "recently played" stick.** Plays are saved promptly and no longer
+  lost when a library scan runs at the same time.
+- **Albums are grouped by album artist + title.** Two different "Greatest Hits" stay
+  separate, and compilations stay one album. Dink now reads the album-artist tag; use
+  Settings → Library → *Force full re-tag* to pick it up for tracks already imported.
+- Deleting a share or removing a folder mid-import is now safe, with a confirmation first.
+- Old tags (ID3v1 / APEv2) with accented characters read correctly; NAS housekeeping
+  folders (@eaDir, #recycle) are skipped.
+- Faster search, section loading and cover-art caching; cover art no longer gets stuck
+  as "no art" after a network blip.
+
+### Lyrics
+- **Online lyrics are now off by default**, behind a single *Online lyrics* switch.
+  The Genius and Musixmatch providers were removed.
+- Lyrics are found in .lrc/.txt files next to tracks on SMB shares and in embedded tags,
+  lookups are cancelled when you skip, and results are cached. Instrumental tracks are
+  recognised.
+- Fixes for LRC timing offsets and encodings, and for special characters and emoji in
+  lyrics from web sources.
+
+### Interface
+- Back navigation, focus after opening items and empty screens (Playlists, Now Playing)
+  behave consistently; Back in the side menu offers to exit.
+- Settings, toasts and key repeat polish; Now Playing and the mini player redraw less.
+
+### Other
+- Dink is now listed for Android TV only.
+- Release builds no longer carry development cloud sign-in credentials, and backups
+  exclude caches.
+
 ## [1.2.4] - 2026-07-13
 
 ### Fixed

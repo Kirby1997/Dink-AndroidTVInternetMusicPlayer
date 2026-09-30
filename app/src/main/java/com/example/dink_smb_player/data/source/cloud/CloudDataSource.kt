@@ -1,17 +1,21 @@
+@file:OptIn(UnstableApi::class)
+
 package com.example.dink_smb_player.data.source.cloud
 
 import android.net.Uri
+import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
 import java.io.IOException
 import java.io.InputStream
 import java.net.URLDecoder
 import java.util.concurrent.TimeUnit
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 
 /**
  * Media3 [DataSource] that STREAMS bytes from a cloud provider over HTTP Range —
@@ -72,6 +76,13 @@ class CloudDataSource : BaseDataSource(/* isNetwork = */ true) {
             resp.close()
             throw IOException("Cloud stream HTTP $code for $fileId")
         }
+        // A 200 to a mid-file Range request is the WHOLE file from byte 0: reading it as
+        // if it started at `position` would feed the extractor the wrong bytes (PLAY-16).
+        if (!rangeHonoured(position, resp.code)) {
+            val code = resp.code
+            resp.close()
+            throw IOException("Cloud stream ignored Range (HTTP $code at $position) for $fileId")
+        }
         response = resp
         val body = resp.body ?: throw IOException("Empty cloud response body for $fileId")
 
@@ -128,13 +139,17 @@ class CloudDataSource : BaseDataSource(/* isNetwork = */ true) {
     }
 
     companion object {
-        // No read timeout: a paused/seeking player can hold a stream open. Connect
-        // timeout stays bounded so a dead network fails the open() promptly.
+        // Finite read timeout: it bounds a single socket read, so a paused player (no
+        // read outstanding) isn't affected, but a stalled server fails the read instead
+        // of hanging the loader thread forever (PLAY-16). Connect stays bounded too.
         private val http: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(0, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
                 .build()
         }
+
+        /** A request from [position] > 0 must come back 206 Partial Content. */
+        internal fun rangeHonoured(position: Long, code: Int): Boolean = position == 0L || code == 206
     }
 }

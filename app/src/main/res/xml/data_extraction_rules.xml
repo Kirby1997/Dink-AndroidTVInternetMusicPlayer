@@ -7,14 +7,34 @@
   hardware-bound and NEVER part of a backup. If the encrypted file were restored onto a
   new device the key would be gone, so the blob would be undecryptable — at best the user
   re-enters creds, at worst the store throws on read. We therefore exclude it from BOTH
-  cloud backup and device-to-device transfer. Everything else (library index, prefs,
-  source list) backs up normally.
+  cloud backup and device-to-device transfer.
+
+  Also excluded (BLD-5): the library index (large, and rebuilt by re-scanning the
+  restored sources), its corrupt-copy, every atomic-write *.tmp, and the album-art cache.
+  Together they blow the 25 MB cloud-backup quota, and an over-quota backup is dropped
+  entirely, so playlists and settings would never back up. Backup rules have no globs,
+  hence the explicit *.tmp list. Everything else (playlists, prefs, source list) backs up.
+  Device-to-device transfer has no quota, so it keeps library_index.json (saves a full
+  re-scan on the new TV) and only drops the junk / regenerable files.
 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="dink_secrets.xml" />
+        <exclude domain="file" path="library_index.json" />
+        <exclude domain="file" path="library_index.json.tmp" />
+        <exclude domain="file" path="library_index.corrupt.json" />
+        <exclude domain="file" path="playlists.json.tmp" />
+        <exclude domain="file" path="nowplaying.json.tmp" />
+        <exclude domain="file" path="nowplaying_pos.json.tmp" />
+        <exclude domain="file" path="artcache" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="dink_secrets.xml" />
+        <exclude domain="file" path="library_index.json.tmp" />
+        <exclude domain="file" path="library_index.corrupt.json" />
+        <exclude domain="file" path="playlists.json.tmp" />
+        <exclude domain="file" path="nowplaying.json.tmp" />
+        <exclude domain="file" path="nowplaying_pos.json.tmp" />
+        <exclude domain="file" path="artcache" />
     </device-transfer>
 </data-extraction-rules>

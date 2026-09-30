@@ -47,9 +47,10 @@ shared.
 - Windowed engine queue so shuffle-all over a whole library can't ANR.
 
 **Lyrics**
-- Synced (karaoke-style) and plain lyrics from embedded tags, `.lrc` sidecar files, or a
-  range of online providers (LRCLIB, NetEase, QQ, Musixmatch, and more). Turn individual
-  sources on or off in Settings.
+- Synced (karaoke-style) and plain lyrics from embedded tags and `.lrc` / `.txt` sidecar
+  files. Optional online lookups (off by default — switch on **Online lyrics** in
+  Settings → Lyrics) from LRCLIB, NetEase, QQ Music, Lyricsify, Letras, DarkLyrics,
+  Metal Archives, AZLyrics, SongLyrics, Bandcamp and LyricFind, each toggleable.
 
 **Sound**
 - Built-in multi-band equalizer with presets plus a full graphic EQ.

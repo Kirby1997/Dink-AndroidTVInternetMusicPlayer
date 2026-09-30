@@ -34,16 +34,6 @@ android {
         targetSdk = 36
         versionCode = 7
         versionName = "1.2.4"
-
-        // Google OAuth client for the "TVs and Limited Input devices" client type,
-        // used by the Phase 8 cloud device-flow. Kept out of source control: set
-        // DINK_GOOGLE_CLIENT_ID / DINK_GOOGLE_CLIENT_SECRET in ~/.gradle/gradle.properties
-        // (or pass -P). Empty default → CloudScreen surfaces a "not configured" notice
-        // instead of crashing, so the build is green without secrets.
-        val googleClientId = (project.findProperty("DINK_GOOGLE_CLIENT_ID") as String?).orEmpty()
-        val googleClientSecret = (project.findProperty("DINK_GOOGLE_CLIENT_SECRET") as String?).orEmpty()
-        buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"$googleClientId\"")
-        buildConfigField("String", "GOOGLE_OAUTH_CLIENT_SECRET", "\"$googleClientSecret\"")
     }
 
     signingConfigs {
@@ -57,8 +47,23 @@ android {
         }
     }
 
+    // Google OAuth client for the "TVs and Limited Input devices" client type, used by
+    // the Phase 8 cloud device-flow. Kept out of source control: set
+    // DINK_GOOGLE_CLIENT_ID / DINK_GOOGLE_CLIENT_SECRET in ~/.gradle/gradle.properties
+    // (or pass -P). Debug builds only — cloud is parked, and a secret compiled into a
+    // release APK is public (-dontobfuscate), so release always gets empty strings.
+    // Empty → CloudScreen surfaces a "not configured" notice instead of crashing.
+    val googleClientId = (project.findProperty("DINK_GOOGLE_CLIENT_ID") as String?).orEmpty()
+    val googleClientSecret = (project.findProperty("DINK_GOOGLE_CLIENT_SECRET") as String?).orEmpty()
+
     buildTypes {
+        debug {
+            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"$googleClientId\"")
+            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_SECRET", "\"$googleClientSecret\"")
+        }
         release {
+            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"\"")
+            buildConfigField("String", "GOOGLE_OAUTH_CLIENT_SECRET", "\"\"")
             // R8 shrink + resource shrink (NO obfuscation — see proguard-rules.pro
             // -dontobfuscate). Cuts dead code + unused resources for a smaller APK while
             // keeping the build reversible.
@@ -88,6 +93,15 @@ android {
         compose = true
         buildConfig = true
     }
+    packaging {
+        resources {
+            // Bouncy Castle ships data files for code smbj never touches: post-quantum
+            // (picnic tables alone were ~1.2 MB in older bcprov) and the X.509
+            // CertPathReviewer message bundles. R8 strips the classes, not these.
+            excludes += "org/bouncycastle/pqc/**"
+            excludes += "org/bouncycastle/x509/CertPathReviewerMessages*.properties"
+        }
+    }
 }
 
 dependencies {
@@ -98,10 +112,10 @@ dependencies {
     implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
-    implementation(libs.androidx.tv.foundation)
     implementation(libs.androidx.tv.material)
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.activity.compose)
 
     implementation(libs.androidx.datastore.preferences)
@@ -113,12 +127,19 @@ dependencies {
 
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.session)
+    implementation(libs.androidx.media3.inspector)
 
     implementation(libs.jaudiotagger)
 
     implementation(libs.okhttp)
 
     implementation(libs.smbj)
+    constraints {
+        // smbj 0.13.0 asks for bcprov 1.75: CVE-2024-29857 / -30171 / -30172 / -34447.
+        implementation(libs.bouncycastle.bcprov) {
+            because("bcprov < 1.78.1 has CVE-2024-29857/30171/30172/34447 (via smbj)")
+        }
+    }
     // smbj pulls slf4j-api 1.7.36 transitively. Without a binding it logs
     // "Failed to load class StaticLoggerBinder" once at startup; slf4j-nop is the
     // no-op binding that silences it — we don't want library logs in logcat.
@@ -126,6 +147,7 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.mockito.kotlin)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)

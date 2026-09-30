@@ -31,7 +31,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,6 +53,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.example.dink_smb_player.DinkApplication
 import com.example.dink_smb_player.data.library.PlaylistRepository
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.player.PlayerState
@@ -79,7 +79,11 @@ fun SongContextMenu(
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val toast = LocalToast.current
+    // Playlist writes run on the process-lifetime scope, not this dialog's: the dialog is
+    // dismissed the moment a row is picked, which cancelled the write mid-flight. The
+    // toast is posted only once the repository reports the change is on disk.
+    val appScope = (context.applicationContext as DinkApplication).appScope
     val playlists by PlaylistRepository.playlists.collectAsState()
 
     var mode by remember { mutableStateOf(MenuMode.Root) }
@@ -136,8 +140,11 @@ fun SongContextMenu(
                                     trailing = if (already) "✓" else "${pl.songIds.size}",
                                     enabled = !already,
                                 ) {
-                                    scope.launch { PlaylistRepository.addSong(context, pl.id, song.id) }
-                                    onToast("Added to ${pl.name}")
+                                    val appContext = context.applicationContext
+                                    appScope.launch {
+                                        if (PlaylistRepository.addSong(appContext, pl.id, song.id)) onToast("Added to ${pl.name}")
+                                        else toast.error("Couldn't save ${pl.name}")
+                                    }
                                     onDismiss()
                                 }
                             }
@@ -150,8 +157,12 @@ fun SongContextMenu(
                 MenuMode.NewPlaylist -> {
                     NewPlaylistField(
                         onCreate = { name ->
-                            scope.launch { PlaylistRepository.create(context, name, seedSongId = song.id) }
-                            onToast("Created “${name.trim().ifEmpty { "Untitled playlist" }}”")
+                            val appContext = context.applicationContext
+                            val label = name.trim().ifEmpty { "Untitled playlist" }
+                            appScope.launch {
+                                if (PlaylistRepository.create(appContext, name, seedSongId = song.id) != null) onToast("Created “$label”")
+                                else toast.error("Couldn't save playlist “$label”")
+                            }
                             onDismiss()
                         },
                         onCancel = { mode = MenuMode.PickPlaylist },

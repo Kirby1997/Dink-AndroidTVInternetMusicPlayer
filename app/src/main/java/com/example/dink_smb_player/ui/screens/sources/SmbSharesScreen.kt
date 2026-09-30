@@ -51,7 +51,6 @@ import com.example.dink_smb_player.data.SharesLibrary
 import com.example.dink_smb_player.data.model.ConnectionStatus
 import com.example.dink_smb_player.data.model.SmbShare
 import com.example.dink_smb_player.data.prefs.SharePrefs
-import com.example.dink_smb_player.data.source.smb.SmbConnectionRegistry
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.ui.components.GradientButton
@@ -74,9 +73,9 @@ fun SmbSharesScreen(
     val shares by sharePrefs.shares.collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
 
-    // Push the live SharePrefs view into the SmbDataSource registry. Without this
-    // the data source can't resolve `?sid=` back to a share config.
-    LaunchedEffect(shares) { SmbConnectionRegistry.update(shares) }
+    // No registry push here: DinkApp mirrors SharePrefs into SmbConnectionRegistry
+    // app-wide. Pushing from this screen's collectAsState(initial = emptyList()) wiped
+    // the registry on every entry, failing mid-playback reads with "Unknown SMB share".
 
     // Grab content focus on entry, else focus is unbound on arrival and Compose
     // hands it to the rail (drawer pops open / focus stranded at the rail top).

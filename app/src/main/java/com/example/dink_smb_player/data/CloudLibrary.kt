@@ -14,6 +14,7 @@ import com.example.dink_smb_player.data.prefs.CloudToken
 import com.example.dink_smb_player.data.prefs.EncryptedShareStore
 import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.MonitorWorker
+import com.example.dink_smb_player.data.source.SourceLocks
 import com.example.dink_smb_player.data.source.cloud.CloudConnectionRegistry
 import com.example.dink_smb_player.data.source.cloud.CloudImporter
 import com.example.dink_smb_player.data.source.cloud.CloudProviderSpec
@@ -163,14 +164,16 @@ object CloudLibrary {
      *  folder + subfolders (other imported folders untouched). */
     fun importFolder(context: Context, provider: CloudProvider, ref: CloudFolderRef) {
         val appContext = context.applicationContext
-        // Importing also monitors — new files in the folder get auto-indexed later.
-        val updated = provider.copy(
-            importFolders = (provider.importFolders + ref).distinctBy { it.id },
-            monitoredFolders = (provider.monitoredFolders + ref).distinctBy { it.id },
-        )
         scope.launch {
-            SharePrefs(appContext).saveProvider(updated)
-            runImportFolder(appContext, updated, ref)
+            // Importing also monitors — new files in the folder get auto-indexed later.
+            // Applied to the CURRENT stored provider; null = disconnected meanwhile.
+            val updated = SharePrefs(appContext).updateProvider(provider.id) {
+                it.copy(
+                    importFolders = (it.importFolders + ref).distinctBy { f -> f.id },
+                    monitoredFolders = (it.monitoredFolders + ref).distinctBy { f -> f.id },
+                )
+            } ?: return@launch
+            SourceLocks.runExclusive(provider.id) { runImportFolder(appContext, updated, ref) }
             MonitorWorker.reschedule(appContext)
         }
     }
@@ -178,19 +181,28 @@ object CloudLibrary {
     /** Remove an imported folder: drop it (+ any monitor flag) and prune its tracks. */
     fun removeImportedFolder(context: Context, provider: CloudProvider, ref: CloudFolderRef) {
         val appContext = context.applicationContext
-        val updated = provider.copy(
-            importFolders = provider.importFolders.filter { it.id != ref.id },
-            monitoredFolders = provider.monitoredFolders.filter { it.id != ref.id },
-        )
         scope.launch {
-            SharePrefs(appContext).saveProvider(updated)
-            val total = LibraryRepository.importScoped(
-                appContext,
-                CloudImporter.sourceEntityFor(updated, 0, 0L),
-                freshTracks = emptyList(),
-                scopePrefixes = listOf(CloudImporter.monitoredPrefix(provider, ref)),
-            )
-            SharePrefs(appContext).saveProvider(updated.copy(trackCount = total))
+            val prefs = SharePrefs(appContext)
+            val updated = prefs.updateProvider(provider.id) {
+                it.copy(
+                    importFolders = it.importFolders.filter { f -> f.id != ref.id },
+                    monitoredFolders = it.monitoredFolders.filter { f -> f.id != ref.id },
+                )
+            } ?: return@launch
+            SourceLocks.runExclusive<Unit>(provider.id) {
+                if (prefs.providers.first().none { it.id == provider.id }) return@runExclusive
+                val total = LibraryRepository.importScoped(
+                    appContext,
+                    CloudImporter.sourceEntityFor(updated, 0, 0L),
+                    freshTracks = emptyList(),
+                    scopePrefixes = listOf(CloudImporter.monitoredPrefix(provider, ref)),
+                ).getOrElse { t ->
+                    errorsByProvider[provider.id] = "library couldn't be saved (${t.message ?: t::class.simpleName})"
+                    android.util.Log.e("CloudLibrary", "remove folder not saved id=${provider.id} folder=${ref.path}", t)
+                    return@runExclusive
+                }
+                prefs.updateProvider(provider.id) { it.copy(trackCount = total) }
+            }
             MonitorWorker.reschedule(appContext)
         }
     }
@@ -198,17 +210,18 @@ object CloudLibrary {
     /** Toggle monitoring for a folder. Enabling also imports it. */
     fun setFolderMonitored(context: Context, provider: CloudProvider, ref: CloudFolderRef, enabled: Boolean) {
         val appContext = context.applicationContext
-        val updated = if (enabled) {
-            provider.copy(
-                importFolders = (provider.importFolders + ref).distinctBy { it.id },
-                monitoredFolders = (provider.monitoredFolders + ref).distinctBy { it.id },
-            )
-        } else {
-            provider.copy(monitoredFolders = provider.monitoredFolders.filter { it.id != ref.id })
-        }
         scope.launch {
-            SharePrefs(appContext).saveProvider(updated)
-            if (enabled) runImportFolder(appContext, updated, ref)
+            val updated = SharePrefs(appContext).updateProvider(provider.id) {
+                if (enabled) {
+                    it.copy(
+                        importFolders = (it.importFolders + ref).distinctBy { f -> f.id },
+                        monitoredFolders = (it.monitoredFolders + ref).distinctBy { f -> f.id },
+                    )
+                } else {
+                    it.copy(monitoredFolders = it.monitoredFolders.filter { f -> f.id != ref.id })
+                }
+            } ?: return@launch
+            if (enabled) SourceLocks.runExclusive(provider.id) { runImportFolder(appContext, updated, ref) }
             MonitorWorker.reschedule(appContext)
         }
     }
@@ -232,15 +245,21 @@ object CloudLibrary {
                         freshTracks = tracks,
                         scopePrefixes = listOf(CloudImporter.monitoredPrefix(provider, ref)),
                         prune = res.complete,
-                    )
+                    ).getOrElse { t ->
+                        // Not saved: report a failed import (CloudBrowseScreen toasts the error), not
+                        // "Imported N" / Connected.
+                        errorsByProvider[provider.id] = "library couldn't be saved (${t.message ?: t::class.simpleName})"
+                        android.util.Log.e("CloudLibrary", "import not saved id=${provider.id} folder=${ref.path}", t)
+                        return@onSuccess
+                    }
                     lastImportedCount[provider.id] = total
-                    SharePrefs(context).saveProvider(
-                        provider.copy(
+                    SharePrefs(context).updateProvider(provider.id) {
+                        it.copy(
                             status = ConnectionStatus.Connected,
                             trackCount = total,
                             lastSyncMs = System.currentTimeMillis(),
-                        ),
-                    )
+                        )
+                    }
                 }
                 .onFailure { t ->
                     errorsByProvider[provider.id] = t.message ?: t::class.simpleName.orEmpty()
@@ -258,9 +277,12 @@ object CloudLibrary {
         if (activeBrowseProviderId == providerId) activeBrowseProviderId = null
         val appContext = context.applicationContext
         scope.launch {
-            LibraryRepository.removeSource(appContext, SourceType.Cloud, providerId)
-            EncryptedShareStore.get(appContext).deleteCloudToken(providerId)
-            SharePrefs(appContext).deleteProvider(providerId)
+            // Cancel + wait out any import/monitor walk first so none re-adds rows after.
+            SourceLocks.remove(providerId) {
+                LibraryRepository.removeSource(appContext, SourceType.Cloud, providerId)
+                EncryptedShareStore.get(appContext).deleteCloudToken(providerId)
+                SharePrefs(appContext).deleteProvider(providerId)
+            }
         }
     }
 }

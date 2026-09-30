@@ -37,33 +37,54 @@ internal object LyricHtml {
 
     private fun Char.isAsciiAlnum() = this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9'
 
+    private val BR = Regex("(?i)<br\\s*/?>")
+    private val P_CLOSE = Regex("(?i)</p\\s*>")
+    private val P_OPEN = Regex("(?i)<p[^>]*>")
+    private val TAG = Regex("<[^>]+>")
+    private val BLANK_RUN = Regex("\n{3,}")
+
+    /** `&name;`, `&#NNN;` or `&#xHH;` — matched once, left to right, so a decoded `&`
+     *  is never re-read as the start of another entity (`&amp;lt;` → `&lt;`). */
+    private val ENTITY = Regex("&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z][a-zA-Z0-9]{1,15});")
+
+    private val NAMED = mapOf(
+        "amp" to "&", "lt" to "<", "gt" to ">", "quot" to "\"", "apos" to "'",
+        "nbsp" to " ", "rsquo" to "\u2019", "lsquo" to "\u2018", "rdquo" to "\u201D",
+        "ldquo" to "\u201C", "hellip" to "\u2026", "ndash" to "\u2013", "mdash" to "\u2014",
+    )
+
     /** Turn an HTML fragment into plain text: <br>/<p> → newlines, strip tags, decode
      *  entities, trim each line, collapse blank runs. */
     fun htmlToText(html: String): String {
         var s = html
-        s = s.replace(Regex("(?i)<br\\s*/?>"), "\n")
-        s = s.replace(Regex("(?i)</p\\s*>"), "\n")
-        s = s.replace(Regex("(?i)<p[^>]*>"), "")
-        s = s.replace(Regex("<[^>]+>"), "")
+        s = s.replace(BR, "\n")
+        s = s.replace(P_CLOSE, "\n")
+        s = s.replace(P_OPEN, "")
+        s = s.replace(TAG, "")
         s = decodeEntities(s)
         return s.lineSequence().map { it.trim() }.joinToString("\n")
-            .replace(Regex("\n{3,}"), "\n\n").trim()
+            .replace(BLANK_RUN, "\n\n").trim()
     }
 
-    private fun decodeEntities(s: String): String {
-        var t = s
-            .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-            .replace("&quot;", "\"").replace("&#39;", "'").replace("&#x27;", "'")
-            .replace("&apos;", "'").replace("&nbsp;", " ")
-        // Numeric entities &#NN; and &#xHH;
-        t = Regex("&#x([0-9a-fA-F]+);").replace(t) { m ->
-            m.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: m.value
+    /** One-pass entity decode. Numeric references go through [Character.toChars] so
+     *  supplementary code points (emoji, `&#128512;`) become a surrogate pair rather than
+     *  a truncated char. Unknown names and invalid code points are left verbatim. */
+    internal fun decodeEntities(s: String): String {
+        if (s.indexOf('&') < 0) return s
+        return ENTITY.replace(s) { m ->
+            val body = m.groupValues[1]
+            val decoded = when {
+                body.startsWith("#x") || body.startsWith("#X") -> codePoint(body.substring(2).toIntOrNull(16))
+                body.startsWith("#") -> codePoint(body.substring(1).toIntOrNull())
+                else -> NAMED[body]
+            }
+            decoded ?: m.value
         }
-        t = Regex("&#(\\d+);").replace(t) { m ->
-            m.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: m.value
-        }
-        return t
     }
+
+    private fun codePoint(cp: Int?): String? =
+        if (cp == null || cp == 0 || !Character.isValidCodePoint(cp) || cp in 0xD800..0xDFFF) null
+        else String(Character.toChars(cp))
 
     /** Substring between the first [start] and the next [end] after it; null if absent. */
     fun between(html: String, start: String, end: String): String? {

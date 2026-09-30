@@ -54,7 +54,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.DinkApplication
+import com.example.dink_smb_player.ui.components.LocalToast
 import com.example.dink_smb_player.LocalContentFocus
+import com.example.dink_smb_player.LocalDrawerOpen
 import com.example.dink_smb_player.LocalRailFocusRequester
 import com.example.dink_smb_player.data.SharesLibrary
 import com.example.dink_smb_player.data.model.ConnectionStatus
@@ -78,6 +80,7 @@ import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Add SMB Share — single compact scrollable form (no multi-step wizard).
@@ -110,6 +113,12 @@ fun AddShareWizard(
     val sharePrefs = remember(context) { SharePrefs(context.applicationContext) }
     val secretStore = remember(context) { EncryptedShareStore.get(context.applicationContext) }
     val scope = rememberCoroutineScope()
+    val toast = LocalToast.current
+    // False once the wizard leaves composition (ScreenHost swaps screens without animation,
+    // so that's exactly "no longer the current screen"). Gates save()'s deferred navigation.
+    val onScreen = remember { AtomicBoolean(true) }
+    DisposableEffect(Unit) { onDispose { onScreen.set(false) } }
+    var saving by remember { mutableStateOf(false) }
 
     var host by remember { mutableStateOf("") }
     var port by remember { mutableStateOf("445") }
@@ -155,7 +164,8 @@ fun AddShareWizard(
     // Own Back so it cancels the form instead of bubbling to the global handler
     // (which focuses the rail and reopens the drawer). A field in edit mode has
     // its own inner BackHandler that takes priority.
-    BackHandler(enabled = !testing) { onDone(ScreenId.SmbShares) }
+    // Not while the drawer is open: Back there is the app's exit dialog (UI-22).
+    BackHandler(enabled = !testing && !LocalDrawerOpen.current.value) { onDone(ScreenId.SmbShares) }
 
     val rail = Modifier.focusProperties { left = railRequester }
 
@@ -197,27 +207,42 @@ fun AddShareWizard(
             signal = 1f,
         )
         val credsToStore = if (authGuest) null else SmbCreds(user, password, domain.ifBlank { null })
-        // Persist on the app scope, NOT the wizard's rememberCoroutineScope: we
-        // navigate away on Add, which would cancel a write mid-flight.
+        // Persist on the app scope, NOT the wizard's rememberCoroutineScope: Back/Cancel
+        // mid-save leaves the wizard, which would cancel a write mid-flight. Nothing claims
+        // success (toast, navigation) until the share config is confirmed on disk.
         val appScope = (context.applicationContext as DinkApplication).appScope
-        SmbConnectionRegistry.add(share)
-        SharesLibrary.activeBrowseShareId = id
+        saving = true
         appScope.launch {
             // Persist the share config FIRST and independently of the secret write.
             // If the encrypted creds store is wedged it must NOT block the share from
             // landing in SharePrefs — that ordering was the "re-add vanishes" bug.
-            runCatching { sharePrefs.saveShare(share) }
+            val shareSaved = runCatching { sharePrefs.saveShare(share) }
                 .onFailure { android.util.Log.e("AddShareWizard", "saveShare failed id=$id", it) }
-            if (credsToStore != null) {
+                .isSuccess
+            if (!shareSaved) {
+                saving = false
+                toast.error("Couldn't save ${share.name}")
+                return@launch
+            }
+            // Playback can resolve `?sid=` before the SharePrefs flow re-emits.
+            SmbConnectionRegistry.add(share)
+            val credsSaved = credsToStore == null ||
                 runCatching { secretStore.putSmbCreds(id, credsToStore) }
                     .onFailure { android.util.Log.e("AddShareWizard", "putSmbCreds failed id=$id", it) }
-            }
-            android.util.Log.i("AddShareWizard", "saved share id=$id host=${share.host}")
+                    .isSuccess
+            android.util.Log.i("AddShareWizard", "saved share id=$id host=${share.host} creds=$credsSaved")
             // No upfront flat walk — SmbBrowseScreen lists the root folder lazily on
             // open, and the user imports the folders they want into the library there.
+            if (credsSaved) onToast("${share.name} saved")
+            else toast.error("${share.name} saved, but its password couldn't be stored — re-enter it")
+            // Only navigate if the wizard is still on screen: the user may have backed out
+            // (or gone elsewhere) while the write was in flight.
+            if (onScreen.get()) {
+                saving = false
+                SharesLibrary.activeBrowseShareId = id
+                onDone(ScreenId.SmbShares)
+            }
         }
-        onToast("${share.name} saved")
-        onDone(ScreenId.SmbShares)
     }
 
     Column(
@@ -380,10 +405,10 @@ fun AddShareWizard(
             FormButton(
                 // Gated on a passing test so a wrong IP / share name can't be
                 // saved as a phantom "online" share.
-                label = "Add share",
+                label = if (saving) "Saving…" else "Add share",
                 modifier = Modifier.weight(1f).focusRequester(addFocus),
                 primary = true,
-                enabled = testPassed && !testing,
+                enabled = testPassed && !testing && !saving,
                 onClick = { save() },
             )
         }

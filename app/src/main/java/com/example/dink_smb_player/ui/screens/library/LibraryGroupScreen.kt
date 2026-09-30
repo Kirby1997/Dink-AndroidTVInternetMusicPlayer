@@ -531,7 +531,7 @@ fun hasUntaggedTracks(songs: List<Song>): Boolean {
 // for the collapsing rules (case/The/feat/punctuation/accents) and collaboration attribution.
 
 /** The most frequent raw spelling among a group's tracks — the canonical display label. */
-private fun <T> Iterable<T>.mostCommon(): T =
+internal fun <T> Iterable<T>.mostCommon(): T =
     groupingBy { it }.eachCount().maxByOrNull { it.value }!!.key
 
 private fun buildGroups(
@@ -551,25 +551,37 @@ private fun buildGroups(
 
 /** An artist bucket's display label: the most common precomputed clean spelling (never a
  *  collaboration/featured string), falling back to the raw artist only for pre-precompute rows. */
-private fun artistLabelOf(list: List<Song>): String =
+internal fun artistLabelOf(list: List<Song>): String =
     list.mapNotNull { it.artistLabel }.ifEmpty { list.map { it.artist } }.mostCommon()
+
+/** A song's album key: the precomputed `albumArtist|title` (LIB-6), or the per-row fallback for
+ *  a row that predates the recompute. The one album-identity rule for every screen. */
+fun albumKeyOf(song: Song): String =
+    song.albumKey ?: LibraryGrouping.fallbackAlbumKey(song.artist, song.albumTitle)
 
 fun albumGroups(songs: List<Song>): List<LibraryGroup> =
     buildGroups(
         songs,
-        keyOf = { it.albumKey ?: LibraryGrouping.normKey(it.albumTitle ?: "Unknown album") },
+        keyOf = ::albumKeyOf,
         titleOf = { _, list ->
             list.mapNotNull { it.albumTitle }.takeIf { it.isNotEmpty() }?.mostCommon() ?: "Unknown album"
         },
-        subtitleOf = { _, list ->
-            // "Various artists" only when the PRIMARY artists genuinely differ — featured
-            // guests and spelling variants collapse to one primary key so they don't read
-            // as a compilation.
-            val keys = list.map { it.artistKey ?: LibraryGrouping.normKey(it.artist) }.distinct()
-            val artist = if (keys.size == 1) artistLabelOf(list) else "Various artists"
-            "$artist · ${list.size} tracks"
-        },
+        subtitleOf = { key, list -> "${albumArtistLabel(key, list)} · ${list.size} tracks" },
     )
+
+/** Display artist of an album group: "Various artists" for a compilation key, else the clean
+ *  label of the tracks filed under the album artist. When none of them match (an album-artist
+ *  tag naming nobody's primary artist), the old rule: one primary artist → them, else various. */
+internal fun albumArtistLabel(key: String, list: List<Song>): String {
+    val albumArtist = LibraryGrouping.albumArtistKeyOf(key)
+    if (albumArtist == LibraryGrouping.VARIOUS_ARTISTS_KEY) return "Various artists"
+    val own = list.filter { (it.artistKey ?: LibraryGrouping.normKey(it.artist)) == albumArtist }
+    if (own.isNotEmpty()) return artistLabelOf(own)
+    // Featured guests and spelling variants collapse to one primary key, so they don't read
+    // as a compilation.
+    val keys = list.map { it.artistKey ?: LibraryGrouping.normKey(it.artist) }.distinct()
+    return if (keys.size == 1) artistLabelOf(list) else "Various artists"
+}
 
 fun artistGroups(songs: List<Song>): List<LibraryGroup> =
     buildGroups(
@@ -577,7 +589,7 @@ fun artistGroups(songs: List<Song>): List<LibraryGroup> =
         keyOf = { it.artistKey ?: LibraryGrouping.normKey(it.artist) },
         titleOf = { _, list -> artistLabelOf(list) },
         subtitleOf = { _, list ->
-            val albums = list.map { it.albumKey ?: LibraryGrouping.normKey(it.albumTitle ?: "") }.distinct().size
+            val albums = list.map(::albumKeyOf).distinct().size
             "${list.size} tracks · $albums albums"
         },
     )

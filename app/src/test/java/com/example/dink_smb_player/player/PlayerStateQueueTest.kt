@@ -12,6 +12,7 @@ import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.clearInvocations
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -183,6 +184,43 @@ class PlayerStateQueueTest {
         rig.state.toggleShuffle() // back to the base order, d still present and current
         assertEquals(listOf("a", "b", "c", "d"), rig.state.queue.map { it.id })
         assertEquals(3, rig.state.currentIndex)
+    }
+
+    @Test
+    fun `shuffle toggle rebuilds the engine at the current position without a second seek`() {
+        val rig = Rig(itemCount = 3)
+        rig.state.playFrom(songs("a", "b", "c"), 1)
+        rig.state.seek(42f)
+        clearInvocations(rig.engine)
+
+        rig.state.toggleShuffle()
+
+        // Current track goes first in the shuffled queue and starts where it was.
+        verify(rig.engine).setMediaItems(any(), eq(0), eq(42_000L))
+        verify(rig.engine, never()).seekTo(any<Long>())
+        assertEquals("b", rig.state.currentSong?.id)
+        assertEquals(42f, rig.state.timeSec)
+
+        clearInvocations(rig.engine)
+        rig.state.toggleShuffle() // unshuffle: back to base order, same spot
+        verify(rig.engine).setMediaItems(any(), eq(1), eq(42_000L))
+        verify(rig.engine, never()).seekTo(any<Long>())
+    }
+
+    @Test
+    fun `shuffle toggle at position zero does not inherit a stale resume position`() {
+        val rig = Rig(itemCount = 0)
+        val list = songs("a", "b", "c")
+        rig.state.restore(
+            PlaybackStore.Snapshot(queueIds = list.map { it.id }, index = 0, positionSec = 42f, shuffle = false, repeat = RepeatMode.Off.name),
+            list.associateBy { it.id },
+        )
+        rig.state.prev() // restart the restored track: position 0
+        clearInvocations(rig.engine)
+
+        rig.state.toggleShuffle()
+
+        verify(rig.engine).setMediaItems(any(), eq(0), eq(0L))
     }
 
     @Test

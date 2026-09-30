@@ -2,6 +2,9 @@ package com.example.dink_smb_player.data.source.smb
 
 import com.example.dink_smb_player.data.model.SmbProtocol
 import com.example.dink_smb_player.data.prefs.SmbCreds
+import com.example.dink_smb_player.data.source.SourceLocks
+import com.hierynomus.mssmb2.SMB2Packet
+import com.hierynomus.mssmb2.messages.SMB2Echo
 import com.hierynomus.smbj.SMBClient
 import com.hierynomus.smbj.SmbConfig
 import com.hierynomus.smbj.auth.AuthenticationContext
@@ -20,12 +23,18 @@ import java.util.concurrent.atomic.AtomicInteger
  * stall the UI for ~600 ms each time. Instead we cache per-share, and only
  * tear down when the share is removed or the process exits.
  *
- * TWO smbj clients, not one: smbj pools connections per host:port inside a client
+ * THREE smbj clients, not one: smbj pools connections per host:port inside a client
  * (SMBClient.connectionTable, refcounted via Pooled.lease/release), so two cache
  * keys under one client would still share a single TCP socket + transport thread.
- * Playback gets its OWN [SMBClient] — its own socket — so an import walk, art
- * fetch, or browse can never contend with or tear down the stream's transport.
- * Everything else (walks, browse, tag/duration/art reads) shares [generalClient].
+ * Each [Channel] gets its OWN [SMBClient] — its own socket:
+ *  - [Channel.PLAYBACK]: the stream, so an import walk, art fetch, or browse can never
+ *    contend with or tear down the stream's transport.
+ *  - [Channel.READS]: file-content reads outside playback ([lease] — tag / duration / art /
+ *    lyric probes). A probe pulls up to MBs; on one TCP stream every directory listing
+ *    queued behind those bytes, and over the TV's Wi-Fi a walk's lists then hit the 30 s
+ *    request timeout. On their own socket a probe's timeout (and a dead-link evict) can't
+ *    touch the walk's listings either.
+ *  - [Channel.GENERAL]: directory listings — walks, browse, sidecar-dir lists ([share]).
  *
  * Eviction safety: a cache entry is only proactively closed when no [ShareLease]
  * is outstanding on it. Before this, an idle-evict could close the connection out
@@ -46,16 +55,39 @@ object SmbClient {
             // 30 s is plenty for LAN; default 60 s leaves the wizard hanging if the
             // host is unreachable. The Test-Connection step should fail fast.
             .withTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-            .withSoTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            // soTimeout MUST stay 0 (smbj's own default). It is the timeout of the socket's
+            // blocking read, and smbj's per-connection packet-reader thread sits in exactly that
+            // read while the link is idle: any non-zero value makes the reader throw after that
+            // much silence, which kills the reader for good (PacketReader.run returns). Its
+            // handleError only RELEASES the pooled connection, so when a second share on the
+            // same host holds a lease the socket stays open with nobody reading — a zombie that
+            // SMBClient keeps handing out, where every request then waits the full 30 s timeout.
+            // Per-request deadlines come from withTimeout above; dead links are caught by the
+            // ECHO probe in [entryForLocked] and the forced evict in [close].
+            .withSoTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
             .build()
         return SMBClient(cfg)
     }
 
-    /** Walks, browse, imports, tag/duration/art reads. */
+    /** Which smbj client (TCP socket) an operation rides on — see class doc. */
+    enum class Channel { GENERAL, READS, PLAYBACK }
+
+    /** Directory listings: walks, browse, imports. */
     private val generalClient: SMBClient by lazy { newClient() }
+
+    /** Non-playback file reads (tag / duration / art / lyric probes) — separate socket. */
+    private val readsClient: SMBClient by lazy { newClient() }
 
     /** Playback streaming only — separate socket, see class doc. */
     private val playbackClient: SMBClient by lazy { newClient() }
+
+    private fun clientFor(channel: Channel): SMBClient = when (channel) {
+        Channel.GENERAL -> generalClient
+        Channel.READS -> readsClient
+        Channel.PLAYBACK -> playbackClient
+    }
+
+    private const val TAG = "SmbClient"
 
     internal class CacheEntry(
         val connection: Connection,
@@ -87,18 +119,29 @@ object SmbClient {
     /** Per-key connect locks — see class doc on thread-safety. */
     private val locks = ConcurrentHashMap<String, Any>()
 
-    /** A NAS silently drops an idle SMB session, but smbj's [DiskShare.isConnected]
-     *  reflects only the LOCAL socket state — a server-side idle-drop still reads as
-     *  "connected", so the next operation blocks to the 30 s soTimeout instead of
-     *  reconnecting. So we treat a cached share that's been idle longer than this as
-     *  stale and reconnect proactively — cheap (no round-trip), and it turns the first
-     *  read after an idle period into one ~600 ms reconnect instead of a 30 s-per-read
-     *  stall. Entries with live leases are exempt: an open handle refreshes
-     *  [CacheEntry.lastUsedMs] on release, and closing under it kills the stream. */
-    private const val STALE_AFTER_IDLE_MS = 60_000L
+    /** A cached entry idle at least this long gets an SMB2 ECHO before reuse. The local
+     *  socket state ([Connection.isConnected]) can't see a link the NAS dropped silently
+     *  (reboot, power loss, NAT/Wi-Fi timeout), and neither it nor [DiskShare.isConnected]
+     *  (a local "we closed it" flag) can see a packet reader that has died. One ECHO round
+     *  trip (~ms on a LAN) proves both ends are alive, so a healthy idle connection is reused
+     *  instead of torn down, and a dead one costs [ECHO_TIMEOUT_MS] instead of a 30 s
+     *  stall on the first real request. Entries with live leases skip the probe: their open
+     *  handles are the traffic, and a failed read on them evicts via [close]. */
+    private const val PROBE_AFTER_IDLE_MS = 15_000L
 
-    private fun key(shareId: String, playback: Boolean) =
-        if (playback) "$shareId#play" else shareId
+    /** How long a liveness ECHO may take before the connection is judged dead. */
+    private const val ECHO_TIMEOUT_MS = 3_000L
+
+    /** The ECHO after an operation TIMED OUT ([close] with a cause): the link was busy enough
+     *  for a 30 s request to expire, so the ECHO may queue behind in-flight responses — give
+     *  it longer than the idle probe before calling the connection dead. */
+    private const val LIVENESS_ECHO_TIMEOUT_MS = 5_000L
+
+    private fun key(shareId: String, channel: Channel) = when (channel) {
+        Channel.GENERAL -> shareId
+        Channel.READS -> "$shareId#read"
+        Channel.PLAYBACK -> "$shareId#play"
+    }
 
     private fun lockFor(key: String): Any = locks.computeIfAbsent(key) { Any() }
 
@@ -106,8 +149,8 @@ object SmbClient {
      * Open or reuse a [DiskShare] for [shareId]. Throws on connect / auth / share
      * mount failure — call site should wrap in `runCatching`.
      *
-     * One-shot ops (list, browse). For a long-lived file handle use [lease] so the
-     * entry can't be evicted underneath it.
+     * One-shot ops (list, browse) on [Channel.GENERAL]. For a long-lived file handle use
+     * [lease] so the entry can't be evicted underneath it.
      */
     fun share(
         shareId: String,
@@ -116,10 +159,11 @@ object SmbClient {
         shareName: String,
         creds: SmbCreds?,
         playback: Boolean = false,
-    ): DiskShare = entryFor(shareId, host, port, shareName, creds, playback).share
+    ): DiskShare = entryFor(shareId, host, port, shareName, creds, if (playback) Channel.PLAYBACK else Channel.GENERAL).share
 
-    /** [share], but pins the entry against proactive eviction until the returned
-     *  [ShareLease] is closed. Hold it for exactly the life of an open file handle. */
+    /** A file-handle share, pinned against proactive eviction until the returned
+     *  [ShareLease] is closed. Hold it for exactly the life of an open file handle.
+     *  Non-playback leases ride [Channel.READS], never the listings' socket. */
     fun lease(
         shareId: String,
         host: String,
@@ -128,13 +172,17 @@ object SmbClient {
         creds: SmbCreds?,
         playback: Boolean = false,
     ): ShareLease {
-        val k = key(shareId, playback)
+        val channel = leaseChannel(playback)
+        val k = key(shareId, channel)
         synchronized(lockFor(k)) {
-            val entry = entryForLocked(k, host, port, shareName, creds, playback)
+            val entry = entryForLocked(shareId, k, host, port, shareName, creds, channel)
             entry.activeLeases.incrementAndGet()
             return ShareLease(entry.share, entry)
         }
     }
+
+    /** The channel [lease] uses — what a lease holder passes to [close]. */
+    fun leaseChannel(playback: Boolean): Channel = if (playback) Channel.PLAYBACK else Channel.READS
 
     private fun entryFor(
         shareId: String,
@@ -142,55 +190,97 @@ object SmbClient {
         port: Int,
         shareName: String,
         creds: SmbCreds?,
-        playback: Boolean,
+        channel: Channel,
     ): CacheEntry {
-        val k = key(shareId, playback)
+        val k = key(shareId, channel)
         synchronized(lockFor(k)) {
-            return entryForLocked(k, host, port, shareName, creds, playback)
+            return entryForLocked(shareId, k, host, port, shareName, creds, channel)
         }
     }
 
-    /** Must hold [lockFor] (k). */
+    /** Must hold [lockFor] (k). Refuses a share that is being deleted ([SourceLocks.isRemoved]):
+     *  a retag, probe retry, lyric sidecar or art read racing the delete would otherwise open a
+     *  fresh session + connection for it that nothing ever closes. [closeAllFor] drops entries
+     *  under the same lock AFTER the tombstone is set, so none can slip in between. */
     private fun entryForLocked(
+        shareId: String,
         k: String,
         host: String,
         port: Int,
         shareName: String,
         creds: SmbCreds?,
-        playback: Boolean,
+        channel: Channel,
     ): CacheEntry {
+        checkNotRemoved(shareId)
         val now = System.currentTimeMillis()
         cache[k]?.let { entry ->
-            val fresh = now - entry.lastUsedMs < STALE_AFTER_IDLE_MS
-            val busy = entry.activeLeases.get() > 0
-            if (entry.share.isConnected && (fresh || busy)) {
-                entry.lastUsedMs = now
-                return entry
+            var dead = !entry.connection.isConnected
+            if (!dead && entry.share.isConnected) {
+                val idle = now - entry.lastUsedMs >= PROBE_AFTER_IDLE_MS
+                val busy = entry.activeLeases.get() > 0
+                if (!idle || busy || answersEcho(entry.connection)) {
+                    entry.lastUsedMs = now
+                    return entry
+                }
+                dead = true
             }
-            // Locally closed, OR idle long enough (with no live handles) that the
-            // server may have dropped the session — drop it and reopen below rather
-            // than risk a 30 s blocked read. A dead-socket entry is closed even if
-            // leases are outstanding: their handles are already doomed, and the
-            // lease release on a removed entry is harmless (counter only).
-            closeEntry(entry)
+            // Socket closed, share closed, or no ECHO reply: drop it and reopen below. The
+            // connection is FORCE-closed when it's dead — a plain close() only releases our
+            // lease on smbj's pooled connection, and while another share on the same host
+            // still holds one, SMBClient.connect would hand the dead socket straight back.
+            // Forcing it shut makes every sharer reconnect. A dead-socket entry is closed even
+            // if leases are outstanding: their handles are already doomed, and the lease
+            // release on a removed entry is harmless (counter only).
+            closeEntry(entry, force = dead)
             cache.remove(k)
         }
-        val client = if (playback) playbackClient else generalClient
-        val connection = client.connect(host, port)
+        val connection = clientFor(channel).connect(host, port)
         val auth = creds?.let {
             AuthenticationContext(it.user, it.password.toCharArray(), it.domain)
         } ?: AuthenticationContext.guest()
-        val session = connection.authenticate(auth)
-        val disk = session.connectShare(shareName) as DiskShare
-        val entry = CacheEntry(connection, session, disk, System.currentTimeMillis())
+        // A failed auth or mount must release what was already opened: smbj refcounts
+        // the pooled connection, so an unclosed one here is a leaked lease that keeps
+        // the socket (and its transport thread) alive with nothing ever closing it.
+        var session: Session? = null
+        val disk = try {
+            session = connection.authenticate(auth)
+            session.connectShare(shareName) as DiskShare
+        } catch (t: Throwable) {
+            session?.let { s -> runCatching { s.close() } }
+            runCatching { connection.close() }
+            throw t
+        }
+        val entry = CacheEntry(connection, session!!, disk, System.currentTimeMillis())
         cache[k] = entry
         return entry
     }
 
-    private fun closeEntry(entry: CacheEntry) {
+    /** Throws when [shareId] is being deleted — see [entryForLocked]. An IOException, so
+     *  callers treat it like any other failed open. */
+    internal fun checkNotRemoved(shareId: String) {
+        if (SourceLocks.isRemoved(shareId)) throw java.io.IOException("SMB share $shareId was removed")
+    }
+
+    /** [force] = the connection is dead (or must be treated as dead): shut the socket FIRST,
+     *  for every share pooled on it, so the tree-disconnect / logoff below fail fast instead
+     *  of each waiting 30 s for a reply that can't come. Graceful (share removed) releases
+     *  only our lease on smbj's pooled connection — other shares on the host keep using it. */
+    private fun closeEntry(entry: CacheEntry, force: Boolean) {
+        if (force) runCatching { entry.connection.close(true) }
         runCatching { entry.share.close() }
         runCatching { entry.session.close() }
-        runCatching { entry.connection.close() }
+        if (!force) runCatching { entry.connection.close() }
+    }
+
+    /** One SMB2 ECHO with a short deadline — true if the server answered at all. Sent on the
+     *  connection (session id 0), which MS-SMB2 allows unsigned for ECHO. */
+    private fun answersEcho(connection: Connection, timeoutMs: Long = ECHO_TIMEOUT_MS): Boolean = try {
+        connection.send<SMB2Packet>(SMB2Echo(connection.negotiatedProtocol.dialect))
+            .get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        true
+    } catch (t: Throwable) {
+        if (t is InterruptedException) Thread.currentThread().interrupt()
+        false
     }
 
     /**
@@ -252,25 +342,147 @@ object SmbClient {
         }
     }
 
-    /** Evict one cache entry (error-path reconnect). [playback] selects the stream's
-     *  entry vs the general one — evicting one never touches the other's socket. */
-    fun close(shareId: String, playback: Boolean = false) {
-        val k = key(shareId, playback)
-        synchronized(lockFor(k)) {
-            val entry = cache.remove(k) ?: return
-            closeEntry(entry)
+    /** True when [t] reads as a transport/session failure (dead connection) rather than a
+     *  per-file SMB status. Per-file statuses (NOT_FOUND, ACCESS_DENIED, SHARING_VIOLATION)
+     *  must NOT evict the shared connection. We key off message text since smbj's status
+     *  enums live across packages and the socket layer throws plain IOExceptions.
+     *  Shared by the playback open (SmbDataSource) and the import walk (SmbImporter). */
+    internal fun isConnectionError(t: Throwable): Boolean {
+        // Socket-layer / smbj-transport types first: a connect to a powered-off NAS throws
+        // e.g. NoRouteToHostException "…EHOSTUNREACH (No route to host)", which none of the
+        // text keys below match — and the walk's circuit breaker must see it as a dead host.
+        var c: Throwable? = t
+        while (c != null) {
+            if (c is java.net.SocketException || c is java.net.SocketTimeoutException ||
+                c is java.net.UnknownHostException || c is java.io.EOFException ||
+                c is java.util.concurrent.TimeoutException ||
+                c is com.hierynomus.protocol.transport.TransportException
+            ) return true
+            c = c.cause
         }
+        val text = buildString {
+            var e: Throwable? = t
+            while (e != null) { append(e.message ?: e::class.simpleName.orEmpty()); append(' '); e = e.cause }
+        }.uppercase()
+        return "TIMEOUT" in text || "TIMED OUT" in text || "SOCKET" in text ||
+            "CONNECTION" in text || "ECONNRESET" in text || "RESET" in text ||
+            "BROKEN PIPE" in text || "EOF" in text || "TRANSPORT" in text ||
+            "UNREACH" in text || "NO ROUTE" in text ||
+            "USER_SESSION_DELETED" in text || "NETWORK_NAME_DELETED" in text
     }
 
-    /** Tear down BOTH entries for a share — call when the user deletes the share. */
+    /** True when [t] is a request/socket TIMEOUT: the reply didn't come in time, which on a
+     *  busy link doesn't mean the link is dead (see [keepAfterFailure]). */
+    internal fun isTimeout(t: Throwable): Boolean {
+        var c: Throwable? = t
+        while (c != null) {
+            if (c is java.util.concurrent.TimeoutException || c is java.net.SocketTimeoutException) return true
+            c = c.cause
+        }
+        return false
+    }
+
+    /** True when [t] is smbj refusing an op because the handle it used was already closed
+     *  ("DiskShare has already been closed") — typically a concurrent evict dropped the share
+     *  the op had just acquired. Not a connection failure: re-acquiring the share fixes it. */
+    internal fun isClosedHandleError(t: Throwable): Boolean {
+        var c: Throwable? = t
+        while (c != null) {
+            if (c.message?.contains("has already been closed", ignoreCase = true) == true) return true
+            c = c.cause
+        }
+        return false
+    }
+
+    /**
+     * Whether an error-path [close] after [cause] should KEEP the connection. Pure, for tests.
+     *  - Socket already down → never.
+     *  - A closed handle ([isClosedHandleError]) → keep: only our share handle is gone, the next
+     *    [share]/[lease] re-mounts on the live socket.
+     *  - A timeout ([isTimeout]) → keep iff the connection still answers an ECHO: the link is
+     *    busy, not dead. Force-closing it would fail EVERY other request in flight on it (the
+     *    walk's lists included, as "DiskShare has already been closed") — one slow reply used
+     *    to cascade into an incomplete walk that way. Only this one operation fails.
+     *  - Anything else connection-level (reset, EOF, session deleted…) → evict.
+     */
+    internal fun keepAfterFailure(
+        cause: Throwable,
+        connected: Boolean,
+        shareOpen: Boolean,
+        answersEcho: () -> Boolean,
+    ): Boolean = when {
+        !connected -> false
+        isClosedHandleError(cause) -> true
+        isTimeout(cause) -> shareOpen && answersEcho()
+        else -> false
+    }
+
+    /** Evict one cache entry after a CONNECTION-level failure (error-path reconnect).
+     *  [channel] selects which socket's entry — evicting one never touches another's. The
+     *  connection is force-closed (see [closeEntry]) so a zombie shared with another share on
+     *  the same host can't be handed back by smbj's pool.
+     *
+     *  [failed] is the [DiskShare] the failing operation used. When given, the entry is only
+     *  evicted if it is still that share: a concurrent op on the same dead connection that
+     *  fails a moment later must not tear down the fresh connection another op just made.
+     *
+     *  [cause] is the failure. With it, a connection that is merely BUSY (a timeout, but the
+     *  ECHO answers) or only lost a handle is kept — see [keepAfterFailure]. The ECHO runs
+     *  outside the key lock, so it never holds up other opens on this share.
+     *
+     *  Returns true when the connection [failed] used is gone (evicted now, or already replaced),
+     *  false when it was kept because it is alive. */
+    fun close(
+        shareId: String,
+        channel: Channel = Channel.GENERAL,
+        failed: DiskShare? = null,
+        cause: Throwable? = null,
+    ): Boolean {
+        val k = key(shareId, channel)
+        val entry = cache[k] ?: return true
+        if (failed != null && entry.share !== failed) return true
+        if (cause != null && keepAfterFailure(cause, entry.connection.isConnected, entry.share.isConnected) {
+                answersEcho(entry.connection, LIVENESS_ECHO_TIMEOUT_MS)
+            }
+        ) {
+            android.util.Log.i(TAG, "$channel link alive after ${cause.javaClass.simpleName} — connection kept")
+            return false
+        }
+        synchronized(lockFor(k)) {
+            if (cache[k] === entry) {
+                cache.remove(k)
+                closeEntry(entry, force = true)
+                android.util.Log.w(TAG, "$channel connection evicted after ${cause?.javaClass?.simpleName ?: "error"}")
+            }
+        }
+        return true
+    }
+
+    /** Share removed: take its entry out of the cache (under the key lock, so nothing can
+     *  reuse it), then close it OUTSIDE the lock. A live link closes gracefully — only our lease
+     *  on smbj's pooled connection is released, other shares on the host keep it. A dead link
+     *  (socket closed, or no ECHO reply within [ECHO_TIMEOUT_MS]) is force-closed socket first:
+     *  a graceful tree-disconnect + logoff there each wait out the 30 s request timeout, and
+     *  only the forced close fails the requests still blocked on it. */
+    private fun release(shareId: String, channel: Channel) {
+        val k = key(shareId, channel)
+        val entry = synchronized(lockFor(k)) { cache.remove(k) } ?: return
+        closeEntry(entry, force = releaseForce(entry.connection.isConnected) { answersEcho(entry.connection) })
+    }
+
+    /** Whether [release] must force-close: the socket is already down, or it doesn't answer. */
+    internal fun releaseForce(connected: Boolean, answersEcho: () -> Boolean): Boolean =
+        !connected || !answersEcho()
+
+    /** Tear down every channel's entry for a share — call when the user deletes the share.
+     *  Blocks for up to an ECHO timeout per entry on a dead NAS: call on IO, and don't wait on it. */
     fun closeAllFor(shareId: String) {
-        close(shareId, playback = false)
-        close(shareId, playback = true)
+        Channel.entries.forEach { release(shareId, it) }
     }
 
     @Synchronized
     fun closeAll() {
-        cache.values.forEach { closeEntry(it) }
+        cache.values.forEach { closeEntry(it, force = false) }
         cache.clear()
     }
 

@@ -58,8 +58,9 @@ $ANDROID_HOME/build-tools/<ver>/apksigner verify --print-certs \
     (see that file for hosting options)
 - Complete **Content rating** questionnaire and **Data safety** form. Data-safety
   answers for Dink: no data collected/shared by the developer; all credentials stay
-  on-device (encrypted). Lyric lookups send song title/artist to third-party lyric
-  services — disclose that as "app functionality", not developer collection.
+  on-device (encrypted). Online lyric lookups are OFF by default; when the user turns
+  them on, song title/artist/album/length go to third-party lyric services — disclose
+  that as "app functionality", not developer collection.
 
 ## 5. Pre-launch checklist
 

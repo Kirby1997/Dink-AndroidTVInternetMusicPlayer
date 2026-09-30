@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -19,16 +20,12 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.compose.runtime.snapshotFlow
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.LyricLine
 import com.example.dink_smb_player.data.model.Song
+import com.example.dink_smb_player.lyrics.LyricsStatus
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.withContext
 
 enum class RepeatMode { Off, All, One }
@@ -60,12 +57,19 @@ data class EngineTags(
  * next track and cross over without a re-prepare gap. Mixed queues fall back to
  * one-at-a-time loading.
  *
- * Lyrics: [load], [playFrom], [moveTo] etc. clear [lyrics] synchronously. The
+ * Lyrics: [load], [playFrom], [moveTo] etc. clear [lyrics] synchronously when the
+ * track changes (a same-song replay keeps them). The
  * Composable owner observes [currentSong] and calls [setLyricsFor] once a
  * background resolver returns — keeps the LRC + ID3 file reads off the UI thread.
+ *
+ * Ownership: one process-wide instance ([shared]). [PlayerService] attaches its engine
+ * and runs the poll + persistence loop, so queue advance across engine windows,
+ * error-skip, ImportThrottle and session saves keep working after the activity is gone
+ * (Back out of the app while playing). The UI ([rememberPlayerState]) only observes and
+ * drives it. All access is on the main thread.
  */
 class PlayerState(
-    private val albumLookup: (String?) -> Album? = { null },
+    var albumLookup: (String?) -> Album? = { null },
 ) {
     var currentSong by mutableStateOf<Song?>(null)
         private set
@@ -73,6 +77,14 @@ class PlayerState(
         private set
     var lyrics by mutableStateOf<List<LyricLine>>(emptyList())
         private set
+    /** Song id [lyrics] were resolved for; differs from [currentSong] while resolving. */
+    private var lyricsSongId by mutableStateOf<String?>(null)
+    val lyricsStatus: LyricsStatus
+        get() = when {
+            lyrics.isNotEmpty() -> LyricsStatus.Loaded
+            currentSong != null && lyricsSongId != currentSong?.id -> LyricsStatus.Loading
+            else -> LyricsStatus.None
+        }
     var timeSec by mutableStateOf(0f)
     var isPlaying by mutableStateOf(false)
 
@@ -100,8 +112,28 @@ class PlayerState(
     internal fun markRestoreDone() { sessionRestoreDone = true }
 
     /** Transient, user-facing playback error (e.g. a track whose file vanished from the
-     *  share). Set when a source fails; the UI observes it to toast, then clears it. */
+     *  share). Set when a source fails; the UI observes it and takes it with
+     *  [consumePlaybackError]. Error-skip runs in the service with no UI attached, so an
+     *  error nobody saw must not toast when the app is next opened (see [PLAYBACK_ERROR_TTL_MS]). */
     var playbackError by mutableStateOf<String?>(null)
+        private set
+    private var playbackErrorAtMs = 0L
+
+    /** Monotonic clock for [playbackError] ageing; tests swap it. */
+    internal var clockMs: () -> Long = { SystemClock.elapsedRealtime() }
+
+    private fun reportPlaybackError(msg: String) {
+        playbackErrorAtMs = clockMs()
+        playbackError = msg
+    }
+
+    /** Clears [playbackError] and returns it, or null when it is older than
+     *  [PLAYBACK_ERROR_TTL_MS] — raised while no UI was attached to show it. */
+    fun consumePlaybackError(): String? {
+        val msg = playbackError ?: return null
+        playbackError = null
+        return msg.takeIf { clockMs() - playbackErrorAtMs <= PLAYBACK_ERROR_TTL_MS }
+    }
 
     // Consecutive engine source-errors since the last successful READY. Bounds the
     // auto-skip so an unreachable queue (NAS offline, every path stale) stops instead
@@ -117,7 +149,7 @@ class PlayerState(
     var onMetadataResolved: ((EngineTags) -> Unit)? = null
 
     /** Resolves engine media ids back to library Songs when adopting a live engine
-     *  session (media-button playback resumption). Set by [rememberPlayerState]. */
+     *  session (media-button playback resumption). Set by [shared]. */
     var songResolver: ((List<String>) -> Map<String, Song>)? = null
 
     private var engine: Player? = null
@@ -160,14 +192,20 @@ class PlayerState(
         // resumption handoff that never reached setMediaItems, a service restart).
         // Re-apply at the position the UI is showing instead of no-opping into a
         // dead play button.
-        val player = engine ?: return
-        if (_queue.isNotEmpty() && currentIndex in _queue.indices &&
-            player.mediaItemCount == 0 && currentSong?.mediaUri != null
-        ) {
+        if (engineLostQueue()) {
             pendingSeekMs = (timeSec * 1000).toLong()
             applyQueueToEngine(autoplay = false)
         }
     }
+
+    private fun engineLostQueue(): Boolean {
+        val player = engine ?: return false
+        return _queue.isNotEmpty() && currentIndex in _queue.indices &&
+            player.mediaItemCount == 0 && currentSong?.mediaUri != null
+    }
+
+    /** The engine doesn't hold our queue yet: the next action must do the one full apply. */
+    private fun engineApplyOutstanding(): Boolean = pendingEngineApply || engineLostQueue()
 
     /**
      * Serve a media-button playback resumption from the LIVE session instead of the
@@ -177,14 +215,24 @@ class PlayerState(
      * Null when there's no fully-streamable session — caller falls back to disk.
      * Main-thread only (MediaSession callbacks arrive on the player's looper).
      */
-    fun resumptionWindow(): ResumptionWindow? {
+    fun resumptionWindow(claim: Boolean = true): ResumptionWindow? {
         if (currentIndex !in _queue.indices || !isQueueAllUri()) return null
         val range = windowRange(currentIndex)
         val songs = range.map { _queue[it] }
         val posMs = if (pendingEngineApply) pendingSeekMs else (timeSec * 1000).toLong()
-        engineBase = range.first
-        pendingEngineApply = false
-        pendingSeekMs = 0L
+        // claim = false: a controller only asking what WOULD resume (isForPlayback false);
+        // Media3 won't load it, so the deferred apply must stay pending.
+        if (claim) {
+            engineBase = range.first
+            pendingEngineApply = false
+            pendingSeekMs = 0L
+            // Media3 loads the window itself, so the engine never sees applyQueueToEngine's
+            // mode setup — a restored Repeat One/All must still reach it.
+            engine?.let {
+                it.repeatMode = engineRepeatMode()
+                it.shuffleModeEnabled = false
+            }
+        }
         return ResumptionWindow(
             songs = songs,
             startIndex = currentIndex - range.first,
@@ -229,9 +277,16 @@ class PlayerState(
     fun albumFor(song: Song): Album? = albumLookup(song.albumId)
 
     fun load(song: Song, album: Album?, lyrics: List<LyricLine>, autoplay: Boolean = true) {
+        // Re-loading the track already showing keeps its resolved lyrics — the owner's
+        // resolver is keyed on the song id and won't run again to refill them.
+        if (lyrics.isNotEmpty()) {
+            this.lyrics = lyrics
+            lyricsSongId = song.id
+        } else {
+            clearLyricsOnSongChange(song)
+        }
         currentSong = song
         currentAlbum = album
-        this.lyrics = lyrics
         timeSec = 0f
         isPlaying = autoplay
         pendingSeekMs = 0L
@@ -265,9 +320,9 @@ class PlayerState(
         _queue.addAll(order)
         currentIndex = startIdx
         val song = order[startIdx]
+        clearLyricsOnSongChange(song)
         currentSong = song
         currentAlbum = albumLookup(song.albumId)
-        lyrics = emptyList()
         timeSec = 0f
         isPlaying = autoplay
         pendingSeekMs = 0L
@@ -280,9 +335,9 @@ class PlayerState(
         baseOrder = (if (baseOrder.isEmpty()) _queue.dropLast(1) else baseOrder) + song
         if (wasEmpty || currentIndex < 0 || currentSong == null) {
             currentIndex = _queue.lastIndex
+            clearLyricsOnSongChange(song)
             currentSong = song
             currentAlbum = albumLookup(song.albumId)
-            lyrics = emptyList()
             timeSec = 0f
             isPlaying = true
             pendingSeekMs = 0L
@@ -317,9 +372,9 @@ class PlayerState(
         _queue.clear()
         baseOrder = emptyList()
         currentIndex = -1
+        clearLyricsOnSongChange(null)
         currentSong = null
         currentAlbum = null
-        lyrics = emptyList()
         timeSec = 0f
         isPlaying = false
         engine?.run {
@@ -350,10 +405,16 @@ class PlayerState(
     }
 
     fun seek(sec: Float) {
-        ensureEngineQueueApplied()
         // Unknown duration (streamed track not yet probed) must not clamp every seek to 0.
         timeSec = if (durationSec > 0) sec.coerceIn(0f, durationSec.toFloat()) else sec.coerceAtLeast(0f)
         val song = currentSong
+        if (song?.mediaUri != null && engineApplyOutstanding()) {
+            // Deferred session: prepare straight at the target instead of applying at the
+            // restored spot and then seeking (two opens of the file).
+            pendingSeekMs = (timeSec * 1000).toLong()
+            applyQueueToEngine(autoplay = isPlaying)
+            return
+        }
         if (song?.mediaUri != null) engine?.seekTo((timeSec * 1000).toLong())
     }
 
@@ -385,12 +446,10 @@ class PlayerState(
         _queue.clear()
         _queue.addAll(order)
         currentIndex = order.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
+        // Seed the start position into the rebuild itself so the engine prepares at the
+        // current spot, rather than preparing at 0 and then seeking (a second buffer).
+        pendingSeekMs = if (current.mediaUri != null && pos > 0f) (pos * 1000).toLong() else 0L
         applyQueueToEngine(autoplay = isPlaying)
-        // applyQueueToEngine restarts at 0; keep the current track where it was.
-        if (current.mediaUri != null && pos > 0f) {
-            timeSec = pos
-            engine?.seekTo((pos * 1000).toLong())
-        }
     }
 
     fun cycleRepeatMode() {
@@ -460,7 +519,7 @@ class PlayerState(
         val skipLimit = minOf(_queue.size, MAX_SKIP_ON_ERROR)
         val nextIdx = if (consecutiveErrors <= skipLimit) pickNextIndex(advance = 1) else null
         if (nextIdx != null) {
-            playbackError = "Skipped \"$failedTitle\" — $reason"
+            reportPlaybackError("Skipped \"$failedTitle\" — $reason")
             moveTo(nextIdx)
         } else {
             // Either the queue end, or we've hit the skip budget (likely share offline).
@@ -469,7 +528,7 @@ class PlayerState(
             val hint = if (reason == REASON_NOT_FOUND) {
                 " Re-import the folder to refresh moved files."
             } else ""
-            playbackError = "Can't play \"$failedTitle\" — $reason.$hint"
+            reportPlaybackError("Can't play \"$failedTitle\" — $reason.$hint")
         }
     }
 
@@ -568,9 +627,9 @@ class PlayerState(
         if (q == currentIndex) return
         currentIndex = q
         val song = _queue[q]
+        clearLyricsOnSongChange(song)
         currentSong = song
         currentAlbum = albumLookup(song.albumId)
-        lyrics = emptyList()
         timeSec = 0f
     }
 
@@ -579,6 +638,17 @@ class PlayerState(
     fun setLyricsFor(songId: String, list: List<LyricLine>) {
         if (currentSong?.id != songId) return
         lyrics = list
+        lyricsSongId = songId
+    }
+
+    /** Call BEFORE assigning [currentSong] = [next]. Clears [lyrics] only when the track
+     *  actually changes. Replaying the current song (queue row 0, its Home card, picking
+     *  it in Songs) keeps its lyrics: the owner's resolver is keyed on the song id and
+     *  won't re-run, so wiping them left "No lyrics" until the next track. */
+    private fun clearLyricsOnSongChange(next: Song?) {
+        if (next != null && currentSong?.id == next.id) return
+        lyrics = emptyList()
+        lyricsSongId = null
     }
 
     internal fun pollTick() {
@@ -739,10 +809,12 @@ class PlayerState(
         }
         // While we hold the engine, media-button playback resumption serves the live
         // session (fast, position-accurate) instead of reloading the disk snapshot.
-        PlayerService.liveSession = ::resumptionWindow
+        PlayerService.liveSession = { claim -> resumptionWindow(claim) }
         // Session next/prev (remote keys, system panel) route through the façade so
         // windowed queues, repeat and shuffle behave exactly like the on-screen buttons.
         PlayerService.transport = object : PlayerService.Transport {
+            override val active: Boolean get() = _queue.isNotEmpty()
+            override val current: Song? get() = currentSong
             override fun next() = this@PlayerState.next()
             override fun prev() = this@PlayerState.prev()
         }
@@ -755,6 +827,14 @@ class PlayerState(
         engineListener?.let { player.removeListener(it) }
         engineListener = null
         engine = null
+        // The service (and its engine) is going away but this façade lives on with the
+        // process. Park the session like a restore: paused, applied lazily at the current
+        // spot on the next engine's first play intent (not on its attach).
+        if (currentIndex in _queue.indices) {
+            pendingSeekMs = (timeSec * 1000).toLong()
+            pendingEngineApply = true
+        }
+        setEngineIsPlaying(false)
     }
 
     private fun pickNextIndex(advance: Int): Int? {
@@ -770,20 +850,24 @@ class PlayerState(
     }
 
     private fun moveTo(idx: Int) {
-        ensureEngineQueueApplied()
+        // Deferred session (restored, engine still empty): one apply, straight at the
+        // target. Applying the restored window first and then seeking/rebuilding cost a
+        // second setMediaItems (~0.7 s on Main each) and opened the old track for nothing.
+        val applyOnce = engineApplyOutstanding()
+        pendingEngineApply = false
         // A different track never inherits a resume position. If the engine wasn't bound
         // yet, the deferred restore offset would otherwise survive to the bind-time apply
         // and start this track at the previous track's saved position.
         pendingSeekMs = 0L
         currentIndex = idx
         val song = _queue[idx]
+        clearLyricsOnSongChange(song)
         currentSong = song
         currentAlbum = albumLookup(song.albumId)
-        lyrics = emptyList()
         timeSec = 0f
         isPlaying = true
         val player = engine
-        if (player != null && isQueueAllUri()) {
+        if (player != null && isQueueAllUri() && !applyOnce) {
             val engineIdx = idx - engineBase
             if (engineIdx in 0 until player.mediaItemCount) {
                 // Target is inside the current window — seek, no re-prepare needed
@@ -889,13 +973,28 @@ class PlayerState(
         val start = if (_queue.size <= max) 0
             else (currentIndex - max / 2).coerceIn(0, _queue.size - max)
         val end = minOf(_queue.size, start + max)
+        val ids = _queue.subList(start, end).map { it.id }
         return PlaybackStore.Snapshot(
-            queueIds = _queue.subList(start, end).map { it.id },
+            queueIds = ids,
             index = currentIndex - start,
             positionSec = timeSec,
             shuffle = shuffle,
             repeat = repeatMode.name,
+            baseOrder = if (shuffle) baseOrderIndices(ids) else null,
         )
+    }
+
+    /** Position checkpoint for [PlaybackStore.savePosition]; null when nothing is loaded. */
+    fun positionRecord(): PlaybackStore.Position? =
+        currentSong?.let { PlaybackStore.Position(it.id, timeSec) }
+
+    /** [baseOrder] restricted to the saved window, as indices into [ids] (duplicates
+     *  matched in turn). Null when there's no usable base. */
+    private fun baseOrderIndices(ids: List<String>): List<Int>? {
+        if (baseOrder.isEmpty()) return null
+        val slots = HashMap<String, ArrayDeque<Int>>(ids.size * 2)
+        ids.forEachIndexed { i, id -> slots.getOrPut(id) { ArrayDeque() }.addLast(i) }
+        return baseOrder.mapNotNull { slots[it.id]?.removeFirstOrNull() }.takeIf { it.isNotEmpty() }
     }
 
     /** Rebuild a persisted session. Resolves ids through [byId] (rows deleted from the
@@ -922,12 +1021,16 @@ class PlayerState(
             .let { if (it >= 0) it else snapshot.index.coerceIn(0, songs.lastIndex) }
         _queue.clear()
         _queue.addAll(songs)
-        baseOrder = songs
+        // A shuffled session saved its unshuffled order; without it the shuffled queue
+        // became the "original" and turning shuffle off changed nothing.
+        val base = snapshot.baseOrder?.takeIf { snapshot.shuffle }
+            ?.mapNotNull { i -> snapshot.queueIds.getOrNull(i)?.let { byId[it] } }
+        baseOrder = if (base.isNullOrEmpty()) songs else base
         currentIndex = idx
         val song = songs[idx]
+        clearLyricsOnSongChange(song)
         currentSong = song
         currentAlbum = albumLookup(song.albumId)
-        lyrics = emptyList()
         shuffle = snapshot.shuffle
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeat) }.getOrDefault(RepeatMode.Off)
         val posSec = snapshot.positionSec.coerceAtLeast(0f)
@@ -956,9 +1059,9 @@ class PlayerState(
         val curId = eng.currentMediaItem?.mediaId
         currentIndex = songs.indexOfFirst { it.id == curId }.coerceAtLeast(0)
         val song = songs[currentIndex]
+        clearLyricsOnSongChange(song)
         currentSong = song
         currentAlbum = albumLookup(song.albumId)
-        lyrics = emptyList()
         timeSec = (eng.currentPosition / 1000f).coerceAtLeast(0f)
         isPlaying = eng.isPlaying
         if (songs.size != ids.size) {
@@ -968,55 +1071,72 @@ class PlayerState(
             applyQueueToEngine(autoplay = eng.playWhenReady)
         }
     }
+
+    companion object {
+        /** A [playbackError] older than this when the UI consumes it is dropped. */
+        internal const val PLAYBACK_ERROR_TTL_MS = 5_000L
+
+        private var sharedInstance: PlayerState? = null
+
+        /** The process-wide façade (see class doc), created on first use with the
+         *  library-backed [songResolver]. Main thread only. */
+        fun shared(context: Context): PlayerState {
+            sharedInstance?.let { return it }
+            val appCtx = context.applicationContext
+            return PlayerState().also { state ->
+                // Resolves engine media ids when adopting a session the engine started on
+                // its own (media-button resumption). Only consulted once the engine is
+                // already playing, which implies the library index is restored.
+                state.songResolver = { ids ->
+                    val wanted = ids.toHashSet()
+                    LibraryRepository.songsNow(appCtx)
+                        .asSequence().filter { it.id in wanted }.associateBy { it.id }
+                }
+                sharedInstance = state
+            }
+        }
+
+        /** The façade if this process has created one, without creating it. */
+        fun sharedOrNull(): PlayerState? = sharedInstance
+    }
 }
 
+/**
+ * The UI's handle on the process-wide [PlayerState]. Binding keeps [PlayerService] (which
+ * attaches the engine and runs the poll/persist loop) alive while the UI is up; the
+ * façade itself outlives this composition, so playback bookkeeping continues after the
+ * activity finishes.
+ */
 @Composable
 fun rememberPlayerState(
     albumLookup: (String?) -> Album? = { null },
 ): PlayerState {
     val context = LocalContext.current
-    val state = remember { PlayerState(albumLookup) }
+    val state = remember { PlayerState.shared(context) }
+    state.albumLookup = albumLookup
 
     DisposableEffect(context) {
-        // Installed before binding so attachEngine can adopt a live resumption session.
-        // Only invoked when the engine is already playing at attach — which implies this
-        // process is warm and the library index is restored, so songsNow() has real rows.
-        state.songResolver = { ids ->
-            val wanted = ids.toHashSet()
-            LibraryRepository.songsNow(context.applicationContext)
-                .asSequence().filter { it.id in wanted }.associateBy { it.id }
-        }
         val bindIntent = Intent(context, PlayerService::class.java).apply {
             action = PlayerService.ACTION_BIND_LOCAL
         }
+        // The service attaches its own engine to the shared façade; the binding only
+        // keeps it (and its loop) alive while the UI shows a paused session.
         val connection = object : ServiceConnection {
-            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                val binder = service as? PlayerService.LocalBinder ?: return
-                state.attachEngine(binder.getPlayer())
-            }
-            override fun onServiceDisconnected(name: ComponentName?) {
-                state.detachEngine()
-            }
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) = Unit
+            override fun onServiceDisconnected(name: ComponentName?) = Unit
         }
         val bound = runCatching {
             context.bindService(bindIntent, connection, Context.BIND_AUTO_CREATE)
         }.getOrDefault(false)
         onDispose {
-            state.detachEngine()
             if (bound) runCatching { context.unbindService(connection) }
         }
     }
 
-    LaunchedEffect(state) {
-        while (true) {
-            delay(250L)
-            state.pollTick()
-        }
-    }
-
-    // Resume the last session (paused), then keep it persisted. Restore waits for the
-    // library index so queue ids can resolve to real tracks, and only restores when the
-    // user hasn't already started something this launch.
+    // Resume the last session (paused). Waits for the library index so queue ids can
+    // resolve to real tracks, and only restores when nothing is loaded yet (the user
+    // started something, the service resumed via a media key, or this process already
+    // holds the session from an earlier activity). Saving is PlayerService's job.
     LaunchedEffect(state) {
         val appCtx = context.applicationContext
         // Off main: if this wins the boot race against DinkApp's startup effect, the
@@ -1035,24 +1155,6 @@ fun rememberPlayerState(
         // Unblock Home's fallback preload — either we restored a session, or there was
         // none and Home may load its resume-track shortcut.
         state.markRestoreDone()
-        // Debounced structural saves: fires on track/order/mode changes, not on the 4x/s
-        // position tick. `drop(1)` skips the initial emission (the just-restored state).
-        snapshotFlow { state.saveSignature() }
-            .drop(1)
-            .debounce(800L)
-            .collectLatest {
-                val snap = state.snapshot()
-                if (snap != null) PlaybackStore.save(appCtx, snap) else PlaybackStore.clear(appCtx)
-            }
-    }
-
-    // Low-frequency position checkpoint so a resume lands near where playback actually
-    // is (the structural save above doesn't fire on position alone). Only while playing.
-    LaunchedEffect(state) {
-        while (true) {
-            delay(5000L)
-            if (state.isPlaying) state.snapshot()?.let { PlaybackStore.save(context.applicationContext, it) }
-        }
     }
     return state
 }

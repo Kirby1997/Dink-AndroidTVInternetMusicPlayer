@@ -49,6 +49,7 @@ import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.ui.components.GradientButton
+import com.example.dink_smb_player.ui.components.LocalToast
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.launch
@@ -84,6 +85,7 @@ fun LocalStorageScreen(
     val songs = MediaLibrary.localSongs
     var loading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val toast = LocalToast.current
 
     val permLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -92,7 +94,10 @@ fun LocalStorageScreen(
     LaunchedEffect(hasPermission) {
         if (hasPermission && songs.isEmpty()) {
             loading = true
-            MediaLibrary.refresh(context, force = true)
+            // Not forced: an empty list at launch means the boot scan hasn't landed yet —
+            // queue behind it instead of scanning a second time (LIB-17).
+            MediaLibrary.refresh(context)
+                .onFailure { toast.error("Couldn't save the local library: ${it.message ?: it::class.simpleName}") }
             loading = false
         }
     }
@@ -143,6 +148,7 @@ fun LocalStorageScreen(
                         scope.launch {
                             loading = true
                             MediaLibrary.refresh(context, force = true)
+                                .onFailure { toast.error("Couldn't save the local library: ${it.message ?: it::class.simpleName}") }
                             loading = false
                         }
                     },

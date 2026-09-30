@@ -10,7 +10,10 @@ the remote:
   * FOCUS_LOST   no focused node after a press (focus fell into the void)
   * OFFSCREEN    focused node sits outside the display
   * TRAP         focus did not move for several presses in different directions
-                 (an item you can land on but never leave, or never reach past)
+                 AND LEFT can't reach the rail either (an item you can land on but
+                 never leave). A screen with a single focusable (Local Storage) that
+                 escapes LEFT to the rail is fine, not a trap.
+  * CRASH        the app died (FATAL EXCEPTION in the crash log / process gone)
 
 Zone is decided by testTag first (rail_* / miniplayer), geometry as fallback,
 so it still works on screens whose leaf focusables are untagged.
@@ -18,12 +21,19 @@ so it still works on screens whose leaf focusables are untagged.
 Usage:
   tools/focuscheck.py screen [name]   crawl the screen currently on display
   tools/focuscheck.py tour            visit every rail item, crawl each
+  tools/focuscheck.py smoke           fast rail + Home regression gate
+  tools/focuscheck.py homeshelf       UI-1: scroll each Home shelf past card 0,
+                                      then re-enter it with Up/Down (crash repro)
+  tools/focuscheck.py empty           UI-19: commit Playlists / Now Playing and
+                                      check focus lands in content, not the rail
+                                      (true empty state needs no playlists / no
+                                      saved session, e.g. a fresh install)
 Screenshots land in tools/shots/. Report prints to stdout.
 """
 import os, re, subprocess, sys, time, xml.etree.ElementTree as ET
 
-PKG = "com.example.dink_smb_player"
-ACT = f"{PKG}/.MainActivity"
+PKG = "com.dink.player"  # applicationId; namespace below is the old one
+ACT = f"{PKG}/com.example.dink_smb_player.MainActivity"
 SERIAL = os.environ.get("DINK_SERIAL", "192.168.255.81:5555")
 SHOTS = os.path.join(os.path.dirname(__file__), "shots")
 W, H = 1920, 1080  # override resolution from `wm size`
@@ -117,6 +127,35 @@ SEQ = ["DOWN", "DOWN", "DOWN", "RIGHT", "RIGHT", "DOWN",
        "UP", "UP", "RIGHT", "DOWN", "DOWN", "UP"]
 
 
+def left_reaches_rail():
+    """True if LEFT from the current (content) focus lands on the rail. Restores focus
+    to content afterwards (RIGHT, else re-commit via CENTER)."""
+    press("LEFT")
+    ok = zone(dump()) == "RAIL"
+    if ok:
+        press("RIGHT")
+        if zone(dump()) != "CONTENT":
+            goto_content()
+    return ok
+
+
+def clear_crash_log():
+    adb("logcat", "-b", "crash", "-c", capture=False)
+
+
+def crashed():
+    """Crash summary for our package since clear_crash_log(), '' if none. A missing
+    process also counts (a crash can race the log flush)."""
+    log = adb("logcat", "-b", "crash", "-d")
+    if "FATAL EXCEPTION" in log and PKG in log:
+        # Exception line + the next (Compose puts the message on its own line).
+        m = re.search(r"[\w.$]+(?:Exception|Error):[^\n]*(?:\n[^\n]*)?", log)
+        return " ".join(m.group(0).split()) if m else "FATAL EXCEPTION"
+    if not adb("shell", "pidof", PKG).strip():
+        return "process not running"
+    return ""
+
+
 def crawl(name):
     """Crawl the on-screen content. Assumes focus is already in content."""
     issues, rows = [], []
@@ -124,6 +163,7 @@ def crawl(name):
     rows.append(("start", zone(prev), label(prev)))
     shot(f"{name}_00_start")
     stuck = 0
+    escape_checked = False  # LEFT-escape probe runs at most once per crawl
     for i, key in enumerate(SEQ, 1):
         press(key)
         cur = dump()
@@ -140,7 +180,17 @@ def crawl(name):
         if cur and prev and cur["bounds"] == prev["bounds"] and cur["id"] == prev["id"]:
             stuck += 1
             if stuck >= 4:
-                issues.append(f"TRAP        focus stuck at {label(cur)} for {stuck} presses")
+                # One focusable and nowhere else to go is legitimate as long as LEFT
+                # still reaches the rail; only flag when the user truly can't leave.
+                if escape_checked or zone(cur) != "CONTENT":
+                    pass
+                elif left_reaches_rail():
+                    rows.append(("LEFT", "RAIL", "single focusable; LEFT reaches rail — not a trap"))
+                    cur = dump()
+                else:
+                    issues.append(f"TRAP        focus stuck at {label(cur)} for {stuck} presses "
+                                  f"and LEFT does not reach the rail")
+                escape_checked = True
                 stuck = 0
         else:
             stuck = 0
@@ -152,6 +202,14 @@ def goto_content():
     """From a rail-focused state, commit into the current screen's content."""
     press("CENTER")
     time.sleep(0.7)  # commitNav retries focus into content over ~600ms
+    # Home's hero is gated on session restore (~10 s after a cold launch); until it
+    # composes there is nothing to commit into and focus stays on the rail. Wait for
+    # content before crawling, or the first DOWN is misreported as a DRAWER_LEAK.
+    deadline = time.time() + 15
+    while zone(dump()) == "RAIL" and time.time() < deadline:
+        time.sleep(1.0)
+        press("RIGHT")
+        time.sleep(0.5)
 
 
 def rail_ids():
@@ -234,6 +292,71 @@ def smoke():
     return len(issues)
 
 
+def home_shelf():
+    """UI-1 regression: Home shelves route Up/Down/focus-enter to each shelf's FIRST
+    card. Scrolling a shelf right past card 0 disposes that card; routing focus to its
+    requester then crashed with 'FocusRequester is not initialized'. Walk every
+    route into a scrolled shelf and fail on crash / lost focus."""
+    issues, rows = [], []
+    launch()
+    clear_crash_log()
+    goto_content()  # hero "Continue Playing"
+    right8 = [("RIGHT", "scroll shelf")] * 8
+    steps = (
+        [("DOWN", "hero -> Recently played")] + right8 +
+        [("UP", "Recently (scrolled) -> hero"),
+         ("DOWN", "hero -> Recently: card 0 disposed"),
+         ("DOWN", "Recently -> New in library")] + right8 +
+        [("UP", "New (scrolled) -> Recently (scrolled)"),
+         ("DOWN", "Recently -> New: card 0 disposed"),
+         ("DOWN", "New -> Across your sources")] + right8 +
+        [("UP", "Across -> New (scrolled)"),
+         ("DOWN", "New -> Across: card 0 disposed"),
+         ("DOWN", "Across (scrolled) -> mini player"),
+         ("UP", "mini player -> Across: shelf focus-enter")]
+    )
+    for i, (key, why) in enumerate(steps, 1):
+        press(key)
+        c = crashed()
+        if c:
+            issues.append(f"CRASH       after {key} (step {i}: {why}) — {c}")
+            shot(f"homeshelf_{i:02d}_CRASH")
+            break
+        cur = dump()
+        rows.append((key, zone(cur), f"{label(cur)}  [{why}]"))
+        if cur is None:
+            issues.append(f"FOCUS_LOST  after {key} (step {i}: {why})")
+        elif zone(cur) == "RAIL":
+            issues.append(f"DRAWER_LEAK {key} (step {i}: {why}) opened the rail")
+    shot("homeshelf_end")
+    return report("home shelves (UI-1)", rows, issues)
+
+
+def empty_states():
+    """UI-19 regression: committing a screen from the rail must land focus in its
+    content. Empty Playlists / Now Playing used to have no focusable, so focus stayed
+    in the rail and the drawer stayed open. Checks the invariant whatever the data;
+    the focused label shows whether the empty-state CTA ("Browse songs") was hit."""
+    total = 0
+    for target in ("rail_playlists", "rail_nowplaying"):
+        issues, rows = [], []
+        launch()
+        reached, _ = nav_down_to(target)
+        if not reached:
+            issues.append(f"UNREACHABLE {target}")
+        else:
+            goto_content()
+            cur = dump()
+            rows.append(("CENTER", zone(cur), label(cur)))
+            shot(f"empty_{target}")
+            if zone(cur) != "CONTENT":
+                issues.append("CENTER left focus in the rail — screen has no focus target")
+            elif not left_reaches_rail():
+                issues.append(f"TRAP        LEFT from {label(cur)} does not reach the rail")
+        total += report(f"{target} (UI-19)", rows, issues)
+    return total
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "screen"
     if adb("get-state").strip() != "device":
@@ -241,6 +364,10 @@ def main():
     total = 0
     if mode == "smoke":
         total += smoke()
+        print(f"\nTOTAL ISSUES: {total}  | screenshots: tools/shots/")
+        return 1 if total else 0
+    if mode in ("homeshelf", "empty"):
+        total += home_shelf() if mode == "homeshelf" else empty_states()
         print(f"\nTOTAL ISSUES: {total}  | screenshots: tools/shots/")
         return 1 if total else 0
     if mode == "screen":

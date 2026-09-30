@@ -9,36 +9,27 @@ import com.example.dink_smb_player.data.index.SourceType
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.ConnectionStatus
 import com.example.dink_smb_player.data.model.SmbShare
-import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.data.prefs.EncryptedShareStore
 import com.example.dink_smb_player.data.prefs.SharePrefs
+import com.example.dink_smb_player.data.source.SourceLocks
 import com.example.dink_smb_player.data.source.smb.SmbClient
+import com.example.dink_smb_player.data.source.smb.SmbConnectionRegistry
 import com.example.dink_smb_player.data.source.smb.SmbImporter
-import com.example.dink_smb_player.data.source.smb.SmbSync
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Process-wide store of per-share enumerated SMB tracks. Mirrors [MediaLibrary]
- * but keyed by [SmbShare.id] so multiple shares stay independent and SmbSharesScreen
- * can render per-share track counts without re-walking the network.
- *
- * Sync triggers:
- *   - [SmbSharesScreen] "Sync" button or first focus on a share row
- *   - [com.example.dink_smb_player.ui.screens.sources.AddShareWizard] "Finish" step
- *   - boot-time silent refresh for shares with [com.example.dink_smb_player.data.model.SyncSchedule.Auto]
+ * Process-wide SMB share state for the sources UI: per-share import / delete progress
+ * and errors, plus the folder import / remove / monitor actions that reconcile a share
+ * into the library index ([LibraryRepository]).
  */
 object SharesLibrary {
 
-    val songsByShare = mutableStateMapOf<String, List<Song>>()
     val errorsByShare = mutableStateMapOf<String, String>()
-    val syncingShares = mutableStateMapOf<String, Boolean>()
 
     /** True while a folder import / re-import into the library index is running. */
     val importingShares = mutableStateMapOf<String, Boolean>()
@@ -54,43 +45,63 @@ object SharesLibrary {
 
     val importProgress = mutableStateMapOf<String, ImportProgress>()
 
-    /** App-lifetime scope so a sync (and its status write) survives the user
-     *  navigating away from SmbSharesScreen. */
+    /** App-lifetime scope so an import / delete (and its status write) survives the
+     *  user navigating away from SmbSharesScreen. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val jobs = mutableMapOf<String, Job>()
 
     /** Currently-browsed share id. Set when SmbSharesScreen card is opened or when
      *  AddShareWizard finishes a save. Cleared on Back from the browse screen. */
     var activeBrowseShareId: String? by mutableStateOf(null)
 
-    fun allSongs(): List<Song> = songsByShare.values.flatten()
+    /** Shares whose delete is in flight (cancelling jobs, dropping rows). The browse
+     *  screen shows "Deleting…" meanwhile; cleared when the delete finishes. */
+    val deletingShares = mutableStateMapOf<String, Boolean>()
 
-    /** Launch (or no-op if already running) a cancellable sync on the app scope. */
-    fun startSync(context: Context, share: SmbShare) {
-        if (jobs[share.id]?.isActive == true) return
+    /** Remove a share entirely: cancel + wait out any in-flight import/monitor walk
+     *  for it (so none can re-add rows afterwards), then drop its indexed tracks,
+     *  encrypted creds and config. [onDone] runs on Main once the delete has finished
+     *  (null) or failed — callers confirm to the user only then. */
+    fun deleteShare(context: Context, shareId: String, onDone: (Throwable?) -> Unit = {}) {
         val appContext = context.applicationContext
-        jobs[share.id] = scope.launch { sync(appContext, share) }
-    }
-
-    /** Cancel an in-flight sync. The job's CancellationException handler in
-     *  [sync] reverts the persisted status to Idle. */
-    fun stopSync(shareId: String) {
-        jobs.remove(shareId)?.cancel()
-        syncingShares[shareId] = false
-    }
-
-    /** Remove a share entirely: stop sync, drop cached tracks, delete config +
-     *  encrypted creds, and tear down any live connection. */
-    fun deleteShare(context: Context, shareId: String) {
-        jobs.remove(shareId)?.cancel()
-        clear(shareId)
-        if (activeBrowseShareId == shareId) activeBrowseShareId = null
-        val appContext = context.applicationContext
+        deletingShares[shareId] = true
         scope.launch {
-            runCatching { SmbClient.closeAllFor(shareId) }
-            LibraryRepository.removeSource(appContext, SourceType.Smb, shareId)
-            EncryptedShareStore.get(appContext).deleteSmbCreds(shareId)
-            SharePrefs(appContext).deleteShare(shareId)
+            val err = runCatching {
+                SourceLocks.remove(
+                    shareId,
+                    afterCancel = {
+                        // The share is tombstoned now, so SmbClient refuses to reconnect it (a
+                        // retag / art / lyric read can't re-create its session). Drop it from
+                        // the registry too, then release its connections on IO without waiting:
+                        // on a dead NAS the release force-closes the socket, which is what makes
+                        // a walk blocked in a list()/tag read fail at once instead of sitting out
+                        // the 30 s request timeout before it sees the cancel. A graceful
+                        // tree-disconnect/logoff there would itself wait out that timeout.
+                        SmbConnectionRegistry.remove(shareId)
+                        scope.launch(Dispatchers.IO) { runCatching { SmbClient.closeAllFor(shareId) } }
+                    },
+                ) {
+                    LibraryRepository.removeSource(appContext, SourceType.Smb, shareId)
+                    EncryptedShareStore.get(appContext).deleteSmbCreds(shareId)
+                    SharePrefs(appContext).deleteShare(shareId)
+                }
+            }.exceptionOrNull()
+            if (err != null) {
+                android.util.Log.e("SharesLibrary", "delete failed id=$shareId", err)
+                // The tombstone is lifted on failure: make the share resolvable again.
+                runCatching { SmbConnectionRegistry.hydrate(appContext) }
+            }
+            withContext(Dispatchers.Main) {
+                deletingShares.remove(shareId)
+                if (err == null) {
+                    clear(shareId)
+                    importingShares.remove(shareId)
+                    importProgress.remove(shareId)
+                    lastImportedCount.remove(shareId)
+                    folderIssues.remove(shareId)
+                    if (activeBrowseShareId == shareId) activeBrowseShareId = null
+                }
+                onDone(err)
+            }
         }
     }
 
@@ -100,39 +111,66 @@ object SharesLibrary {
      *  the folder. */
     fun importFolder(context: Context, share: SmbShare, smbPath: String) {
         val appContext = context.applicationContext
-        // Importing a folder also MONITORS it — so files added on the NAS later are
-        // auto-indexed without the user toggling anything. (Monitor can still be turned
-        // off per-folder in the browser.)
-        val updated = share.copy(
-            importPaths = (share.importPaths + smbPath).distinct(),
-            monitoredPaths = (share.monitoredPaths + smbPath).distinct(),
-        )
         scope.launch {
-            SharePrefs(appContext).saveShare(updated)
-            runImportFolder(appContext, updated, smbPath)
+            // Importing a folder also MONITORS it — so files added on the NAS later are
+            // auto-indexed without the user toggling anything. (Monitor can still be turned
+            // off per-folder in the browser.) Applied to the CURRENT stored share, not the
+            // screen's copy; null = the share was deleted meanwhile.
+            SharePrefs(appContext).updateShare(share.id) {
+                it.copy(
+                    importPaths = (it.importPaths + smbPath).distinct(),
+                    monitoredPaths = (it.monitoredPaths + smbPath).distinct(),
+                )
+            } ?: return@launch
+            SourceLocks.runExclusive(share.id, listOf(smbPath)) {
+                runImportFolder(appContext, share.id, smbPath)
+            }
             com.example.dink_smb_player.data.source.MonitorWorker.reschedule(appContext)
         }
     }
 
     /** Remove an imported folder: drop it (and any monitor flag) from the share's
-     *  roots and prune its tracks from the index, leaving sibling folders intact. */
-    fun removeImportedFolder(context: Context, share: SmbShare, smbPath: String) {
+     *  roots and prune its tracks from the index, leaving sibling folders intact.
+     *  [onDone] runs on Main when the prune has finished (null) or failed. */
+    fun removeImportedFolder(
+        context: Context,
+        share: SmbShare,
+        smbPath: String,
+        onDone: (Throwable?) -> Unit = {},
+    ) {
         val appContext = context.applicationContext
-        val updated = share.copy(
-            importPaths = share.importPaths.filter { it != smbPath },
-            monitoredPaths = share.monitoredPaths.filter { it != smbPath },
-        )
         scope.launch {
-            SharePrefs(appContext).saveShare(updated)
-            val total = LibraryRepository.importScoped(
-                appContext,
-                SmbImporter.sourceEntityFor(updated, 0, 0L),
-                freshTracks = emptyList(),
-                scopePrefixes = listOf(SmbImporter.monitoredPrefix(share, smbPath)),
-            )
-            SharePrefs(appContext).saveShare(updated.copy(trackCount = total))
-            com.example.dink_smb_player.data.source.MonitorWorker.reschedule(appContext)
+            val err = runCatching { removeImportedFolderNow(appContext, share, smbPath) }.exceptionOrNull()
+            if (err != null) android.util.Log.e("SharesLibrary", "remove folder failed id=${share.id} path=$smbPath", err)
+            withContext(Dispatchers.Main) { onDone(err) }
         }
+    }
+
+    private suspend fun removeImportedFolderNow(appContext: Context, share: SmbShare, smbPath: String) {
+        val prefs = SharePrefs(appContext)
+        prefs.updateShare(share.id) {
+            it.copy(
+                importPaths = it.importPaths.filter { p -> p != smbPath },
+                monitoredPaths = it.monitoredPaths.filter { p -> p != smbPath },
+            )
+        } ?: return
+        // An import (or monitor pass) of this folder still in flight would re-add its
+        // rows after the prune below — stop it first.
+        SourceLocks.cancelOverlapping(share.id, listOf(smbPath))
+        SourceLocks.runExclusive<Unit>(share.id, listOf(smbPath)) {
+            // Re-read under the lock: skip if the share was deleted while we waited
+            // (importScoped would re-create its source row).
+            val fresh = prefs.shares.first().firstOrNull { it.id == share.id } ?: return@runExclusive
+            // A failed write throws: the caller reports "Couldn't remove", not "Removed".
+            LibraryRepository.importScoped(
+                appContext,
+                SmbImporter.sourceEntityFor(fresh, 0, 0L),
+                freshTracks = emptyList(),
+                scopePrefixes = listOf(SmbImporter.monitoredPrefix(fresh, smbPath)),
+            ).getOrThrow()
+            refreshShareStats(appContext, prefs, share.id, synced = false)
+        }
+        com.example.dink_smb_player.data.source.MonitorWorker.reschedule(appContext)
     }
 
     /** Toggle background monitoring for a single folder ([smbPath]; "" = whole share).
@@ -140,24 +178,34 @@ object SharesLibrary {
      *  disabling leaves the already-imported tracks in place. */
     fun setFolderMonitored(context: Context, share: SmbShare, smbPath: String, enabled: Boolean) {
         val appContext = context.applicationContext
-        val updated = if (enabled) {
-            share.copy(
-                importPaths = (share.importPaths + smbPath).distinct(),
-                monitoredPaths = (share.monitoredPaths + smbPath).distinct(),
-            )
-        } else {
-            share.copy(monitoredPaths = share.monitoredPaths.filter { it != smbPath })
-        }
         scope.launch {
-            SharePrefs(appContext).saveShare(updated)
-            if (enabled) runImportFolder(appContext, updated, smbPath)
+            SharePrefs(appContext).updateShare(share.id) {
+                if (enabled) {
+                    it.copy(
+                        importPaths = (it.importPaths + smbPath).distinct(),
+                        monitoredPaths = (it.monitoredPaths + smbPath).distinct(),
+                    )
+                } else {
+                    it.copy(monitoredPaths = it.monitoredPaths.filter { p -> p != smbPath })
+                }
+            } ?: return@launch
+            if (enabled) {
+                SourceLocks.runExclusive(share.id, listOf(smbPath)) {
+                    runImportFolder(appContext, share.id, smbPath)
+                }
+            }
             com.example.dink_smb_player.data.source.MonitorWorker.reschedule(appContext)
         }
     }
 
     /** Enumerate ONLY [smbPath] (+ subfolders) and reconcile it into the index
-     *  without touching the share's other imported folders. ("" = whole share.) */
-    private suspend fun runImportFolder(context: Context, share: SmbShare, smbPath: String) {
+     *  without touching the share's other imported folders. ("" = whole share.)
+     *  Call under [SourceLocks.runExclusive] for [shareId]. */
+    private suspend fun runImportFolder(context: Context, shareId: String, smbPath: String) {
+        // Fresh read under the source lock — the caller's copy may predate a delete or
+        // another folder edit. Gone = deleted while this import was queued.
+        val prefs = SharePrefs(context)
+        val share = prefs.shares.first().firstOrNull { it.id == shareId } ?: return
         importingShares[share.id] = true
         importProgress[share.id] = ImportProgress(0)
         val importStartMs = System.currentTimeMillis()
@@ -184,21 +232,25 @@ object SharesLibrary {
                     if (!res.complete) {
                         android.util.Log.w("SharesLibrary", "import walk incomplete id=${share.id} path=$smbPath — upsert-only, not pruning (would lose unseen tracks)")
                     }
+                    // The folder itself is gone / unreadable: report it (the end-of-import
+                    // toast reads errorsByShare) instead of a silent "Imported 0".
+                    SmbImporter.describeRootIssues(res.rootIssues)?.let { errorsByShare[share.id] = it }
                     val total = LibraryRepository.importScoped(
                         context,
                         SmbImporter.sourceEntityFor(share, tracks.size, tracks.sumOf { it.sizeBytes }),
                         freshTracks = tracks,
                         scopePrefixes = listOf(SmbImporter.monitoredPrefix(share, smbPath)),
                         prune = res.complete,
-                    )
+                    ).getOrElse { t ->
+                        // Indexed in memory but not saved: gone on restart. Report it as a failed
+                        // import (the browser toasts errorsByShare), not "Imported N" / Connected.
+                        errorsByShare[share.id] = "library couldn't be saved (${t.message ?: t::class.simpleName})"
+                        android.util.Log.e("SharesLibrary", "import not saved id=${share.id} path=$smbPath", t)
+                        return@onSuccess
+                    }
                     lastImportedCount[share.id] = total
-                    SharePrefs(context).saveShare(
-                        share.copy(
-                            status = ConnectionStatus.Connected,
-                            trackCount = total,
-                            lastSyncMs = System.currentTimeMillis(),
-                        ),
-                    )
+                    prefs.updateShare(share.id) { it.copy(status = ConnectionStatus.Connected) }
+                    refreshShareStats(context, prefs, share.id, synced = true)
                 }
                 .onFailure { t ->
                     errorsByShare[share.id] = t.message ?: t::class.simpleName.orEmpty()
@@ -210,45 +262,40 @@ object SharesLibrary {
         }
     }
 
-    suspend fun sync(context: Context, share: SmbShare) {
-        val prefs = SharePrefs(context.applicationContext)
-        val store = EncryptedShareStore.get(context.applicationContext)
-        val creds = store.getSmbCreds(share.id)
-        syncingShares[share.id] = true
-        errorsByShare.remove(share.id)
-        prefs.saveShare(share.copy(status = ConnectionStatus.Syncing))
-        try {
-            val result = withContext(Dispatchers.IO) { SmbSync.enumerate(share, creds) }
-            result
-                .onSuccess { songs ->
-                    songsByShare[share.id] = songs
-                    prefs.saveShare(
-                        share.copy(
-                            status = ConnectionStatus.Connected,
-                            trackCount = songs.size,
-                            lastSyncMs = System.currentTimeMillis(),
-                        ),
-                    )
-                }
-                .onFailure { t ->
-                    errorsByShare[share.id] = t.message ?: t::class.simpleName.orEmpty()
-                    android.util.Log.e("SharesLibrary", "sync failed id=${share.id} host=${share.host}", t)
-                    prefs.saveShare(share.copy(status = ConnectionStatus.Offline))
-                }
-        } catch (c: CancellationException) {
-            // Stopped by the user — persist Idle even though the scope is cancelling.
-            withContext(NonCancellable) {
-                prefs.saveShare(share.copy(status = ConnectionStatus.Idle))
-            }
-            throw c
-        } finally {
-            syncingShares[share.id] = false
+    fun clear(shareId: String) {
+        errorsByShare.remove(shareId)
+    }
+
+    /** Monitor-pass status per share: the message last set by [setFolderIssue]. */
+    private val folderIssues = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Bring the share card's stats in line with the library: track count and total size
+     * come from the indexed rows of this share (not from whichever folder was last
+     * imported), and [synced] stamps "synced just now" — pass it only for a completed
+     * import or a clean monitor pass. No-op if the share was deleted meanwhile.
+     */
+    suspend fun refreshShareStats(context: Context, prefs: SharePrefs, shareId: String, synced: Boolean) {
+        val rows = LibraryRepository.sourceTrackMap(context, SourceType.Smb, shareId).values
+        val bytes = rows.sumOf { it.sizeBytes }
+        prefs.updateShare(shareId) {
+            it.copy(
+                trackCount = rows.size,
+                sizeBytes = bytes,
+                lastSyncMs = if (synced) System.currentTimeMillis() else it.lastSyncMs,
+            )
         }
     }
 
-    fun clear(shareId: String) {
-        songsByShare.remove(shareId)
-        errorsByShare.remove(shareId)
-        syncingShares.remove(shareId)
+    /** Show [message] (a monitored folder is gone / unreadable) as the share's error, or with
+     *  null clear the one this set before — leaving any other error (a failed import) alone. */
+    fun setFolderIssue(shareId: String, message: String?) {
+        if (message != null) {
+            folderIssues[shareId] = message
+            errorsByShare[shareId] = message
+        } else {
+            val prev = folderIssues.remove(shareId) ?: return
+            if (errorsByShare[shareId] == prev) errorsByShare.remove(shareId)
+        }
     }
 }

@@ -5,9 +5,10 @@
     <uses-feature
         android:name="android.hardware.touchscreen"
         android:required="false" />
+    <!-- TV-only: the UI is D-pad driven, so don't offer it to phones/tablets. -->
     <uses-feature
         android:name="android.software.leanback"
-        android:required="false" />
+        android:required="true" />
     <!-- Many AndroidTV boxes (Nvidia Shield, generic AOSP TV) expose USB-A host ports.
          Required="false" so devices without USB host still install. -->
     <uses-feature
@@ -19,7 +20,7 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
 
-    <!-- Online lyric lookup (LRCLIB and future NetEase/QQ/Musixmatch). -->
+    <!-- SMB/cloud streaming and opt-in online lyric lookups. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
@@ -61,9 +62,11 @@
              swiped away / process dead): starts PlayerService, whose
              onPlaybackResumption() rebuilds the queue from PlaybackStore. Also silences
              the framework's "couldn't find a unique registered media button receiver"
-             warning that made key routing flaky after other media apps died. -->
+             warning that made key routing flaky after other media apps died.
+             Dink's subclass skips the service start when there's no session to resume
+             (a foreground start with nothing to play crashed the app, PLAY-1). -->
         <receiver
-            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:name=".player.DinkMediaButtonReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MEDIA_BUTTON" />

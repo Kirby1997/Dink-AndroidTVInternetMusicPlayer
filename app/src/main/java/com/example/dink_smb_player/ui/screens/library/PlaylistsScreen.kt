@@ -20,10 +20,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.MusicNote
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.QueueMusic
 import androidx.compose.runtime.Composable
@@ -31,7 +32,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,12 +47,17 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.example.dink_smb_player.ui.components.LocalToast
+import com.example.dink_smb_player.DinkApplication
+import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.library.PlaylistRepository
 import com.example.dink_smb_player.data.model.Playlist
+import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.player.PlayerState
+import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.launch
@@ -73,12 +78,18 @@ fun PlaylistsScreen(
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
     val railRequester = LocalRailFocusRequester.current
+    val contentFocus = LocalContentFocus.current
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val toast = LocalToast.current
+    val appScope = (context.applicationContext as DinkApplication).appScope
 
     val playlists by PlaylistRepository.playlists.collectAsState()
     val libraryFlow = remember(context) { LibraryRepository.songs(context) }
     val library by libraryFlow.collectAsState()
+    // Index the library once per emission. songsOf() rebuilt this 25k-entry map for
+    // every visible row on every recomposition.
+    val songsById = remember(library) { library.associateBy { it.id } }
+    fun resolve(pl: Playlist): List<Song> = pl.songIds.mapNotNull { songsById[it] }
 
     var menuFor by remember { mutableStateOf<Playlist?>(null) }
 
@@ -99,23 +110,35 @@ fun PlaylistsScreen(
                 style = type.body.copy(color = palette.ink3),
                 maxLines = 2,
             )
+            Spacer(Modifier.height(20.dp))
+            // A focus target: with nothing focusable a drawer commit had nowhere to land,
+            // so the drawer stayed open over an empty screen (UI-19). Also the way forward.
+            GradientButton(
+                label = "Browse songs",
+                leadingIcon = Icons.Outlined.MusicNote,
+                onClick = { onNavigate(ScreenId.Songs) },
+                height = 48.dp,
+                modifier = Modifier.focusRequester(contentFocus).focusProperties { left = railRequester },
+            )
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(playlists, key = { it.id }) { pl ->
-                    val resolved = PlaylistRepository.songsOf(pl, library)
+                itemsIndexed(playlists, key = { _, pl -> pl.id }) { idx, pl ->
+                    val resolved = remember(pl, songsById) { resolve(pl) }
                     PlaylistRow(
                         name = pl.name,
                         subtitle = "${resolved.size} tracks",
                         railRequester = railRequester,
+                        // First row takes contentFocus so a drawer commit lands in the list.
+                        modifier = if (idx == 0) Modifier.focusRequester(contentFocus) else Modifier,
                         onClick = {
                             if (resolved.isNotEmpty()) {
                                 player.playFrom(resolved, 0)
                                 onNavigate(ScreenId.NowPlaying)
                             } else {
-                                onToast("Playlist is empty (or its source is offline)")
+                                toast.error("Playlist is empty (or its source is offline)")
                             }
                         },
                         onLongClick = { menuFor = pl },
@@ -126,7 +149,7 @@ fun PlaylistsScreen(
     }
 
     menuFor?.let { pl ->
-        val resolved = PlaylistRepository.songsOf(pl, library)
+        val resolved = remember(pl, songsById) { resolve(pl) }
         PlaylistActionsDialog(
             playlist = pl,
             onPlay = {
@@ -134,12 +157,17 @@ fun PlaylistsScreen(
                 if (resolved.isNotEmpty()) {
                     player.playFrom(resolved, 0)
                     onNavigate(ScreenId.NowPlaying)
-                } else onToast("Playlist is empty")
+                } else toast.error("Playlist is empty")
             },
             onDelete = {
                 menuFor = null
-                scope.launch { PlaylistRepository.delete(context, pl.id) }
-                onToast("Deleted “${pl.name}”")
+                // Process-lifetime scope: navigating away mustn't cancel the write, and the
+                // toast waits for the repository to confirm it's on disk.
+                val appContext = context.applicationContext
+                appScope.launch {
+                    if (PlaylistRepository.delete(appContext, pl.id)) onToast("Deleted “${pl.name}”")
+                    else toast.error("Couldn't delete “${pl.name}”")
+                }
             },
             onDismiss = { menuFor = null },
         )
@@ -153,6 +181,7 @@ private fun PlaylistRow(
     railRequester: FocusRequester,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
@@ -168,7 +197,7 @@ private fun PlaylistRow(
             focusedContentColor = palette.ink0,
         ),
         interactionSource = interaction,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .height(64.dp)
             .focusProperties { left = railRequester },

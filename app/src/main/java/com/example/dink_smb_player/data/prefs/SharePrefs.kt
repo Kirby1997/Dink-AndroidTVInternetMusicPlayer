@@ -2,8 +2,10 @@ package com.example.dink_smb_player.data.prefs
 
 import android.content.Context
 import android.util.Log
+import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -32,43 +34,78 @@ private val CLOUD_PROVIDERS_KEY = stringSetPreferencesKey("cloud_providers_json"
  *
  * Addresses Plan.txt pain #1: shares + providers survive process death and reboot.
  */
-class SharePrefs(private val context: Context) {
+class SharePrefs internal constructor(private val store: DataStore<Preferences>) {
+
+    constructor(context: Context) : this(context.shareDataStore)
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    val shares: Flow<List<SmbShare>> = context.shareDataStore.data
+    val shares: Flow<List<SmbShare>> = store.data
         .catch { e -> Log.e("SharePrefs", "shares read failed, emitting empty", e); emit(emptyPreferences()) }
         .map { prefs -> decodeSet<SmbShare>(prefs[SMB_SHARES_KEY]) }
 
-    val providers: Flow<List<CloudProvider>> = context.shareDataStore.data
+    val providers: Flow<List<CloudProvider>> = store.data
         .catch { e -> Log.e("SharePrefs", "providers read failed, emitting empty", e); emit(emptyPreferences()) }
         .map { prefs -> decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY]) }
 
     suspend fun saveShare(share: SmbShare) {
-        context.shareDataStore.edit { prefs ->
+        store.edit { prefs ->
             val current = decodeSet<SmbShare>(prefs[SMB_SHARES_KEY])
             val next = current.filter { it.id != share.id } + share
             prefs[SMB_SHARES_KEY] = encodeSet(next)
         }
     }
 
+    /**
+     * Read-modify-write of ONE share against its CURRENT stored value, atomically inside
+     * [DataStore.edit]. Use this — not [saveShare] with a copy taken earlier — for every
+     * write-back after async work (import completion stamps, folder ticks, monitor
+     * stamps): a stale copy would clobber concurrent edits and, worse, re-insert a share
+     * the user deleted mid-import. No-op (returns null) when [id] is no longer stored;
+     * otherwise returns the updated share. [transform] must keep the id.
+     */
+    suspend fun updateShare(id: String, transform: (SmbShare) -> SmbShare): SmbShare? {
+        var updated: SmbShare? = null
+        store.edit { prefs ->
+            val current = decodeSet<SmbShare>(prefs[SMB_SHARES_KEY])
+            val existing = current.firstOrNull { it.id == id } ?: return@edit
+            val next = transform(existing).copy(id = id)
+            prefs[SMB_SHARES_KEY] = encodeSet(current.map { if (it.id == id) next else it })
+            updated = next
+        }
+        return updated
+    }
+
     suspend fun deleteShare(id: String) {
-        context.shareDataStore.edit { prefs ->
+        store.edit { prefs ->
             val current = decodeSet<SmbShare>(prefs[SMB_SHARES_KEY])
             prefs[SMB_SHARES_KEY] = encodeSet(current.filter { it.id != id })
         }
     }
 
     suspend fun saveProvider(provider: CloudProvider) {
-        context.shareDataStore.edit { prefs ->
+        store.edit { prefs ->
             val current = decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
             val next = current.filter { it.id != provider.id } + provider
             prefs[CLOUD_PROVIDERS_KEY] = encodeSet(next)
         }
     }
 
+    /** [updateShare] for cloud providers: no-op (null) if the provider was deleted. */
+    suspend fun updateProvider(id: String, transform: (CloudProvider) -> CloudProvider): CloudProvider? {
+        var updated: CloudProvider? = null
+        store.edit { prefs ->
+            val current = decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
+            val existing = current.firstOrNull { it.id == id } ?: return@edit
+            val next = transform(existing).copy(id = id)
+            prefs[CLOUD_PROVIDERS_KEY] = encodeSet(current.map { if (it.id == id) next else it })
+            updated = next
+        }
+        return updated
+    }
+
     suspend fun deleteProvider(id: String) {
-        context.shareDataStore.edit { prefs ->
+        store.edit { prefs ->
             val current = decodeSet<CloudProvider>(prefs[CLOUD_PROVIDERS_KEY])
             prefs[CLOUD_PROVIDERS_KEY] = encodeSet(current.filter { it.id != id })
         }

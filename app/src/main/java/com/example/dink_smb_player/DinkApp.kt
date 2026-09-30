@@ -13,12 +13,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.staticCompositionLocalOf
 import kotlinx.coroutines.delay
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -46,6 +51,7 @@ import com.example.dink_smb_player.data.library.PlaylistRepository
 import com.example.dink_smb_player.lyrics.LyricChain
 import com.example.dink_smb_player.lyrics.LyricPrefs
 import com.example.dink_smb_player.lyrics.LyricSettings
+import com.example.dink_smb_player.lyrics.toDisplayLines
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -57,6 +63,7 @@ import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.player.rememberPlayerState
 import com.example.dink_smb_player.ui.components.DinkDrawerContent
 import com.example.dink_smb_player.ui.components.ExitConfirmDialog
+import com.example.dink_smb_player.ui.components.LocalToast
 import com.example.dink_smb_player.ui.components.MiniPlayer
 import com.example.dink_smb_player.ui.components.MiniPlayerState
 import com.example.dink_smb_player.ui.components.PlaceholderScreen
@@ -72,6 +79,7 @@ import com.example.dink_smb_player.ui.screens.library.albumGroups
 import com.example.dink_smb_player.ui.screens.library.artistGroups
 import com.example.dink_smb_player.ui.screens.library.folderGroups
 import com.example.dink_smb_player.ui.screens.library.PlaylistsScreen
+import com.example.dink_smb_player.ui.screens.library.SearchMemo
 import com.example.dink_smb_player.ui.screens.library.SearchScreen
 import com.example.dink_smb_player.ui.screens.library.SongsScreen
 import com.example.dink_smb_player.ui.screens.nowplaying.NowPlayingScreen
@@ -115,47 +123,50 @@ fun DinkApp() {
     // Persist tags the engine extracts while streaming (Phase 8.7) into the index.
     // Surface playback source errors (e.g. a track whose file was moved/deleted on the
     // share) as a toast — PlayerState auto-skips the bad track, this just tells the user.
+    // consumePlaybackError drops an error raised long ago with no UI attached (service-side
+    // error-skip while the app was closed), so it doesn't toast on the next open.
     LaunchedEffect(player.playbackError) {
-        val msg = player.playbackError ?: return@LaunchedEffect
-        toast.show(msg)
-        player.playbackError = null
+        val msg = player.consumePlaybackError() ?: return@LaunchedEffect
+        toast.error(msg)
     }
 
-    LaunchedEffect(player) {
-        val app = context.applicationContext as? DinkApplication
-        player.onMetadataResolved = { tags ->
-            app?.appScope?.launch(Dispatchers.IO) {
-                LibraryRepository.enrichTrack(
-                    context, tags.songId, tags.title, tags.artist, tags.album,
-                    tags.year, tags.trackNumber, tags.durationMs,
-                )
+    // Tell the user (once) if the secure credential store had to be wiped or can't be
+    // opened — otherwise shares just start failing auth with no explanation.
+    LaunchedEffect(Unit) {
+        EncryptedShareStore.notice.collect { notice ->
+            when (notice ?: return@collect) {
+                EncryptedShareStore.Notice.Reset ->
+                    toast.error("Saved share passwords were reset — re-enter them in Sources")
+                EncryptedShareStore.Notice.Unavailable ->
+                    toast.error("Secure storage unavailable — passwords won't be saved")
             }
-        }
-        // Stamp lastPlayed/playCount once a track has genuinely been listened to (see
-        // PlayerState.onTrackPlayed) so "Recently played" + the Home resume hero reflect
-        // real plays — not a restored session, a Home preload, or tracks skipped past.
-        player.onTrackPlayed = { songId ->
-            app?.appScope?.launch(Dispatchers.Default) {
-                LibraryRepository.markPlayed(context, songId)
-            }
+            EncryptedShareStore.acknowledgeNotice(context)
         }
     }
+
+    // Library sinks (play credit → markPlayed, engine tags → enrichTrack) are bound once per
+    // process in DinkApplication, not here: plays must count with no UI (media-key cold start).
 
     // Re-resolves when the title changes too, so enrichment (dirty filename → real
-    // tag title) re-runs the lyric chain with the accurate name.
-    LaunchedEffect(player.currentSong?.id, player.currentSong?.title) {
+    // tag title) re-runs the lyric chain with the accurate name — and when the lyric
+    // settings change what the chain may consult (e.g. Online lyrics switched on), so the
+    // current track refetches instead of waiting for the next one. Re-keying cancels an
+    // in-flight resolve started under the old settings.
+    val lyricFingerprint by LyricSettings.fingerprintFlow.collectAsState()
+    LaunchedEffect(player.currentSong?.id, player.currentSong?.title, lyricFingerprint) {
         val song = player.currentSong ?: return@LaunchedEffect
         if (song.mediaUri == null && song.id != PreviewMockData.songIxion.id) return@LaunchedEffect
         // A restored/preloaded track sits paused at launch; don't fire the provider chain
         // (up to a dozen network lookups + parsing) into the launch window for it. Resolve
         // once it plays or Now Playing is opened.
         snapshotFlow { player.isPlaying || nav.current == ScreenId.NowPlaying }.first { it }
-        val resolved = withContext(Dispatchers.IO) {
-            val chain = LyricChain.resolve(context, song)
+        // resolve() suspends and is cancellable: a skip re-keys this effect, which cancels
+        // the previous track's in-flight lookups instead of letting them pile up (LYR-8).
+        val chain = LyricChain.resolve(context, song).toDisplayLines(song.durationSec)
+        val resolved =
             if (chain.isNotEmpty()) chain
             else if (song.id == PreviewMockData.songIxion.id) PreviewMockData.sampleLyrics
             else emptyList()
-        }
         player.setLyricsFor(song.id, resolved)
     }
 
@@ -233,9 +244,12 @@ fun DinkApp() {
     // Home, etc.) must bounce focus to the new screen's primary focusable;
     // otherwise the old screen's button loses focus → Compose picks a drawer
     // rail item → drawer expands on the wrong screen.
-    var commitTarget: ScreenId? by remember { mutableStateOf(null) }
-    LaunchedEffect(commitTarget) {
-        val t = commitTarget ?: return@LaunchedEffect
+    // Keyed on a per-commit counter, not the target screen: re-committing the screen
+    // already shown (Enter on its own rail item) left the key unchanged, so the effect
+    // never re-ran and focus stayed on the rail.
+    var commitSeq by remember { mutableIntStateOf(0) }
+    LaunchedEffect(commitSeq) {
+        if (commitSeq == 0) return@LaunchedEffect
         // A single fixed delay races with the new screen's composition/layout
         // (data-heavy screens like LazyGrid take longer than any guess), so the
         // request no-ops and focus drifts onto the rail or mini-player. Retry
@@ -246,63 +260,44 @@ fun DinkApp() {
             delay(40)
             if (runCatching { contentFocus.requestFocus() }.isSuccess) return@LaunchedEffect
         }
-        commitTarget = null
-    }
-    // Preview-on-focus is debounced. Arrowing through the rail used to call
-    // nav.go() on every focus change, recomposing the whole ScreenHost mid-D-pad
-    // — that dropped queued keypresses and skipped items. Now a focus change only
-    // sets a pending target; the content pane swaps once focus rests (~160ms), so
-    // a fast sweep down the rail does ONE recomposition instead of one per item.
-    var previewTarget: ScreenId? by remember { mutableStateOf(null) }
-    LaunchedEffect(previewTarget) {
-        val t = previewTarget ?: return@LaunchedEffect
-        if (t == nav.current) return@LaunchedEffect
-        // Debounce a fast D-pad sweep into one swap, but stay snappy: section loads are
-        // now cheap (cached song flow + memoised groups), so the screen no longer has to
-        // earn a long delay before it appears. 80ms still coalesces a held-key sweep.
-        delay(80)
-        nav.go(t)
-    }
-    val previewNav: (ScreenId) -> Unit = { screen ->
-        // No move() tick here — the root onPreviewKeyEvent handler already ticks on
-        // every D-pad press, so ticking again on rail hover would double up.
-        previewTarget = screen
     }
     val commitNav: (ScreenId) -> Unit = { screen ->
         navSounds.select()
-        previewTarget = screen   // cancel any pending preview so it can't override the commit
         nav.go(screen)
-        commitTarget = screen
-    }
-    val commitReplace: (ScreenId) -> Unit = { screen ->
-        navSounds.select()
-        previewTarget = screen
-        nav.replaceTop(screen)
-        commitTarget = screen
+        commitSeq++
     }
 
+    // Screen-level BackHandlers (SmbBrowse, CloudBrowse, AddShareWizard) register later and
+    // so win over this one; they're gated on LocalDrawerOpen so Back in the open drawer
+    // still reaches the exit dialog here (UI-22).
+    // A State (not a Boolean read here) so drawer toggles don't recompose all of DinkApp.
+    val drawerOpen = remember { derivedStateOf { drawerState.currentValue == DrawerValue.Open } }
     BackHandler(enabled = !exitDialog) {
-        when {
+        when (resolveBack(drawerOpen.value, nav.current, LibraryDetailNav.frames.size)) {
             // Drawer open (focused) → exit dialog.
-            drawerState.currentValue == DrawerValue.Open -> exitDialog = true
+            BackAction.ExitDialog -> exitDialog = true
             // Nested detail (album opened under an artist) → pop back to the artist's albums.
-            nav.current == ScreenId.LibraryDetail && LibraryDetailNav.popFrame() -> navSounds.select()
-            // On a detail → return to the list we came from (Albums/Artists/Folders), where
-            // scroll + the opened tile's focus are restored. Go straight (no commitTarget) so
-            // the list's own tile-refocus wins instead of focus snapping to "Shuffle all".
-            nav.current == ScreenId.LibraryDetail -> {
+            BackAction.PopDetailFrame -> if (LibraryDetailNav.popFrame()) navSounds.select()
+            // On a detail → return to the screen we came from (Albums/Artists/Folders/Search/
+            // Home), where scroll + the opened item's focus are restored. Go straight (no
+            // commitSeq bump) so the screen's own refocus wins instead of the primary focusable.
+            BackAction.DetailToParent -> {
                 navSounds.select()
-                ListScrollMemo.facetOf(LibraryDetailNav.parent)?.let { ListScrollMemo.arm(it) }
-                nav.go(LibraryDetailNav.parent)
+                val parent = LibraryDetailNav.parent
+                ListScrollMemo.facetOf(parent)?.let { ListScrollMemo.arm(it) }
+                if (parent == ScreenId.Search) SearchMemo.arm()
+                nav.go(parent)
             }
             // Otherwise (a top-level screen) → focus the rail; Back again (drawer open) exits.
-            else -> runCatching { railRequester.requestFocus() }
+            BackAction.FocusRail -> runCatching { railRequester.requestFocus() }
         }
     }
 
     CompositionLocalProvider(
         LocalRailFocusRequester provides railRequester,
         LocalContentFocus provides contentFocus,
+        LocalDrawerOpen provides drawerOpen,
+        LocalToast provides toast,
         LocalUiScale provides uiScale,
         LocalNavSounds provides navSounds,
         LocalDensity provides scaledDensity,
@@ -345,7 +340,6 @@ fun DinkApp() {
                             // "FocusRequester is not initialized" because the rail has
                             // no item bound to railRequester.
                             current = railCurrentFor(nav.current),
-                            onSelect = previewNav,
                             onCommit = commitNav,
                             currentItemFocusRequester = railRequester,
                         )
@@ -363,24 +357,24 @@ fun DinkApp() {
                             screen = nav.current,
                             player = player,
                             onNavigate = commitNav,
-                            onReplace = commitReplace,
                             onToast = toast::show,
                         )
                     }
                     // MiniPlayer is the persistent transport readout — but it's redundant
                     // on Now Playing, which has its own full transport, so hide it there.
-                    // Safe to toggle per-screen now that rail preview-on-focus is gone
-                    // (it was the dropped-D-pad-press culprit); nav between screens is a
-                    // committed action, so the one-time relayout is fine.
+                    // Rail items are commit-only (no preview-on-focus), so nav between
+                    // screens is a committed action and the one-time relayout is fine.
                     if (nav.current != ScreenId.NowPlaying) {
                         val miniState = MiniPlayerState(
                             title = player.currentSong?.title ?: "Nothing playing",
                             artist = player.currentSong?.artist ?: "—",
                             isPlaying = player.isPlaying,
-                            progress = player.progress,
                         )
                         MiniPlayer(
                             state = miniState,
+                            // Read in MiniPlayer's draw phase only, so the 250 ms position tick
+                            // doesn't recompose this content lambda (every screen) — UI-11.
+                            progress = { player.progress },
                             song = player.currentSong,
                             onPlayPause = player::togglePlayPause,
                             onPrev = player::prev,
@@ -409,7 +403,6 @@ private fun ScreenHost(
     screen: ScreenId,
     player: PlayerState,
     onNavigate: (ScreenId) -> Unit,
-    onReplace: (ScreenId) -> Unit,
     onToast: (String) -> Unit,
 ) {
     when (screen) {
@@ -427,11 +420,9 @@ private fun ScreenHost(
         ScreenId.SmbBrowse -> SmbBrowseScreen(player = player, onNavigate = onNavigate, onToast = onToast)
         ScreenId.Cloud -> CloudScreen(player = player, onNavigate = onNavigate, onToast = onToast)
         ScreenId.CloudBrowse -> CloudBrowseScreen(player = player, onNavigate = onNavigate, onToast = onToast)
-        // AddShareWizard hands off via onReplace so the wizard entry is swapped
-        // for whatever target the wizard chose (SmbShares on Cancel, SmbBrowse on
-        // Save). Without replaceTop, pressing Back from the post-wizard screen
-        // would re-enter the wizard.
-        ScreenId.AddShareWizard -> AddShareWizard(onDone = onReplace, onToast = onToast)
+        // AddShareWizard hands off to whatever target it chose (SmbShares on Cancel,
+        // SmbBrowse on Save).
+        ScreenId.AddShareWizard -> AddShareWizard(onDone = onNavigate, onToast = onToast)
         ScreenId.Settings -> SettingsScreen()
         else -> PlaceholderScreen(screen)
     }
@@ -456,6 +447,23 @@ val LocalContentFocus = compositionLocalOf<FocusRequester> {
     error("LocalContentFocus not provided")
 }
 
+/**
+ * Whether the side drawer is open (focus in the rail). Screen BackHandlers gate on it
+ * (`enabled = !LocalDrawerOpen.current.value`) so Back in the drawer reaches the app-level
+ * exit dialog instead of the screen's own "up a level" handler (UI-22).
+ */
+val LocalDrawerOpen = staticCompositionLocalOf<State<Boolean>> { mutableStateOf(false) }
+
+/** What app-level Back does, by precedence. Pure so the order is unit-tested. */
+internal enum class BackAction { ExitDialog, PopDetailFrame, DetailToParent, FocusRail }
+
+internal fun resolveBack(drawerOpen: Boolean, current: ScreenId, detailFrames: Int): BackAction = when {
+    drawerOpen -> BackAction.ExitDialog
+    current == ScreenId.LibraryDetail && detailFrames > 1 -> BackAction.PopDetailFrame
+    current == ScreenId.LibraryDetail -> BackAction.DetailToParent
+    else -> BackAction.FocusRail
+}
+
 /** Map non-rail screens to their parent rail entry. Used both to highlight the
  *  drawer correctly and to ensure railRequester always attaches to a RailItem. */
 private fun railCurrentFor(screen: ScreenId): ScreenId = when (screen) {
@@ -465,10 +473,14 @@ private fun railCurrentFor(screen: ScreenId): ScreenId = when (screen) {
     else -> screen
 }
 
-private fun crumbsFor(screen: ScreenId): String {
+internal fun crumbsFor(screen: ScreenId): String {
     if (screen == ScreenId.LibraryDetail) {
         val g = LibraryDetailNav.group
-        return "Library / ${LibraryDetailNav.parent.displayName}" + (g?.let { " / ${it.title}" } ?: "")
+        val parent = LibraryDetailNav.parent
+        // "Library / " only for library-list parents — a detail opened from Search or Home
+        // read "Library / Search / …".
+        val prefix = if (parent.group == RailGroup.Library) "Library / " else ""
+        return "$prefix${parent.displayName}" + (g?.let { " / ${it.title}" } ?: "")
     }
     val prefix = when (screen.group) {
         RailGroup.Top -> ""

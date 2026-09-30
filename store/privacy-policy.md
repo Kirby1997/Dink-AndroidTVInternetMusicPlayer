@@ -1,6 +1,6 @@
 # Dink — Privacy Policy
 
-_Last updated: 16 June 2026_
+_Last updated: 28 September 2026_
 
 Dink ("the app") is a music player for Android TV. This policy explains what the app does
 with your data. The short version: **Dink does not collect, store, or share your personal
@@ -19,10 +19,15 @@ We (the developer) have no access to any of the above.
 Dink connects to the network only to do the things you ask it to:
 - **Your own servers / shares (SMB):** to browse and stream the music files you point it
   at. These connections go to addresses you configure, not to us.
-- **Online lyric providers (optional):** when you enable online lyrics, the app sends the
-  **song title and artist** to third-party lyric services to look up matching lyrics.
-  These services have their own privacy policies. You can disable online lyric lookups,
-  or individual providers, in Settings.
+- **Online lyric providers (optional, off by default):** only if you switch on
+  **Online lyrics** in Settings → Lyrics, the app sends the **song title and artist**
+  (and, for some providers, the **album name and track length**) of the song you are
+  playing to the third-party lyric services you have enabled there, to look up matching
+  lyrics. With it off, no lyric lookups leave your device; lyrics from your own files
+  (embedded tags and `.lrc`/`.txt` files) still work. The providers are LRCLIB, NetEase
+  Cloud Music, QQ Music, Lyricsify, Letras, DarkLyrics, Metal Archives, AZLyrics,
+  SongLyrics, Bandcamp and LyricFind; each can be turned off individually. These services
+  have their own privacy policies.
 - **Cover-art / metadata** is read from your files; album art may be fetched over your
   network from the same sources as your music.
 

@@ -36,11 +36,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
@@ -54,6 +56,7 @@ import androidx.tv.material3.Text
 import com.example.dink_smb_player.DinkApplication
 import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
+import com.example.dink_smb_player.data.art.AlbumArtCache
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.lyrics.LyricPrefs
 import com.example.dink_smb_player.player.EqEngine
@@ -97,7 +100,7 @@ fun SettingsScreen() {
     val uiScale = LocalUiScale.current
     val context = LocalContext.current
     val lyricPrefs = remember(context) { LyricPrefs(context.applicationContext) }
-    val lyricToggles by lyricPrefs.toggles.collectAsState(initial = LyricSettings.snapshot())
+    val lyricConfig by lyricPrefs.toggles.collectAsState(initial = LyricSettings.config())
     val scope = rememberCoroutineScope()
     val retag by LibraryRepository.retagProgress.collectAsState()
 
@@ -129,13 +132,15 @@ fun SettingsScreen() {
                         label = label,
                         selected = tab == i,
                         onSelect = { tab = i },
-                        // First tab owns content focus so a drawer commit lands on the
-                        // tab row. ONLY the first tab routes Left to the rail; the rest
-                        // must let Left fall through to the previous tab (spatial nav) —
-                        // routing every tab's Left to the rail meant arrowing left between
-                        // tabs opened the drawer instead of switching tab.
+                        // The SELECTED tab owns content focus so a commit lands on the
+                        // tab row without switching category. Bound to tab 0 it pulled a
+                        // deep link (EQ shortcut → Audio) back to Display, since focusing
+                        // a tab selects it. ONLY the first tab routes Left to the rail; the
+                        // rest must let Left fall through to the previous tab (spatial
+                        // nav) — routing every tab's Left to the rail meant arrowing left
+                        // between tabs opened the drawer instead of switching tab.
                         isFirst = i == 0,
-                        focusRequester = if (i == 0) contentFocus else null,
+                        focusRequester = if (tab == i) contentFocus else null,
                         // The selected tab is the Up-target for content below it.
                         activeTabRequester = if (tab == i) activeTabFocus else null,
                         railReq = railReq,
@@ -281,29 +286,53 @@ fun SettingsScreen() {
                         }
                     }
 
-                    // ---- Lyrics: provider toggles ----
+                    // ---- Lyrics: master switch + provider toggles ----
                     2 -> {
+                        Column(modifier = Modifier.width(720.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(text = "Online lyrics", style = type.cardTitle.copy(color = palette.ink0))
+                            Text(
+                                text = "Look up lyrics on the internet when a track has none of its own. When on, " +
+                                    "the song title, artist, album and length are sent to the providers enabled " +
+                                    "below. Sidecar .lrc/.txt files and embedded tags always work, even when off.",
+                                style = type.body.copy(color = palette.ink2),
+                            )
+                            LyricToggleRow(
+                                label = "Online lyrics",
+                                checked = lyricConfig.online,
+                                onToggle = { next ->
+                                    LyricSettings.setOnline(next)
+                                    scope.launch { lyricPrefs.setOnline(next) }
+                                },
+                                // Top focusable of Lyrics → Up returns to the active tab.
+                                modifier = Modifier.focusProperties {
+                                    left = railReq
+                                    up = activeTabFocus
+                                },
+                            )
+                        }
                         Column(modifier = Modifier.width(720.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(text = "Lyric sources", style = type.cardTitle.copy(color = palette.ink0))
                             Text(
-                                text = "Online providers, tried in this order. Synced lyrics are preferred; " +
-                                    "the search stops at the first match. Sidecar .lrc/.txt and embedded tags are always used.",
+                                text = if (lyricConfig.online) {
+                                    "Online providers, tried in this order. Synced lyrics are preferred; " +
+                                        "the search stops at the first match."
+                                } else {
+                                    "Turn on Online lyrics above to use these providers."
+                                },
                                 style = type.body.copy(color = palette.ink2),
                             )
-                            OnlineLyricProviders.all.forEachIndexed { i, provider ->
+                            // Rows stay focusable while the master is off (so D-pad travel
+                            // through the tab doesn't change shape), just dimmed and inert.
+                            OnlineLyricProviders.all.forEach { provider ->
                                 LyricToggleRow(
                                     label = provider.label,
-                                    checked = lyricToggles[provider.id] ?: provider.defaultEnabled,
+                                    checked = lyricConfig.isProviderOn(provider),
+                                    enabled = lyricConfig.online,
                                     onToggle = { next ->
                                         LyricSettings.set(provider.id, next)
                                         scope.launch { lyricPrefs.setProvider(provider.id, next) }
                                     },
-                                    // First row → Up returns to the active tab; lower rows
-                                    // keep spatial Up to the row above.
-                                    modifier = Modifier.focusProperties {
-                                        left = railReq
-                                        if (i == 0) up = activeTabFocus
-                                    },
+                                    modifier = Modifier.focusProperties { left = railReq },
                                 )
                             }
                         }
@@ -351,7 +380,8 @@ fun SettingsScreen() {
                                     )
                                 } else {
                                     Text(
-                                        text = "Last rescan: updated ${p.changed} of ${p.total} tracks.",
+                                        text = p.saveError?.let { "Last rescan: couldn't save the library ($it). Changes are lost on restart." }
+                                            ?: "Last rescan: updated ${p.changed} of ${p.total} tracks.",
                                         style = type.monoSmall.copy(color = palette.ink3),
                                     )
                                 }
@@ -368,6 +398,14 @@ fun SettingsScreen() {
                             GhostButton(
                                 label = if (running) "Rescanning…" else "Force full re-tag",
                                 onClick = { startRetag(force = true) },
+                                modifier = Modifier.focusProperties { left = railReq },
+                            )
+                            // Drops cached covers + "no art" markers; albums re-probe on next view.
+                            // Label flips only after the delete finishes (no optimistic success).
+                            var artCleared by remember { mutableStateOf(false) }
+                            GhostButton(
+                                label = if (artCleared) "Art cache cleared" else "Clear art cache",
+                                onClick = { scope.launch { AlbumArtCache.clear(context.applicationContext); artCleared = true } },
                                 modifier = Modifier.focusProperties { left = railReq },
                             )
                         }
@@ -430,6 +468,8 @@ private fun LyricToggleRow(
     checked: Boolean,
     onToggle: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    // false → dimmed and OK is swallowed, but the row stays focusable.
+    enabled: Boolean = true,
 ) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
@@ -449,12 +489,18 @@ private fun LyricToggleRow(
             .onKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
                 when (event.key) {
-                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter, Key.Spacebar -> { onToggle(!checked); true }
+                    // Held OK auto-repeats KeyDown; only the first press toggles, else a
+                    // long press flickers the switch on/off. Repeats are still consumed.
+                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter, Key.Spacebar -> {
+                        if (enabled && !event.isAutoRepeat()) onToggle(!checked)
+                        true
+                    }
                     else -> false
                 }
             }
             .focusable(interactionSource = interaction)
-            .padding(horizontal = 20.dp),
+            .padding(horizontal = 20.dp)
+            .alpha(if (enabled) 1f else 0.4f),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
@@ -762,8 +808,12 @@ private fun EqBandSlider(
                 .onKeyEvent { event ->
                     if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
                     when (event.key) {
-                        // OK grabs / releases the bar.
-                        Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> { onToggleEdit(); true }
+                        // OK grabs / releases the bar. Ignore auto-repeat so a held OK
+                        // doesn't grab/release/grab; Up/Down keep repeating (hold to sweep).
+                        Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
+                            if (!event.isAutoRepeat()) onToggleEdit()
+                            true
+                        }
                         // Up/Down only adjust while grabbed; otherwise pass through to navigate.
                         Key.DirectionUp -> if (editing) { onDelta(+EQ_STEP_MDB); true } else false
                         Key.DirectionDown -> if (editing) { onDelta(-EQ_STEP_MDB); true } else false
@@ -809,3 +859,7 @@ private fun freqLabel(hz: Int): String =
     } else {
         "$hz"
     }
+
+/** True for the synthetic KeyDowns a held key emits after the first press. */
+private fun KeyEvent.isAutoRepeat(): Boolean =
+    nativeKeyEvent.repeatCount > 0

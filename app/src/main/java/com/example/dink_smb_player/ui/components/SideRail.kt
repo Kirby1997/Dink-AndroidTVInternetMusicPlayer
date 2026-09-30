@@ -22,18 +22,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.material.icons.outlined.Lan
 import androidx.compose.material.icons.outlined.SignalWifiOff
 import androidx.compose.ui.graphics.Color
@@ -69,52 +65,20 @@ private val OpenDrawerWidth: Dp = 260.dp
  * width are owned by the wrapping NavigationDrawer in `DinkApp`; this composable
  * only renders the rail's content for the given [drawerValue].
  *
- * Focus-driven nav: each item calls [onSelect] on focus gain so D-pad Up/Down
- * swaps the screen without leaving the drawer. Press Select (or D-pad Right) to
- * commit — that triggers [onCommit] which moves focus into the screen content,
- * and NavigationDrawer collapses the drawer when its focus leaves.
+ * Commit-only nav: D-pad Up/Down just moves focus between rail items. Press Select
+ * to commit — that triggers [onCommit], which swaps the screen and moves focus into
+ * its content, and NavigationDrawer collapses the drawer when its focus leaves.
  */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 fun DinkDrawerContent(
     drawerValue: DrawerValue,
     current: ScreenId,
-    onSelect: (ScreenId) -> Unit,
     onCommit: (ScreenId) -> Unit,
     currentItemFocusRequester: FocusRequester,
 ) {
     val palette = LocalDinkPalette.current
     val expanded = drawerValue == DrawerValue.Open
-
-    // Tracks the most recently focused rail item *while the drawer is open*.
-    // Used to distinguish two cases in RailItem.onFocusChanged:
-    //   (a) D-pad nav inside the drawer (lastFocusedItem != null, different
-    //       screen) → fire onSelect to swap the screen.
-    //   (b) The drawer regaining focus because content unmounted / lost focus
-    //       (lastFocusedItem == null after a Closed→Open transition) → DON'T
-    //       fire onSelect, otherwise an in-screen button click that navigates
-    //       elsewhere will be clobbered by Home (or last drawer item) firing.
-    // Cleared whenever the drawer transitions to Closed.
-    var lastFocusedItem by remember { mutableStateOf<ScreenId?>(null) }
-    var lastFocusChangeMs by remember { mutableStateOf(0L) }
-    LaunchedEffect(drawerValue) {
-        if (drawerValue == DrawerValue.Closed) {
-            lastFocusedItem = null
-            lastFocusChangeMs = 0L
-        }
-    }
-    // Distinguish real D-pad nav (≥60ms between item-focus events — user
-    // physical key cadence) from Compose's spatial-search noise that fires
-    // when content unmounts (multiple focus events within the same frame,
-    // <16ms apart). Pure timing — no async coroutines = no race window.
-    val gatedSelect: (ScreenId) -> Unit = { screen ->
-        val now = System.currentTimeMillis()
-        val prev = lastFocusedItem
-        val delta = now - lastFocusChangeMs
-        lastFocusedItem = screen
-        lastFocusChangeMs = now
-        if (prev != null && prev != screen && delta > 60) onSelect(screen)
-    }
 
     Column(
         modifier = Modifier
@@ -131,7 +95,6 @@ fun DinkDrawerContent(
             group = RailGroup.Top,
             current = current,
             expanded = expanded,
-            onSelect = gatedSelect,
             onCommit = onCommit,
             currentItemFocusRequester = currentItemFocusRequester,
         )
@@ -140,7 +103,6 @@ fun DinkDrawerContent(
             group = RailGroup.Library,
             current = current,
             expanded = expanded,
-            onSelect = gatedSelect,
             onCommit = onCommit,
             currentItemFocusRequester = currentItemFocusRequester,
             eyebrow = "LIBRARY",
@@ -150,7 +112,6 @@ fun DinkDrawerContent(
             group = RailGroup.Sources,
             current = current,
             expanded = expanded,
-            onSelect = gatedSelect,
             onCommit = onCommit,
             currentItemFocusRequester = currentItemFocusRequester,
             eyebrow = "SOURCES",
@@ -161,7 +122,6 @@ fun DinkDrawerContent(
             group = RailGroup.Bottom,
             current = current,
             expanded = expanded,
-            onSelect = gatedSelect,
             onCommit = onCommit,
             currentItemFocusRequester = currentItemFocusRequester,
         )
@@ -179,7 +139,6 @@ private fun Section(
     group: RailGroup,
     current: ScreenId,
     expanded: Boolean,
-    onSelect: (ScreenId) -> Unit,
     onCommit: (ScreenId) -> Unit,
     eyebrow: String? = null,
     currentItemFocusRequester: FocusRequester? = null,
@@ -202,15 +161,11 @@ private fun Section(
             screen = screen,
             active = isCurrent,
             expanded = expanded,
-            // ALL rail items are commit-only (open with Enter / D-pad Right), matching
-            // what NowPlaying always did. Preview-on-focus (swap the content pane as you
-            // arrow past an item) was inconsistent — only NowPlaying was exempt — and on
-            // NowPlaying it reliably wedged the rail (the focus engine refused to traverse
-            // DOWN onto a preview-navigated item and dropped a press). Commit-only makes
-            // every menu behave the same: arrowing the rail just moves focus; the screen
-            // changes only when you select.
-            navOnFocus = false,
-            onSelect = { onSelect(screen) },
+            // ALL rail items are commit-only (open with Enter): arrowing the rail just
+            // moves focus; the screen changes only when you select. Preview-on-focus
+            // (swap the content pane as you arrow past an item) was removed — it wedged
+            // the rail on NowPlaying (the focus engine refused to traverse DOWN onto a
+            // preview-navigated item and dropped a press).
             onCommit = { onCommit(screen) },
             // Attach the shared rail requester to whichever item matches the
             // current screen. Left-from-content lands here; drawer reopen lands
@@ -226,9 +181,7 @@ private fun RailItem(
     screen: ScreenId,
     active: Boolean,
     expanded: Boolean,
-    onSelect: () -> Unit,
     onCommit: () -> Unit,
-    navOnFocus: Boolean = true,
     focusRequester: FocusRequester? = null,
 ) {
     val palette = LocalDinkPalette.current
@@ -269,7 +222,6 @@ private fun RailItem(
                 .height(ItemHeight)
                 .weight(1f, fill = expanded)
                 .let { if (focusRequester != null) it.focusRequester(focusRequester) else it }
-                .onFocusChanged { state -> if (state.isFocused && navOnFocus) onSelect() }
                 .focusProperties { left = FocusRequester.Cancel },
         ) {
             Row(

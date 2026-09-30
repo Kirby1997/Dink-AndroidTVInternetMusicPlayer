@@ -84,6 +84,8 @@ fun SongsScreen(
     // True until the on-disk index finishes loading at boot. Used to show a loading bar
     // instead of an empty "0 tracks" list while a 25k library is still being restored.
     val restored by LibraryRepository.restoredState.collectAsState()
+    // Play counts live apart from the song list (LIB-15), so a play doesn't re-emit the library.
+    val playStats by remember(context) { LibraryRepository.playStats(context) }.collectAsState()
 
     var sort by remember { mutableStateOf(SongSort.Title) }
     var filter by remember { mutableStateOf(SongFilter.All) }
@@ -95,7 +97,9 @@ fun SongsScreen(
     // background pass completes, so the screen opens instantly then populates.
     // null while the background filter+sort runs → screen shows a thin loading bar
     // instead of a blank list. Non-null (possibly empty) means the pass finished.
-    val filtered: List<Song>? by produceState<List<Song>?>(initialValue = null, sort, filter, allSongs) {
+    // Only the Most-played sort depends on play counts; other sorts don't re-run on a play.
+    val sortStats = if (sort == SongSort.MostPlayed) playStats else null
+    val filtered: List<Song>? by produceState<List<Song>?>(initialValue = null, sort, filter, allSongs, sortStats) {
         value = withContext(Dispatchers.Default) {
             val pool = when (filter) {
                 SongFilter.All -> allSongs
@@ -103,7 +107,7 @@ fun SongsScreen(
                 SongFilter.Lossy -> allSongs.filter { !it.bitrate.contains("FLAC", ignoreCase = true) }
             }
             when (sort) {
-                SongSort.MostPlayed -> pool.sortedByDescending { it.playCount }
+                SongSort.MostPlayed -> pool.sortedByDescending { sortStats?.get(it.id)?.count ?: it.playCount }
                 SongSort.Title -> pool.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
                 SongSort.Artist -> pool.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.artist })
                 SongSort.Longest -> pool.sortedByDescending { it.durationSec }
@@ -164,6 +168,7 @@ fun SongsScreen(
                     index = index + 1,
                     song = song,
                     album = album,
+                    playCount = playStats[song.id]?.count ?: song.playCount,
                     isPlaying = player.currentSong?.id == song.id,
                     onClick = {
                         player.playFrom(rows, index)
@@ -291,6 +296,7 @@ private fun SongRow(
     index: Int,
     song: Song,
     album: Album?,
+    playCount: Int,
     isPlaying: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -395,7 +401,7 @@ private fun SongRow(
                 )
             }
             Text(
-                text = song.playCount.toString(),
+                text = playCount.toString(),
                 style = type.mono.copy(color = palette.ink1),
                 maxLines = 1,
                 softWrap = false,

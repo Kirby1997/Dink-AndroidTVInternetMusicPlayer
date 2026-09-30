@@ -2,8 +2,14 @@ package com.example.dink_smb_player
 
 import android.app.Application
 import android.content.Context
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.MonitorWorker
+import com.example.dink_smb_player.player.EngineTags
+import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.ui.theme.preloadThemeMode
 import com.example.dink_smb_player.ui.theme.preloadUiScale
 import kotlinx.coroutines.CoroutineScope
@@ -52,6 +58,16 @@ class DinkApplication : Application() {
         // MediaLibrary.loadOnce. Volume mounts still enqueue LocalSyncWorker.
         // Periodic re-import of monitored SMB shares + local media into the library index.
         MonitorWorker.reschedule(this)
+        // Library sinks on the process-wide player, here rather than in the UI: a media-key
+        // cold start plays with no activity, and its plays / engine tags must still count.
+        PlayerState.shared(this).bindLibrarySinks(this)
+        // LIB-3: plays persist on a ~2 s debounce; when the app leaves the foreground write
+        // whatever is still pending, in case the process is killed before the timer fires.
+        ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) {
+                appScope.launch(Dispatchers.Default) { LibraryRepository.flushPendingWrites() }
+            }
+        })
         // One-time: adopt already-imported folders as monitored so existing libraries
         // auto-update without the user re-toggling anything. Then fire a catch-up scan
         // so files added while Dink was closed appear shortly after launch.
@@ -69,12 +85,12 @@ class DinkApplication : Application() {
         val prefs = SharePrefs(context)
         prefs.shares.first().forEach { share ->
             if (share.importPaths.isNotEmpty() && share.monitoredPaths.isEmpty()) {
-                prefs.saveShare(share.copy(monitoredPaths = share.importPaths))
+                prefs.updateShare(share.id) { it.copy(monitoredPaths = it.monitoredPaths.ifEmpty { it.importPaths }) }
             }
         }
         prefs.providers.first().forEach { provider ->
             if (provider.importFolders.isNotEmpty() && provider.monitoredFolders.isEmpty()) {
-                prefs.saveProvider(provider.copy(monitoredFolders = provider.importFolders))
+                prefs.updateProvider(provider.id) { it.copy(monitoredFolders = it.monitoredFolders.ifEmpty { it.importFolders }) }
             }
         }
         flags.edit().putBoolean(FLAG_MONITOR_MIGRATED, true).apply()
@@ -134,6 +150,30 @@ class DinkApplication : Application() {
             "org.jaudiotagger.tag.id3",
             "org.jaudiotagger.tag.id3.framebody",
             "id3", "audio", "tag", "mp3",
+        )
+    }
+}
+
+/**
+ * Route the player's library side effects: a credited play (30 s of listening, see
+ * PlayerState.onTrackPlayed) → play stats + debounced persist; tags the engine parsed while
+ * streaming → row enrichment. Set once per process, never by the UI, so nothing double-counts.
+ */
+internal fun PlayerState.bindLibrarySinks(
+    context: Context,
+    playSink: (Context, String) -> Unit = LibraryRepository::recordPlay,
+    tagSink: (Context, EngineTags) -> Unit = ::enrichFromEngine,
+) {
+    val appCtx = context.applicationContext
+    onTrackPlayed = { songId -> playSink(appCtx, songId) }
+    onMetadataResolved = { tags -> tagSink(appCtx, tags) }
+}
+
+private fun enrichFromEngine(appCtx: Context, tags: EngineTags) {
+    (appCtx as? DinkApplication)?.appScope?.launch(Dispatchers.IO) {
+        LibraryRepository.enrichTrack(
+            appCtx, tags.songId, tags.title, tags.artist, tags.album,
+            tags.year, tags.trackNumber, tags.durationMs,
         )
     }
 }

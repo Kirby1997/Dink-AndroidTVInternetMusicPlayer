@@ -6,62 +6,70 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.encodeToStream
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 
 /**
  * Disk persistence for user playlists. Single JSON file in filesDir, atomic write
- * (temp + ATOMIC_MOVE) serialized through [ioLock], mirroring [LibraryStore]. Unlike
+ * (temp + fsync + ATOMIC_MOVE) serialized through [ioLock], mirroring [LibraryStore]. Unlike
  * the library index, playlists aren't re-derivable from any source — they're the
  * user's own data — so a torn write or accidental overwrite is unrecoverable; the
- * atomic move is what prevents it.
+ * atomic move is what prevents it. A known-good `playlists.bak.json` is the fallback
+ * when the main file is unreadable, and unreadable files are kept as timestamped
+ * `*.corrupt-<ms>.json` copies rather than overwritten.
  */
 object PlaylistStore {
 
     @Serializable
     data class Snapshot(val playlists: List<Playlist> = emptyList())
 
+    /** See [LibraryStore.LoadResult] — same contract: never write over [Corrupt]; retry
+     *  [Transient]. */
+    sealed interface LoadResult {
+        data class Ok(val playlists: List<Playlist>, val fromBackup: Boolean = false) : LoadResult
+        data object Missing : LoadResult
+        data class Corrupt(val error: Throwable) : LoadResult
+        data class Transient(val error: Throwable) : LoadResult
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
     private val ioLock = Mutex()
 
-    private fun file(context: Context): File =
-        File(context.applicationContext.filesDir, "playlists.json")
+    @Volatile private var guarded: GuardedJsonFile<Snapshot>? = null
 
-    suspend fun save(context: Context, playlists: List<Playlist>) = withContext(Dispatchers.IO) {
-        ioLock.withLock {
-            runCatching {
-                val f = file(context)
-                val tmp = File(f.parentFile, "${f.name}.tmp")
-                tmp.writeText(json.encodeToString(Snapshot(playlists)))
-                Files.move(
-                    tmp.toPath(), f.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
-                )
-            }.onFailure { t ->
-                android.util.Log.e("PlaylistStore", "save failed: ${playlists.size} playlists", t)
-            }
-            Unit
+    private fun guarded(context: Context): GuardedJsonFile<Snapshot> =
+        guarded ?: synchronized(this) {
+            guarded ?: guardedFile(context.applicationContext.filesDir).also { guarded = it }
         }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    internal fun guardedFile(dir: File): GuardedJsonFile<Snapshot> = GuardedJsonFile(
+        file = File(dir, "playlists.json"),
+        tag = "PlaylistStore",
+        decode = { json.decodeFromStream<Snapshot>(it) },
+        encode = { snap, out -> json.encodeToStream(snap, out) },
+    )
+
+    /** Test hook: forget the cached file so the next call re-resolves filesDir. */
+    internal fun resetForTest() { guarded = null }
+
+    /** Returns true only once [playlists] are durably on disk. */
+    suspend fun save(context: Context, playlists: List<Playlist>): Boolean = withContext(Dispatchers.IO) {
+        ioLock.withLock { guarded(context).save(Snapshot(playlists)) }
     }
 
-    /** Returns null when the file is missing (first run) OR unreadable — either way
-     *  the caller starts with no playlists. A corrupt file is preserved for recovery
-     *  rather than silently overwritten on the next save. */
-    suspend fun load(context: Context): List<Playlist>? = withContext(Dispatchers.IO) {
-        ioLock.withLock {
-            val f = file(context)
-            if (!f.exists()) return@withContext null
-            runCatching { json.decodeFromString<Snapshot>(f.readText()).playlists }.getOrElse { t ->
-                runCatching {
-                    f.copyTo(File(f.parentFile, "playlists.corrupt.json"), overwrite = true)
-                }
-                android.util.Log.e("PlaylistStore", "load failed; preserved as playlists.corrupt.json", t)
-                null
-            }
-        }
+    suspend fun load(context: Context): LoadResult = withContext(Dispatchers.IO) {
+        ioLock.withLock { toLoadResult(guarded(context).loadWithRetry()) }
+    }
+
+    internal fun toLoadResult(r: GuardedJsonFile.Load<Snapshot>): LoadResult = when (r) {
+        is GuardedJsonFile.Load.Ok -> LoadResult.Ok(r.value.playlists, r.fromBackup)
+        GuardedJsonFile.Load.Missing -> LoadResult.Missing
+        is GuardedJsonFile.Load.Corrupt -> LoadResult.Corrupt(r.error)
+        is GuardedJsonFile.Load.Transient -> LoadResult.Transient(r.error)
     }
 }

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -56,7 +57,6 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
-import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.AlbumArtShape
@@ -69,10 +69,12 @@ import com.example.dink_smb_player.ui.components.AlbumCard
 import com.example.dink_smb_player.ui.components.GhostButton
 import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.components.ShelfRow
+import com.example.dink_smb_player.ui.components.shelfFirstCardTarget
 import com.example.dink_smb_player.ui.components.SongCard
 import com.example.dink_smb_player.ui.components.ThinLoadingBar
 import com.example.dink_smb_player.ui.screens.library.LibraryDetailNav
 import com.example.dink_smb_player.ui.screens.library.albumGroups
+import com.example.dink_smb_player.ui.screens.library.albumKeyOf
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.CancellationException
@@ -151,6 +153,20 @@ fun HomeScreen(
     val newFirstRequester = remember { FocusRequester() }
     val acrossFirstRequester = remember { FocusRequester() }
     val heroRequester = remember { FocusRequester() }
+    // Hoisted so the chain can check whether a shelf's first card is still composed.
+    // Scroll a shelf right past card 0 and LazyRow disposes it — its requester detaches,
+    // and routing Up/Down/enter to it threw "FocusRequester is not initialized" (UI-1).
+    // Each target is a lambda so the check runs at focus-move time, not composition.
+    val recentState = rememberLazyListState()
+    val newState = rememberLazyListState()
+    val acrossState = rememberLazyListState()
+    val toHero: () -> FocusRequester = { heroRequester }
+    val toRecent: () -> FocusRequester =
+        { shelfFirstCardTarget(recentState.firstVisibleItemIndex, recentFirstRequester) }
+    val toNew: () -> FocusRequester =
+        { shelfFirstCardTarget(newState.firstVisibleItemIndex, newFirstRequester) }
+    val toAcross: () -> FocusRequester =
+        { shelfFirstCardTarget(acrossState.firstVisibleItemIndex, acrossFirstRequester) }
 
     LaunchedEffect(feed.resumeSong.id) {
         // Preload the resume track so the mini player + Now Playing have data before the
@@ -166,10 +182,10 @@ fun HomeScreen(
     // representative song by the same key normalisation the Albums screen groups with.
     // Parent = Home so the rail highlights Home and Back lands back here, not on Albums.
     val openAlbumDetail: (Song) -> Unit = { rep ->
-        val key = rep.albumKey ?: LibraryGrouping.normKey(rep.albumTitle ?: "Unknown album")
-        val albumSongs = allSongs.filter {
-            (it.albumKey ?: LibraryGrouping.normKey(it.albumTitle ?: "Unknown album")) == key
-        }.ifEmpty { listOf(rep) }
+        // Key from the LIVE row: [rep] may be a Song captured before the grouping keys were
+        // last recomputed (a restored queue), whose stale key would match nothing.
+        val key = albumKeyOf(allSongs.firstOrNull { it.id == rep.id } ?: rep)
+        val albumSongs = allSongs.filter { albumKeyOf(it) == key }.ifEmpty { listOf(rep) }
         albumGroups(albumSongs).firstOrNull()?.let { group ->
             LibraryDetailNav.open(group, "Album", ScreenId.Home)
             onNavigate(ScreenId.LibraryDetail)
@@ -272,7 +288,7 @@ fun HomeScreen(
                 height = heroHeight,
                 railRequester = railRequester,
                 heroRequester = heroRequester,
-                downTarget = if (shelvesReady) recentFirstRequester else null,
+                downTarget = if (shelvesReady) toRecent else null,
                 onFocusedChange = { heroFocused = it },
                 onContinue = onContinue,
                 onAddToQueue = {
@@ -290,6 +306,7 @@ fun HomeScreen(
                     eyebrow = "Across all your sources",
                     onViewAll = { onNavigate(ScreenId.Songs) },
                     onEnterRequester = recentFirstRequester,
+                    state = recentState,
                 ) {
                     itemsIndexed(feed.recentlyPlayed) { idx, (song, album) ->
                         SongCard(
@@ -302,8 +319,8 @@ fun HomeScreen(
                             modifier = cardFocus(
                                 railRequester = railRequester,
                                 isLeftEdge = idx == 0,
-                                upTarget = heroRequester,
-                                downTarget = newFirstRequester,
+                                upTarget = toHero,
+                                downTarget = toNew,
                             ).let { if (idx == 0) it.focusRequester(recentFirstRequester) else it },
                         )
                     }
@@ -315,6 +332,7 @@ fun HomeScreen(
                     eyebrow = "Recently imported",
                     onViewAll = { onNavigate(ScreenId.Albums) },
                     onEnterRequester = newFirstRequester,
+                    state = newState,
                 ) {
                     itemsIndexed(feed.newOnShares) { idx, (album, repSong) ->
                         AlbumCard(
@@ -323,8 +341,8 @@ fun HomeScreen(
                             modifier = cardFocus(
                                 railRequester = railRequester,
                                 isLeftEdge = idx == 0,
-                                upTarget = recentFirstRequester,
-                                downTarget = acrossFirstRequester,
+                                upTarget = toRecent,
+                                downTarget = toAcross,
                             ).let { if (idx == 0) it.focusRequester(newFirstRequester) else it },
                         )
                     }
@@ -336,6 +354,7 @@ fun HomeScreen(
                     eyebrow = "A spin through everything you've added",
                     onViewAll = { onNavigate(ScreenId.Songs) },
                     onEnterRequester = acrossFirstRequester,
+                    state = acrossState,
                 ) {
                     itemsIndexed(feed.acrossShares) { idx, (song, album) ->
                         SongCard(
@@ -348,7 +367,7 @@ fun HomeScreen(
                             modifier = cardFocus(
                                 railRequester = railRequester,
                                 isLeftEdge = idx == 0,
-                                upTarget = newFirstRequester,
+                                upTarget = toNew,
                             ).let { if (idx == 0) it.focusRequester(acrossFirstRequester) else it },
                         )
                     }
@@ -366,12 +385,13 @@ fun HomeScreen(
 private fun cardFocus(
     railRequester: FocusRequester,
     isLeftEdge: Boolean,
-    upTarget: FocusRequester? = null,
-    downTarget: FocusRequester? = null,
+    /** Resolved when focus moves (see [shelfFirstCardTarget]), never at composition. */
+    upTarget: (() -> FocusRequester)? = null,
+    downTarget: (() -> FocusRequester)? = null,
 ): Modifier = Modifier.focusProperties {
     if (isLeftEdge) left = railRequester
-    upTarget?.let { up = it }
-    downTarget?.let { down = it }
+    upTarget?.let { up = it() }
+    downTarget?.let { down = it() }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
@@ -451,7 +471,7 @@ private fun Hero(
     railRequester: FocusRequester,
     heroRequester: FocusRequester,
     /** Null while the shelves below are not composed yet (staggered first frame). */
-    downTarget: FocusRequester?,
+    downTarget: (() -> FocusRequester)?,
     onFocusedChange: (Boolean) -> Unit,
     onContinue: () -> Unit,
     onAddToQueue: () -> Unit,
@@ -665,7 +685,7 @@ private fun buildHomeFeed(
     // of the library (newest ids last) when play/import history is thin.
     val addedPool = recentAdded.ifEmpty { library.takeLast(12).reversed() }
     val newAlbums = addedPool
-        .distinctBy { it.albumTitle ?: it.id }
+        .distinctBy { if (it.albumTitle == null) it.id else albumKeyOf(it) }
         .take(10)
         .map { synthAlbumFor(it) to it }
 

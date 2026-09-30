@@ -1,11 +1,17 @@
+@file:OptIn(UnstableApi::class)
+
 package com.example.dink_smb_player.data.art
 
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import com.example.dink_smb_player.data.source.Media3MediaDataSource
+import com.example.dink_smb_player.data.source.ReadFailures
+import com.example.dink_smb_player.data.source.ReadResult
 import com.example.dink_smb_player.data.source.smb.DinkDataSourceFactory
 import java.io.ByteArrayOutputStream
 
@@ -19,8 +25,10 @@ import java.io.ByteArrayOutputStream
  * budget is allowed because embedded art is bigger than a tag/duration probe (a few MB),
  * but it's still capped so a probe can never fall through to a full download.
  *
- * Blocks (network) — call from Dispatchers.IO. Returns null when there's no embedded
- * picture, the read times out, or anything goes wrong (caller falls back to procedural art).
+ * Blocks (network) — call from Dispatchers.IO. Returns [ReadResult.Absent] when the file has
+ * no picture (or is gone / unparseable) and [ReadResult.Error] when a transient failure (NAS
+ * down, dropped connection, timeout) cut the read short — the cache must only remember the
+ * former as "no art".
  */
 object ArtExtractor {
 
@@ -28,14 +36,16 @@ object ArtExtractor {
      *  container header. Capped so an art-less file with a huge moov can't pull forever. */
     private const val PROBE_BUDGET_BYTES = 24L * 1024 * 1024
 
-    fun extract(context: Context, uri: String): ByteArray? {
+    fun extract(context: Context, uri: String): ReadResult<ByteArray> {
         val retriever = MediaMetadataRetriever()
         val src = Media3MediaDataSource(context.applicationContext, uri, PROBE_BUDGET_BYTES)
         return try {
             retriever.setDataSource(src)
-            retriever.embeddedPicture
+            classify(retriever.embeddedPicture, src.failure)
         } catch (t: Throwable) {
-            null
+            // setDataSource's own exception is opaque ("setDataSource failed"); the data
+            // source recorded the real I/O cause, if there was one.
+            classify(null, src.failure)
         } finally {
             runCatching { retriever.release() }
             runCatching { src.close() }
@@ -59,14 +69,15 @@ object ArtExtractor {
      *
      * Derives each candidate by swapping the last path segment of [sampleUri]; only
      * `smb://` and `file://` have a meaningful sibling path (cloud uses opaque file ids),
-     * so other schemes return null without any network round-trips.
+     * so other schemes are Absent without any network round-trips. A transient failure on
+     * any candidate is an Error (the rest would fail the same way, so stop there).
      */
-    fun extractFolderImage(context: Context, sampleUri: String): ByteArray? {
+    fun extractFolderImage(context: Context, sampleUri: String): ReadResult<ByteArray> {
         val uri = Uri.parse(sampleUri)
         val scheme = uri.scheme?.lowercase()
-        if (scheme != "smb" && scheme != "file") return null
+        if (scheme != "smb" && scheme != "file") return ReadResult.Absent
         val segments = uri.pathSegments
-        if (segments.size < 1) return null
+        if (segments.size < 1) return ReadResult.Absent
         val parent = segments.dropLast(1)
         for (name in FOLDER_IMAGE_NAMES) {
             val candidate = Uri.Builder()
@@ -79,14 +90,25 @@ object ArtExtractor {
                 .encodedQuery(uri.encodedQuery) // preserve ?sid= for SMB
                 .build()
                 .toString()
-            readWhole(context, candidate)?.let { return it }
+            when (val r = readWhole(context, candidate)) {
+                is ReadResult.Found, is ReadResult.Error -> return r
+                ReadResult.Absent -> Unit // not there — try the next name
+            }
         }
-        return null
+        return ReadResult.Absent
     }
 
-    /** Read an entire (small) file via the Media3 data-source stack, capped. Returns null
-     *  when the file doesn't exist / can't be opened / is empty / exceeds the cap. */
-    private fun readWhole(context: Context, uri: String): ByteArray? {
+    /** Found when [bytes] is a non-empty picture; otherwise Error if a transient [failure]
+     *  cut the read short, else Absent. */
+    internal fun classify(bytes: ByteArray?, failure: Throwable?): ReadResult<ByteArray> = when {
+        bytes != null && bytes.isNotEmpty() -> ReadResult.Found(bytes)
+        ReadFailures.isTransient(failure) -> ReadResult.Error(failure)
+        else -> ReadResult.Absent
+    }
+
+    /** Read an entire (small) file via the Media3 data-source stack, capped. Absent when
+     *  the file doesn't exist / is empty / exceeds the cap; Error on a transient failure. */
+    private fun readWhole(context: Context, uri: String): ReadResult<ByteArray> {
         val ds = DinkDataSourceFactory(context.applicationContext).createDataSource()
         return try {
             ds.open(DataSpec(Uri.parse(uri)))
@@ -98,11 +120,11 @@ object ArtExtractor {
                 if (n == C.RESULT_END_OF_INPUT) break
                 out.write(buf, 0, n)
                 total += n
-                if (total > FOLDER_IMAGE_CAP) return null
+                if (total > FOLDER_IMAGE_CAP) return ReadResult.Absent
             }
-            out.toByteArray().takeIf { it.isNotEmpty() }
+            classify(out.toByteArray(), null)
         } catch (t: Throwable) {
-            null
+            classify(null, t)
         } finally {
             runCatching { ds.close() }
         }

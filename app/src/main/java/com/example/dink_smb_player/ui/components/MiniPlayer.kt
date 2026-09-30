@@ -25,6 +25,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -44,13 +46,15 @@ data class MiniPlayerState(
     val title: String = "Nothing playing",
     val artist: String = "—",
     val isPlaying: Boolean = false,
-    val progress: Float = 0f,
 )
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 fun MiniPlayer(
     state: MiniPlayerState,
+    // A lambda, read only in the scrubber's draw phase (UI-11): the 250 ms position tick then
+    // just redraws the bar instead of recomposing this Row and the caller's content lambda.
+    progress: () -> Float,
     song: Song? = null,
     onPlayPause: () -> Unit,
     onPrev: () -> Unit,
@@ -109,7 +113,7 @@ fun MiniPlayer(
         )
         TransportButton(icon = Icons.Outlined.SkipNext, onClick = onNext)
         Spacer(Modifier.width(8.dp))
-        Scrubber(progress = state.progress, modifier = Modifier.weight(1f))
+        Scrubber(progress = progress, modifier = Modifier.weight(1f))
         Spacer(Modifier.width(8.dp))
         Icon(
             imageVector = Icons.Outlined.VolumeUp,
@@ -121,21 +125,19 @@ fun MiniPlayer(
 }
 
 @Composable
-private fun Scrubber(progress: Float, modifier: Modifier = Modifier) {
+private fun Scrubber(progress: () -> Float, modifier: Modifier = Modifier) {
     val palette = LocalDinkPalette.current
+    val fill = palette.accent
     Box(
         modifier = modifier
             .height(4.dp)
             .clip(RoundedCornerShape(2.dp))
-            .background(palette.bg2),
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth(progress.coerceIn(0f, 1f))
-                .height(4.dp)
-                .background(palette.accent),
-        )
-    }
+            .background(palette.bg2)
+            // Draw-phase read of the position: no recomposition or relayout per tick.
+            .drawBehind {
+                drawRect(fill, size = Size(size.width * progress().coerceIn(0f, 1f), size.height))
+            },
+    )
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)

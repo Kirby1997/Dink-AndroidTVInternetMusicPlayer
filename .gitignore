@@ -33,3 +33,6 @@ Continuenextsession.txt
 
 # Smoke-test screenshots (regenerated locally, not source)
 tools/shots/
+
+# Python bytecode from tools/*.py
+__pycache__/

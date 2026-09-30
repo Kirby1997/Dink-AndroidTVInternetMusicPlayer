@@ -16,6 +16,7 @@ import kotlinx.coroutines.sync.withPermit
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicInteger
 
 data class DiscoveredHost(
     val name: String,
@@ -52,19 +53,17 @@ object LanScanner {
         }
 
         val nsd = ctx.getSystemService(Context.NSD_SERVICE) as? NsdManager
-        val discoveryListener = nsd?.let { manager ->
-            object : NsdManager.DiscoveryListener {
-                override fun onDiscoveryStarted(serviceType: String?) {}
-                override fun onDiscoveryStopped(serviceType: String?) {}
-                override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {}
-                override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
-                override fun onServiceLost(serviceInfo: NsdServiceInfo?) {}
-                override fun onServiceFound(info: NsdServiceInfo) {
-                    manager.resolveService(info, object : NsdManager.ResolveListener {
-                        override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {}
-                        override fun onServiceResolved(resolved: NsdServiceInfo) {
-                            val host = resolved.host ?: return
-                            val addr = host.hostAddress ?: return
+        // Below API 34 NsdManager runs ONE resolve at a time: a second resolveService while one
+        // is in flight fails at once with FAILURE_ALREADY_ACTIVE — and onServiceFound fires for
+        // every host in a burst, so only the first mDNS host was ever resolved. Resolves go
+        // through a serial queue instead (on 34+ that costs a few ms per host, nothing more).
+        val resolveQueue = nsd?.let { manager ->
+            SerialQueue<NsdServiceInfo> { info, done ->
+                manager.resolveService(info, object : NsdManager.ResolveListener {
+                    override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) = done()
+                    override fun onServiceResolved(resolved: NsdServiceInfo) {
+                        try {
+                            val addr = resolved.host?.hostAddress ?: return
                             synchronized(resultsLock) {
                                 if (!results.containsKey(addr)) {
                                     results[addr] = DiscoveredHost(
@@ -76,8 +75,25 @@ object LanScanner {
                                 }
                             }
                             emitSnapshot()
+                        } finally {
+                            done()
                         }
-                    })
+                    }
+                })
+            }
+        }
+        // The same service is often reported more than once (per interface / address family).
+        val queuedServices = HashSet<String>()
+        val discoveryListener = nsd?.let { manager ->
+            object : NsdManager.DiscoveryListener {
+                override fun onDiscoveryStarted(serviceType: String?) {}
+                override fun onDiscoveryStopped(serviceType: String?) {}
+                override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {}
+                override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
+                override fun onServiceLost(serviceInfo: NsdServiceInfo?) {}
+                override fun onServiceFound(info: NsdServiceInfo) {
+                    val fresh = synchronized(queuedServices) { queuedServices.add(info.serviceName ?: return) }
+                    if (fresh) resolveQueue?.submit(info)
                 }
             }.also { runCatching { manager.discoverServices(SMB_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, it) } }
         }
@@ -109,6 +125,7 @@ object LanScanner {
         emitSnapshot()
 
         awaitClose {
+            resolveQueue?.close()
             discoveryListener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
             sweepJob.cancel()
         }
@@ -136,5 +153,62 @@ object LanScanner {
             }
         }
         return null
+    }
+}
+
+/**
+ * Runs [start] for one item at a time, in submission order. [start] gets a `done` callback
+ * that must be invoked when the item finishes (success or failure) — only then does the next
+ * item start. A second `done` for the same item is ignored; a [start] that throws counts as
+ * done. [close] drops everything still queued (the in-flight item just finishes).
+ */
+internal class SerialQueue<T>(private val start: (item: T, done: () -> Unit) -> Unit) {
+    private companion object {
+        const val RUNNING = 0
+        const val DETACHED = 1
+        const val DONE = 2
+    }
+
+    private val lock = Any()
+    private val pending = ArrayDeque<T>()
+    private var busy = false
+    private var closed = false
+
+    fun submit(item: T) {
+        synchronized(lock) {
+            if (closed) return
+            if (busy) { pending.addLast(item); return }
+            busy = true
+        }
+        run(item)
+    }
+
+    fun close() {
+        synchronized(lock) { closed = true; pending.clear() }
+    }
+
+    private fun run(first: T) {
+        // Iterative, so a [start] that finishes synchronously doesn't recurse once per queued
+        // item. Per-item state: RUNNING while [start] is on this stack, DETACHED once it has
+        // returned with the item still in flight, DONE after `done`. If `done` lands before
+        // [start] returns, this loop advances the queue; otherwise the `done` callback does.
+        var item: T = first
+        while (true) {
+            val state = AtomicInteger(RUNNING)
+            val done: () -> Unit = {
+                if (!state.compareAndSet(RUNNING, DONE) && state.compareAndSet(DETACHED, DONE)) {
+                    next()?.let { run(it) }
+                }
+            }
+            try { start(item, done) } catch (_: Throwable) { state.compareAndSet(RUNNING, DONE) }
+            if (state.compareAndSet(RUNNING, DETACHED)) return
+            item = next() ?: return
+        }
+    }
+
+    private fun next(): T? = synchronized(lock) {
+        val n = if (closed) null else pending.removeFirstOrNull()
+        if (n == null) busy = false
+        n
     }
 }

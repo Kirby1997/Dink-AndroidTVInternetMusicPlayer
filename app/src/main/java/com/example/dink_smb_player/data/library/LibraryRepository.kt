@@ -4,16 +4,22 @@ import android.content.Context
 import com.example.dink_smb_player.data.index.IndexDao
 import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.index.MediaIndex
+import com.example.dink_smb_player.data.index.PlayStat
 import com.example.dink_smb_player.data.index.SourceEntity
 import com.example.dink_smb_player.data.index.SourceType
 import com.example.dink_smb_player.data.index.TrackEntity
+import com.example.dink_smb_player.data.index.TrackMerges
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.DinkApplication
+import com.example.dink_smb_player.data.source.ReadResult
+import com.example.dink_smb_player.data.source.SmbProbe
+import com.example.dink_smb_player.data.source.TagReadGate
 import com.example.dink_smb_player.data.source.TagReader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -46,7 +52,22 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object LibraryRepository {
 
-    private fun dao(context: Context): IndexDao = MediaIndex.get(context.applicationContext).dao
+    private fun dao(context: Context): IndexDao = daoOverride ?: MediaIndex.get(context.applicationContext).dao
+
+    /** Disk side of the index, swappable for tests. */
+    internal interface IndexIo {
+        suspend fun load(context: Context): LibraryStore.LoadResult
+        suspend fun save(context: Context, snapshot: () -> Pair<List<TrackEntity>, List<SourceEntity>>): Result<Unit>
+    }
+
+    private object StoreIo : IndexIo {
+        override suspend fun load(context: Context) = LibraryStore.load(context)
+        override suspend fun save(context: Context, snapshot: () -> Pair<List<TrackEntity>, List<SourceEntity>>) =
+            LibraryStore.save(context, snapshot)
+    }
+
+    @Volatile internal var io: IndexIo = StoreIo
+    @Volatile internal var daoOverride: IndexDao? = null
 
     @Volatile private var restored = false
     private val restoreMutex = Mutex()
@@ -58,42 +79,99 @@ object LibraryRepository {
     private val _restored = MutableStateFlow(false)
     val restoredState: StateFlow<Boolean> = _restored.asStateFlow()
 
-    // Gates [persist]. Stays true normally, but flips false if a restore finds the
-    // on-disk index present-but-unreadable: persisting then would snapshot an index
-    // that is missing that file's tracks and overwrite the (recoverable) file with
-    // an empty one — exactly the bug that wiped imported SMB tracks on restart. An
-    // authoritative reindex ([importSource] with reindexAuthoritative=true) re-enables it.
-    @Volatile private var safeToPersist = true
+    // Gates [persist]. Starts NotRestored: [persist] runs the restore first, so an early writer
+    // (LocalStorageScreen's refresh, a worker, the media-button process) can't snapshot a
+    // half-loaded index over the file. Disabled if a restore finds the on-disk index
+    // present-but-unreadable (main AND backup) and it could NOT be quarantined aside:
+    // persisting then would snapshot an index that is missing that file's tracks and
+    // overwrite the (recoverable) file with an empty one — exactly the bug that wiped
+    // imported SMB tracks on restart. (Once the bad file is moved aside there is nothing
+    // left to clobber, so the gate stays open.) That lasts for the process; the next launch
+    // retries the load. A transient load failure (I/O, OOM) also disables it, but a retry is
+    // scheduled and [persist] retries the restore first; a successful retry re-enables it.
+    private val persistGate = PersistGate()
 
-    /** Reload the on-disk index into memory at boot. Upserts (never prunes) so a
-     *  concurrent local MediaStore refresh can't be clobbered. */
-    suspend fun restore(context: Context) {
-        when (val result = LibraryStore.load(context)) {
-            is LibraryStore.LoadResult.Missing -> safeToPersist = true
+    /** Transient-restore retries scheduled from [restore]: delay = base × 2^attempt. After the
+     *  last one the UI's loading gate is released; writers still retry via [ensureRestored]. */
+    @Volatile internal var restoreRetryBaseMs = 2_000L
+    private const val RESTORE_RETRIES = 5
+    @Volatile private var restoreRetryAttempt = 0
+    private val restoreRetryPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Test hook: back to a fresh-process state. */
+    internal fun resetForTest(io: IndexIo, dao: IndexDao?) {
+        this.io = io
+        daoOverride = dao
+        restored = false
+        _restored.value = false
+        persistGate.resetForTest()
+        restoreRetryAttempt = 0
+        restoreRetryPending.set(false)
+        lastBatchPersistMs = 0L
+    }
+
+    /** Reload the on-disk index into memory. Runs under [restoreMutex] (via [ensureRestored]).
+     *  The restore merge only fills rows the index doesn't have yet, so rows a writer put in
+     *  the index before a (retried) restore finished survive it. */
+    private suspend fun restore(context: Context) {
+        when (val result = io.load(context)) {
+            is LibraryStore.LoadResult.Missing -> persistGate.onLoaded()
             is LibraryStore.LoadResult.Ok -> {
                 val dao = dao(context)
                 result.snapshot.sources.forEach { dao.upsertSource(it) }
-                dao.upsertTracks(result.snapshot.tracks)
-                safeToPersist = true
+                // Seeds the live play-stats map from the rows' stored counts (LIB-15).
+                dao.restoreTracks(result.snapshot.tracks)
+                persistGate.onLoaded()
                 // One-time migration: snapshots written before precompute existed carry null
-                // grouping keys. Compute them once and persist so subsequent boots (and the
-                // Albums/Artists views) read ready-made keys instead of normalizing at display.
-                if (result.snapshot.tracks.any { it.artistKey == null }) {
-                    recomputeGroupingKeys(context)
-                    persist(context)
-                }
+                // grouping keys, and ones from before LIB-6 carry title-only album keys.
+                // Recompute once and persist so subsequent boots (and the Albums/Artists views)
+                // read ready-made keys instead of normalizing at display. The raw write: we
+                // hold restoreMutex, which isn't reentrant.
+                if (migrateGroupingKeys(dao, result.snapshot.tracks)) persistNow(context)
             }
             is LibraryStore.LoadResult.Corrupt -> {
-                safeToPersist = false
+                // The unreadable file(s) were quarantined aside (timestamped copies) when the
+                // move succeeded: nothing is left at the index path to clobber, so keep writes on
+                // — otherwise everything imported this session is silently lost on restart. Only
+                // a file still in place (quarantine failed) keeps the gate closed.
+                persistGate.onCorrupt(quarantined = result.quarantined)
                 android.util.Log.e(
                     "LibraryRepository",
-                    "index restore failed — persistence disabled until a reindex, to avoid wiping the on-disk library",
+                    if (result.quarantined) "index unreadable — quarantined aside, starting from an empty index"
+                    else "index restore failed — persistence disabled this session, to avoid wiping the on-disk library",
                     result.error,
                 )
+            }
+            is LibraryStore.LoadResult.Transient -> {
+                // Says nothing about the file: don't write, and leave [restored] false so the
+                // next ensureRestored()/persist() retries. Keep the UI's loading gate closed while
+                // a retry is scheduled, so screens don't show "no sources — add one" over a
+                // library that is still coming.
+                persistGate.onTransientFailure()
+                android.util.Log.e("LibraryRepository", "index restore failed transiently — will retry; persistence off meanwhile", result.error)
+                scheduleRestoreRetry(context)
+                return
             }
         }
         restored = true
         _restored.value = true
+    }
+
+    /** One pending retry at a time, backing off; gives up (releasing the UI) after [RESTORE_RETRIES]. */
+    private fun scheduleRestoreRetry(context: Context) {
+        if (restoreRetryAttempt >= RESTORE_RETRIES) {
+            android.util.Log.e("LibraryRepository", "index restore still failing after $RESTORE_RETRIES retries — showing what's loaded")
+            _restored.value = true
+            return
+        }
+        if (!restoreRetryPending.compareAndSet(false, true)) return
+        val delayMs = restoreRetryBaseMs shl restoreRetryAttempt++
+        val appCtx = context.applicationContext
+        backgroundScope(appCtx).launch {
+            delay(delayMs)
+            restoreRetryPending.set(false)
+            ensureRestored(appCtx)
+        }
     }
 
     /**
@@ -104,7 +182,8 @@ object LibraryRepository {
      * in a cold process where the UI's boot restore never executed. Persisting an
      * unrestored index would overwrite library_index.json with a near-empty
      * snapshot, wiping every imported SMB/cloud track that isn't re-derived from a
-     * live source. Idempotent and cheap — guards on a process-level flag.
+     * live source. Every write path below calls this first, so a writer that races
+     * the boot restore waits for it. Idempotent and cheap — guards on a process-level flag.
      */
     suspend fun ensureRestored(context: Context) {
         if (restored) return
@@ -113,14 +192,25 @@ object LibraryRepository {
         restoreMutex.withLock { if (!restored) restore(context) }
     }
 
-    /** Snapshot the current index to disk. Called after every mutation. */
-    private suspend fun persist(context: Context) {
-        if (!safeToPersist) {
-            android.util.Log.w("LibraryRepository", "persist skipped — restore failed; not clobbering on-disk index")
-            return
+    /** Snapshot the current index to disk. Called after every mutation. Restores first if that
+     *  hasn't happened (or failed transiently). Failure (write error, or the gate is closed so
+     *  the change won't survive a restart) is logged and returned. */
+    private suspend fun persist(context: Context): Result<Unit> {
+        if (persistGate.needsRestore) ensureRestored(context)
+        return persistNow(context)
+    }
+
+    /** [persist] without the restore step — for [restore] itself, which holds restoreMutex. */
+    private suspend fun persistNow(context: Context): Result<Unit> {
+        if (!persistGate.canPersist) {
+            android.util.Log.w("LibraryRepository", "persist skipped (${persistGate.state}) — not clobbering on-disk index")
+            return Result.failure(IllegalStateException("library persistence disabled (${persistGate.state})"))
         }
-        val (tracks, sources) = dao(context).snapshot()
-        LibraryStore.save(context, tracks, sources)
+        val dao = dao(context)
+        // The snapshot is taken inside LibraryStore's write lock, so writes land in order (LIB-12).
+        // persistSnapshot folds the live play stats back into the rows (LIB-15).
+        return io.save(context) { dao.persistSnapshot() }
+            .onFailure { android.util.Log.e("LibraryRepository", "persist failed", it) }
     }
 
     /** Recompute the precomputed grouping keys (artistKey/albumKey/artistLabel) across the WHOLE
@@ -129,18 +219,31 @@ object LibraryRepository {
      *  authoritative write boundaries (import/retag) rather than per-batch. Off-main (Default).
      *  Does NOT persist — callers persist after, so the recompute and their other writes land in
      *  one snapshot. */
-    private suspend fun recomputeGroupingKeys(context: Context) {
-        val dao = dao(context)
+    internal suspend fun recomputeGroupingKeys(dao: IndexDao) {
         val all = dao.snapshot().first
         if (all.isEmpty()) return
         val updated = withContext(Dispatchers.Default) { LibraryGrouping.computeGroupingKeys(all) }
         // computeGroupingKeys preserves order and returns unchanged rows by data equality, so
         // upsert only what actually differs (typically all rows on first migration, few after).
-        val changed = all.asSequence().zip(updated.asSequence())
-            .filter { (old, new) -> old != new }
-            .map { it.second }
-            .toList()
-        if (changed.isNotEmpty()) dao.upsertTracks(changed)
+        val bases = HashMap<String, TrackEntity>()
+        val changed = ArrayList<TrackEntity>()
+        for (i in all.indices) {
+            if (all[i] != updated[i]) { bases[all[i].id] = all[i]; changed += updated[i] }
+        }
+        // Keys-only patch against the CURRENT rows: a play or a retag landing during the
+        // recompute isn't reverted, and a row pruned meanwhile isn't re-created.
+        if (changed.isNotEmpty()) dao.upsertTracks(changed, TrackMerges.keys(bases))
+    }
+
+    /** Recompute the grouping keys if any restored row's are missing or from an older scheme
+     *  ([LibraryGrouping.keysStale]: pre-precompute nulls, pre-LIB-6 title-only album keys).
+     *  Goes through [recomputeGroupingKeys], i.e. the keys-only merge: play stats (IndexDao's
+     *  map), addedAt and every other field stay as restored. Returns true if it ran — the
+     *  caller then persists once so the next boot finds current keys and skips this. */
+    internal suspend fun migrateGroupingKeys(dao: IndexDao, restored: List<TrackEntity>): Boolean {
+        if (restored.none(LibraryGrouping::keysStale)) return false
+        recomputeGroupingKeys(dao)
+        return true
     }
 
     // Process-cached, app-scoped projection of the index into the UI [Song] model.
@@ -188,6 +291,10 @@ object LibraryRepository {
         dao(context).observeRecentlyAdded(limit).map { rows -> rows.map(TrackEntity::toSong) }
             .flowOn(Dispatchers.Default)
 
+    /** Live play stats by track id (count + last played). Separate from [songs] so a play
+     *  doesn't re-emit the whole library (LIB-15): read this where plays are shown or sorted on. */
+    fun playStats(context: Context): StateFlow<Map<String, PlayStat>> = dao(context).playStats
+
     fun recentlyPlayed(context: Context, limit: Int = 20): Flow<List<Song>> =
         dao(context).observeRecentlyPlayed(limit).map { rows -> rows.map(TrackEntity::toSong) }
             .flowOn(Dispatchers.Default)
@@ -204,48 +311,32 @@ object LibraryRepository {
 
     /**
      * Replace the indexed contents of one source with [tracks] (upsert present,
-     * prune absent), and refresh its [SourceEntity] stats. This is the import +
-     * monitor write path — call from a background coroutine.
+     * prune absent), and refresh its [SourceEntity] stats. This is the local MediaStore
+     * write path — call from a background coroutine. Restores first: merging into an
+     * index the boot restore hasn't filled yet would be persisted without the SMB rows.
      */
     suspend fun importSource(
         context: Context,
         source: SourceEntity,
         tracks: List<TrackEntity>,
-        // A user-initiated full reindex of a source is authoritative: it re-enables
-        // persistence after a failed restore disabled it, so a manual resync can
-        // recover the on-disk index. Automatic/boot imports leave the gate as-is.
-        reindexAuthoritative: Boolean = false,
-    ) {
-        if (reindexAuthoritative) safeToPersist = true
-        val dao = dao(context)
-        val existing = HashMap<String, TrackEntity>()
-        for (t in dao.snapshot().first) {
-            if (t.sourceType == source.type && t.sourceId == source.id) existing[t.id] = t
-        }
-        // Rows are rebuilt from the source each time; carry over what only the index knows
-        // (first-seen time, play stats, retag marker, grouping keys). Without this every
-        // local refresh reset play history and re-dated every local track as "new".
-        val merged = tracks.map { t ->
-            val e = existing[t.id] ?: return@map t
-            t.copy(
-                addedAtMs = e.addedAtMs,
-                lastPlayedMs = e.lastPlayedMs,
-                playCount = e.playCount,
-                retagAttemptedMs = t.retagAttemptedMs ?: e.retagAttemptedMs,
-                artistKey = e.artistKey,
-                albumKey = e.albumKey,
-                artistLabel = e.artistLabel,
-            )
-        }
-        // Nothing changed (the normal case for a launch/monitor rescan): skip the upsert,
-        // the 25k-row grouping recompute and the full library-file rewrite, and don't
-        // re-emit the library to every screen.
-        if (!reindexAuthoritative && merged.size == existing.size && merged.all { existing[it.id] == it }) {
-            return
-        }
+    ): Result<Unit> {
+        ensureRestored(context)
+        if (!mergeSource(dao(context), source, tracks)) return Result.success(Unit)
+        return persist(context)
+    }
+
+    /** [importSource] minus the disk write. Returns false when nothing changed (the normal
+     *  launch/monitor rescan): then no stats, no 25k-row grouping recompute, no file rewrite,
+     *  and no re-emit of the library to every screen. */
+    internal suspend fun mergeSource(dao: IndexDao, source: SourceEntity, tracks: List<TrackEntity>): Boolean {
+        // Rows are rebuilt from the source each time; the Local merge carries over what only the
+        // index knows (first-seen time, play stats, retag stamp, grouping keys) from the CURRENT
+        // row. Without this every local refresh reset play history and re-dated every local
+        // track as "new".
+        val changed = dao.upsertTracks(tracks, TrackMerges.Local)
+        val pruned = dao.pruneSource(source.type, source.id, tracks.map { it.uri })
+        if (changed == 0 && pruned == 0) return false
         dao.upsertSource(source)
-        dao.upsertTracks(merged)
-        dao.pruneSource(source.type, source.id, merged.map { it.uri })
         dao.updateSourceStats(
             id = source.id,
             ts = System.currentTimeMillis(),
@@ -253,8 +344,8 @@ object LibraryRepository {
             size = tracks.sumOf { it.sizeBytes },
             statusJson = null,
         )
-        recomputeGroupingKeys(context)
-        persist(context)
+        recomputeGroupingKeys(dao)
+        return true
     }
 
     /**
@@ -263,8 +354,11 @@ object LibraryRepository {
      * [scopePrefixes] and vanished from the scan — every other imported folder of
      * the same source is left untouched. This is the folder-scoped import/re-import
      * path: it does NOT re-walk or prune the rest of the share. Returns the source's
-     * new total track count. Authoritative (re-enables persistence after a failed
-     * restore), since it's a user-initiated import.
+     * new total track count once it is on disk, or the persist failure — the change is
+     * then in memory only and lost on restart, so callers must report an error, not
+     * "Imported N". NOT authoritative: it covers one folder, so it never re-enables
+     * persistence after a failed restore (that would overwrite the rest of the library on
+     * disk with this folder alone).
      */
     suspend fun importScoped(
         context: Context,
@@ -275,11 +369,25 @@ object LibraryRepository {
         // enumeration was COMPLETE — a partial/failed walk returns a subset, and pruning
         // against it deletes real, still-present files. Pass the walk's `complete` flag.
         prune: Boolean = true,
-    ): Int {
-        safeToPersist = true
+    ): Result<Int> {
+        ensureRestored(context)
         val dao = dao(context)
+        // Source removed while this walk ran: drop everything rather than re-create it (LIB-5).
+        if (!dao.acceptsWrites(source.id)) return Result.success(0)
+        val total = importScopedIn(dao, source, freshTracks, scopePrefixes, prune)
+        return persist(context).map { total }
+    }
+
+    /** [importScoped] minus the disk write (and the removed-source early return). */
+    internal suspend fun importScopedIn(
+        dao: IndexDao,
+        source: SourceEntity,
+        freshTracks: List<TrackEntity>,
+        scopePrefixes: List<String>,
+        prune: Boolean,
+    ): Int {
         dao.upsertSource(source)
-        dao.upsertTracks(freshTracks)
+        dao.upsertTracks(freshTracks, TrackMerges.Walk)
         if (prune) {
             val existing = dao.observeTracksFor(source.type, source.id).first()
             val keepUris = buildSet {
@@ -296,8 +404,7 @@ object LibraryRepository {
             size = total.sumOf { it.sizeBytes },
             statusJson = null,
         )
-        recomputeGroupingKeys(context)
-        persist(context)
+        recomputeGroupingKeys(dao)
         return total.size
     }
 
@@ -318,10 +425,29 @@ object LibraryRepository {
         // a TV boot, transient network drop) returns a subset; pruning against it deletes
         // real tracks and wipes the library. When false this is upsert-only — never deletes.
         prune: Boolean = true,
-    ) {
-        if (monitoredPrefixes.isEmpty()) return
-        val dao = dao(context)
-        dao.upsertTracks(freshTracks)
+    ): Result<Unit> {
+        ensureRestored(context)
+        if (!reconcileMonitored(dao(context), source, freshTracks, monitoredPrefixes, prune)) {
+            return Result.success(Unit)
+        }
+        return persist(context)
+    }
+
+    /** [refreshMonitored] minus the disk write. Upserts via the walk merge (only new or changed
+     *  rows are rewritten) and returns false when the pass changed nothing — the normal case for
+     *  a periodic monitor — so the caller skips the stats, the whole-library grouping recompute
+     *  and the index-file rewrite. */
+    internal suspend fun reconcileMonitored(
+        dao: IndexDao,
+        source: SourceEntity,
+        freshTracks: List<TrackEntity>,
+        monitoredPrefixes: List<String>,
+        prune: Boolean,
+    ): Boolean {
+        if (monitoredPrefixes.isEmpty()) return false
+        if (!dao.acceptsWrites(source.id)) return false
+        val changed = dao.upsertTracks(freshTracks, TrackMerges.Walk)
+        var pruned = 0
         if (prune) {
             val existing = dao.observeTracksFor(source.type, source.id).first()
             // Keep: every row that is NOT inside a monitored folder, plus the fresh scan
@@ -331,8 +457,9 @@ object LibraryRepository {
                 existing.forEach { t -> if (monitoredPrefixes.none { t.path.startsWith(it) }) add(t.uri) }
                 freshTracks.forEach { add(it.uri) }
             }
-            dao.pruneSource(source.type, source.id, keepUris.toList())
+            pruned = dao.pruneSource(source.type, source.id, keepUris.toList())
         }
+        if (changed == 0 && pruned == 0) return false
         val total = dao.observeTracksFor(source.type, source.id).first()
         dao.updateSourceStats(
             id = source.id,
@@ -341,8 +468,8 @@ object LibraryRepository {
             size = total.sumOf { it.sizeBytes },
             statusJson = null,
         )
-        recomputeGroupingKeys(context)
-        persist(context)
+        recomputeGroupingKeys(dao)
+        return true
     }
 
     /**
@@ -350,19 +477,20 @@ object LibraryRepository {
      * crash during a long initial walk (25k SMB files = minutes) doesn't lose everything.
      * Upsert-only — no prune, no stats — the final [importScoped] reconciles the full set.
      * Because track ids are deterministic ([trackIdFor]), a resumed import reuses these
-     * rows and skips re-reading their tags. Authoritative (user-initiated import), so it
-     * re-enables persistence after a failed restore.
+     * rows and skips re-reading their tags. NOT authoritative — never re-enables
+     * persistence after a failed restore (see [importScoped]).
      */
     @Volatile private var lastBatchPersistMs = 0L
     private val BATCH_PERSIST_INTERVAL_MS = 3_000L
 
     suspend fun upsertBatch(context: Context, tracks: List<TrackEntity>) {
         if (tracks.isEmpty()) return
-        safeToPersist = true
+        ensureRestored(context)
         val dao = dao(context)
         // The index is in-memory, so this upsert is cheap and immediately re-emits to
         // the live `songs()` flow — that's what populates the Library view progressively.
-        dao.upsertTracks(tracks)
+        // Nothing new (a resumed walk re-flushing rows already indexed): no snapshot.
+        if (dao.upsertTracks(tracks, TrackMerges.Walk) == 0) return
         // The disk snapshot (full JSON serialize) is the expensive part, so throttle it
         // mid-walk instead of snapshotting on every batch. The caller's final importScoped
         // persists unconditionally, so the completed import is always fully on disk; the
@@ -375,15 +503,61 @@ object LibraryRepository {
         }
     }
 
+    // Callers run this inside SourceLocks.remove, which tombstones [sourceId] first — from then
+    // on the DAO drops any late write for it (LIB-5), so the delete below is final.
     suspend fun removeSource(context: Context, type: SourceType, sourceId: String) {
+        ensureRestored(context)
         val dao = dao(context)
         dao.deleteSourceTracks(type, sourceId)
         dao.deleteSource(sourceId)
         persist(context)
     }
 
+    /** Record a play (LIB-15: patches the play-stats map, not the track list) and schedule a
+     *  debounced persist (LIB-3) — plays were never written to disk before. */
     suspend fun markPlayed(context: Context, trackId: String) {
-        dao(context).markPlayed(trackId, System.currentTimeMillis())
+        if (dao(context).markPlayed(trackId, System.currentTimeMillis())) playPersister(context).request()
+    }
+
+    /** Fire-and-forget [markPlayed] off-main — the player's play-credit sink, wired once per
+     *  process (DinkApplication) so plays count with no UI (a media-key cold start).
+     *  Restores the index first: in a cold process the played row may not be loaded yet. */
+    fun recordPlay(context: Context, trackId: String) {
+        val appCtx = context.applicationContext
+        backgroundScope(appCtx).launch {
+            ensureRestored(appCtx)
+            markPlayed(appCtx, trackId)
+        }
+    }
+
+    /** Process-lifetime scope on Dispatchers.Default (the app's, or a private one in tests). */
+    private fun backgroundScope(appCtx: Context): CoroutineScope {
+        val scope = (appCtx as? DinkApplication)?.appScope
+            ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        return CoroutineScope(scope.coroutineContext + Dispatchers.Default)
+    }
+
+    /** Write any play not yet on disk now. Called on process ON_STOP (DinkApplication). */
+    suspend fun flushPendingWrites() {
+        playPersister?.flush()
+    }
+
+    private const val PLAY_PERSIST_DEBOUNCE_MS = 2_000L
+    @Volatile private var playPersister: DebouncedWriter? = null
+
+    /** One app-lifetime writer: plays landing within [PLAY_PERSIST_DEBOUNCE_MS] share one
+     *  snapshot. Goes through [persist], so the PersistGate still applies; a failed or gated
+     *  write stays pending for the next play / flush. */
+    private fun playPersister(context: Context): DebouncedWriter {
+        playPersister?.let { return it }
+        return synchronized(this) {
+            playPersister ?: run {
+                val appCtx = context.applicationContext
+                DebouncedWriter(backgroundScope(appCtx), PLAY_PERSIST_DEBOUNCE_MS) {
+                    persist(appCtx).isSuccess
+                }.also { playPersister = it }
+            }
+        }
     }
 
     /** Progress of an in-flight [retagAll], for the Settings UI. null = idle.
@@ -395,6 +569,9 @@ object LibraryRepository {
         val changed: Int,
         val running: Boolean,
         val ratePerSec: Double = 0.0,
+        /** Why the last write of the retagged rows failed, or null. Set = the updates are in
+         *  memory only and will be lost on restart; the UI must not report them as saved. */
+        val saveError: String? = null,
     ) {
         /** Seconds of work left at the current rate, or null until a rate is known. */
         val etaSeconds: Long?
@@ -457,20 +634,25 @@ object LibraryRepository {
      */
     suspend fun retagAll(context: Context, force: Boolean = false): Int {
         if (_retagProgress.value?.running == true) return 0
+        ensureRestored(context)
         val dao = dao(context)
         // Remote rows that still look filename-derived (title == file stem) OR are missing
         // a duration (durationMs <= 0 — imported before duration reading existed). A row
         // with a real name AND a duration is skipped, so this is cheap to re-run and resumes
         // after an interrupt instead of re-reading 25k. The same probe fills both.
         //
-        // Every processed row is stamped with retagAttemptedMs, and a normal run skips rows that
-        // already carry one — so the unfixable residue (correct titles that happen to equal the
-        // filename; genuinely untagged files) is read ONCE and then never re-checked. A forced
-        // run ([force]) ignores the stamp and re-reads every candidate.
+        // A row whose read was CONCLUSIVE (tags found, or the file genuinely has none) is stamped
+        // with retagAttemptedMs, and a normal run skips rows that already carry one — so the
+        // unfixable residue (correct titles that happen to equal the filename; genuinely untagged
+        // files) is read ONCE and then never re-checked. A transient failure (NAS down, timeout)
+        // is NOT stamped, so it's retried next run. A forced run ([force]) ignores the stamp and
+        // re-reads the tags of EVERY remote row (as its Settings text says) — the way rows indexed
+        // before a reader improvement (e.g. the album-artist tag) pick up the new field.
         val rows = dao.snapshot().first.filter {
             it.sourceType != SourceType.Local &&
-                (force || it.retagAttemptedMs == null) &&
-                (looksFilenameDerived(it) || it.durationMs <= 0L || durationLooksBogus(it) || hasMojibake(it))
+                dao.acceptsWrites(it.sourceId) &&
+                needsRetagAttempt(it, force) &&
+                (force || looksFilenameDerived(it) || it.durationMs <= 0L || durationLooksBogus(it) || hasMojibake(it))
         }
         val total = rows.size
         if (total == 0) {
@@ -485,6 +667,12 @@ object LibraryRepository {
         val lightGate = Semaphore(RETAG_CONCURRENCY_LIGHT)
         val done = AtomicInteger(0)
         val changed = AtomicInteger(0)
+        val failed = AtomicInteger(0)
+        // Last persist failure, surfaced in the progress state (optimistic-persist rule).
+        val saveError = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        suspend fun persistChecked() {
+            persist(context).onFailure { t -> saveError.set(t.message ?: t::class.simpleName ?: "write failed") }
+        }
         // Wall-clock start + last-emit guard: progress is published per ROW (not per 500-row
         // chunk) so the UI count moves continuously instead of jumping once a chunk and
         // looking frozen for minutes. Emits are time-throttled to avoid spamming the StateFlow
@@ -500,32 +688,50 @@ object LibraryRepository {
             val d = done.get()
             val elapsedSec = (now - startMs) / 1000.0
             val rate = if (elapsedSec > 0.0) d / elapsedSec else 0.0
-            _retagProgress.value = RetagProgress(d, total, changed.get(), running, rate)
+            _retagProgress.value = RetagProgress(d, total, changed.get(), running, rate, saveError.get())
         }
         // Process in chunks and persist after each: peak heap is bounded by the gates (only
         // RETAG_CONCURRENCY_HEAVY tail-loaded reads buffer big tails at once), and chunking
         // makes the rescan crash-resumable — a kill loses at most one chunk, and rows already
         // persisted with real titles/durations are skipped on rerun.
         withContext(Dispatchers.IO) {
+            val bases = rows.associateBy { it.id }
             rows.chunked(RETAG_CHUNK).forEach { chunk ->
                 val updates = Collections.synchronizedList(ArrayList<TrackEntity>())
                 coroutineScope {
                     chunk.forEach { row ->
                         launch {
                             val gate = if (isTailLoaded(row.path)) heavyGate else lightGate
-                            gate.withPermit {
+                            // Retag doesn't run under SourceLocks: a source deleted mid-run is
+                            // skipped here (no SMB read), and the DAO drops any write for it.
+                            if (dao.acceptsWrites(row.sourceId)) gate.withPermit {
                                 // Read over SMB ONLY the field this row is actually missing.
                                 // Title still filename-derived → re-read embedded tags; already
                                 // a real title → skip the 1-3s tag retrieve. Duration missing →
                                 // probe it; already present → skip a whole second SMB open.
-                                val tagsNeeded = looksFilenameDerived(row)
+                                val tagsNeeded = force || looksFilenameDerived(row)
                                 val durationNeeded = row.durationMs <= 0L || durationLooksBogus(row)
-                                val tags = TagReader.read(
-                                    context,
-                                    row.uri,
-                                    tagsNeeded = tagsNeeded,
-                                    durationNeeded = durationNeeded,
-                                )
+                                // One shared SMB handle for this row's duration probe, its
+                                // retriever fallback and the tail tag read (WP-I), as import does.
+                                // Size is the last walk's listing; 0 (never recorded) → unknown,
+                                // since the probe would otherwise trust it as the file length.
+                                val knownSize = row.sizeBytes.takeIf { it > 0 } ?: -1L
+                                // Inside the per-run caps, the process-wide TagReadGate keeps the
+                                // retag plus any concurrent walks under Media3's retriever cap.
+                                val result = TagReadGate.withPermit(row.path) {
+                                    SmbProbe.session(row.uri, knownSize) {
+                                        TagReader.readResult(
+                                            context,
+                                            row.uri,
+                                            tagsNeeded = tagsNeeded,
+                                            durationNeeded = durationNeeded,
+                                        )
+                                    }
+                                }
+                                if (result is ReadResult.Error) failed.incrementAndGet()
+                                // Partial reads (Error.partial) still merge — only the stamp
+                                // depends on whether the read was conclusive.
+                                val tags = result.valueOrNull()
                                 // Merge any tags we read over the existing row (unchanged when the
                                 // read found nothing), then repair any field still carrying mojibake
                                 // from a corrupt embedded tag by re-deriving it from the file path —
@@ -536,6 +742,7 @@ object LibraryRepository {
                                         title = tags.title?.ifBlank { null } ?: row.title,
                                         artist = tags.artist?.ifBlank { null } ?: row.artist,
                                         albumTitle = tags.album?.ifBlank { null } ?: row.albumTitle,
+                                        albumArtist = tags.albumArtist?.ifBlank { null } ?: row.albumArtist,
                                         year = tags.year ?: row.year,
                                         trackNumber = tags.trackNumber ?: row.trackNumber,
                                         durationMs = tags.durationMs?.takeIf { it > 0 } ?: row.durationMs,
@@ -554,12 +761,13 @@ object LibraryRepository {
                                     )
                                 }
                                 // A real content change (name/duration/etc) counts toward the
-                                // "updated N" the UI shows. Regardless, stamp the row as attempted
-                                // so a normal rerun skips it — this is what stops the residue from
-                                // being re-read on every press.
+                                // "updated N" the UI shows. A conclusive read stamps the row as
+                                // attempted so a normal rerun skips it — this is what stops the
+                                // residue from being re-read on every press; a transient failure
+                                // leaves it unstamped for the next run.
                                 val contentChanged = merged != row
                                 if (contentChanged) changed.incrementAndGet()
-                                val stamped = merged.copy(retagAttemptedMs = System.currentTimeMillis())
+                                val stamped = retagStamped(merged, result, System.currentTimeMillis())
                                 if (stamped != row) updates.add(stamped)
                             }
                             done.incrementAndGet()
@@ -568,19 +776,53 @@ object LibraryRepository {
                     }
                 }
                 if (updates.isNotEmpty()) {
-                    dao.upsertTracks(updates)
-                    persist(context)
+                    // Patch only what the retag changed onto the CURRENT rows: plays and
+                    // enrichment that landed while the chunk was reading survive, and a row
+                    // pruned (or a source removed) meanwhile isn't re-created.
+                    dao.upsertTracks(updates, TrackMerges.retag(bases))
+                    persistChecked()
                 }
                 emitProgress(running = true, force = true)
             }
         }
         // Tags (artist/album) may have changed, so the grouping keys are now stale — recompute
         // across the whole library once and persist the corrected keys.
-        recomputeGroupingKeys(context)
-        persist(context)
+        recomputeGroupingKeys(dao)
+        // A later successful write carries every earlier chunk too, so only the final
+        // outcome decides whether the run is on disk.
+        saveError.set(null)
+        persistChecked()
         emitProgress(running = false, force = true)
+        saveError.get()?.let { android.util.Log.e("LibraryRepository", "retag: results not saved — $it") }
+        if (failed.get() > 0) {
+            android.util.Log.i("LibraryRepository", "retag: ${failed.get()} of $total reads failed transiently; left unstamped for retry")
+        }
         return changed.get()
     }
+
+    /** Version of the retag stamping logic. Stamps written by an older version (retagVersion
+     *  below this) count as unstamped, so the residue is re-read once under the new logic.
+     *  v1: transient read failures are no longer stamped (v0 stamped every outcome). */
+    internal const val RETAG_VERSION = 1
+
+    /** Whether a normal (or [force]d) retag should read [row]: never conclusively read, or
+     *  only stamped by an older [RETAG_VERSION]. */
+    internal fun needsRetagAttempt(row: TrackEntity, force: Boolean): Boolean =
+        force || row.retagAttemptedMs == null || row.retagVersion < RETAG_VERSION
+
+    /** SRC-8: whether a walk should (re-)read the tags of already-indexed [stored] given the file's
+     *  listing ([sizeBytes], last-write [mtimeMs]): the file changed in place, or the row still has
+     *  no duration and no conclusive read is recorded for it (so it isn't re-read every pass). */
+    internal fun needsRescanRead(stored: TrackEntity, sizeBytes: Long, mtimeMs: Long?): Boolean =
+        TrackMerges.fileChanged(stored, sizeBytes, mtimeMs) ||
+            (stored.durationMs <= 0L && needsRetagAttempt(stored, force = false))
+
+    /** [merged] with its retag stamp decided by the read [result]: Found/Absent are conclusive
+     *  → stamped now at [RETAG_VERSION]; Error (transient) → stamp left as it was, so the row
+     *  is retried next run. */
+    internal fun retagStamped(merged: TrackEntity, result: ReadResult<*>, nowMs: Long): TrackEntity =
+        if (result is ReadResult.Error) merged
+        else merged.copy(retagAttemptedMs = nowMs, retagVersion = RETAG_VERSION)
 
     /** True when the row's title still equals its filename stem — i.e. it was indexed
      *  from the path and never got real embedded tags. Cheap heuristic, no I/O. */
@@ -595,7 +837,7 @@ object LibraryRepository {
     private fun hasMojibake(row: TrackEntity): Boolean =
         looksMojibake(row.title) || looksMojibake(row.artist) || looksMojibake(row.albumTitle)
 
-    private fun looksMojibake(s: String?): Boolean {
+    internal fun looksMojibake(s: String?): Boolean {
         if (s == null) return false
         for (i in s.indices) {
             val c = s[i].code
@@ -624,7 +866,7 @@ object LibraryRepository {
      *  truncated-probe artifact (old 5s deadline reported fake 5-16s durations whose implied
      *  bitrate ran to thousands of kbps; lossy audio tops out near 320, lossless near ~1400).
      *  Such a row is re-probed by retag even though it already has a (wrong) duration > 0. */
-    private fun durationLooksBogus(row: TrackEntity): Boolean {
+    internal fun durationLooksBogus(row: TrackEntity): Boolean {
         if (row.sizeBytes <= 0L || row.durationMs <= 0L) return false
         val impliedKbps = row.sizeBytes * 8.0 / row.durationMs
         return impliedKbps > BOGUS_DURATION_KBPS
@@ -646,9 +888,25 @@ object LibraryRepository {
         year: Int?,
         trackNumber: Int?,
         durationMs: Long?,
-    ) {
-        val dao = dao(context)
-        val existing = dao.trackById(songId) ?: return
+    ): Result<Unit> {
+        if (!enrichIn(dao(context), songId, title, artist, albumTitle, year, trackNumber, durationMs)) {
+            return Result.success(Unit)
+        }
+        return persist(context)
+    }
+
+    /** [enrichTrack] minus the disk write; false = nothing changed. */
+    internal suspend fun enrichIn(
+        dao: IndexDao,
+        songId: String,
+        title: String?,
+        artist: String?,
+        albumTitle: String?,
+        year: Int?,
+        trackNumber: Int?,
+        durationMs: Long?,
+    ): Boolean {
+        val existing = dao.trackById(songId) ?: return false
         val updated = existing.copy(
             title = title?.ifBlank { null } ?: existing.title,
             artist = artist?.ifBlank { null } ?: existing.artist,
@@ -657,19 +915,38 @@ object LibraryRepository {
             trackNumber = trackNumber ?: existing.trackNumber,
             durationMs = durationMs?.takeIf { it > 0 } ?: existing.durationMs,
         )
-        if (updated == existing) return
-        dao.upsertTracks(listOf(updated))
-        persist(context)
+        if (updated == existing) return false
+        dao.upsertTracks(listOf(updated), TrackMerges.enrich(existing))
+        // LIB-13: the grouping keys were derived from the old artist/album — without this the
+        // enriched track stays filed under its folder-derived artist/album until the next
+        // import or retag. Keys use library-wide collaboration stats, hence the full pass
+        // (memoised normalisation; only changed rows are written).
+        if (updated.artist != existing.artist || updated.albumTitle != existing.albumTitle) {
+            recomputeGroupingKeys(dao)
+        }
+        return true
     }
 }
 
 /** Deterministic primary key so re-imports of the same file update in place rather
  *  than duplicating. Matches [TrackEntity.id]'s documented `sha1(type+source+path)`. */
 fun trackIdFor(type: SourceType, sourceId: String, path: String): String {
-    val digest = MessageDigest.getInstance("SHA-1")
-        .digest("$type|$sourceId|$path".toByteArray(Charsets.UTF_8))
-    return digest.joinToString("") { "%02x".format(it) }
+    val digest = SHA1.get()!!.digest("$type|$sourceId|$path".toByteArray(Charsets.UTF_8))
+    // Runs once per file per monitor pass (25k+): a lookup table instead of a
+    // String.format per byte. Output is byte-identical to the old "%02x" form.
+    val out = CharArray(digest.size * 2)
+    for (i in digest.indices) {
+        val b = digest[i].toInt() and 0xff
+        out[i * 2] = HEX_DIGITS[b ushr 4]
+        out[i * 2 + 1] = HEX_DIGITS[b and 0x0f]
+    }
+    return String(out)
 }
+
+// MessageDigest isn't thread-safe; one per thread (the walk runs parallel) avoids a
+// provider lookup per call. digest() resets it for the next use.
+private val SHA1: ThreadLocal<MessageDigest> = ThreadLocal.withInitial { MessageDigest.getInstance("SHA-1") }
+private val HEX_DIGITS = "0123456789abcdef".toCharArray()
 
 fun TrackEntity.toSong(): Song = Song(
     id = id,

@@ -7,10 +7,10 @@ import android.media.MediaMetadataRetriever
  * Reads a track's playback DURATION at IMPORT time — including remote SMB / cloud
  * tracks — WITHOUT downloading the file.
  *
- * Media3's [androidx.media3.exoplayer.MetadataRetriever] (used by [TagReader] for
- * tags) does not surface duration in media3 1.4, so this fills the gap: it drives the
- * platform [MediaMetadataRetriever] over a [MediaDataSource] that is itself backed by
- * our own [DinkDataSourceFactory]. The extractor pulls only the bytes it needs
+ * Media3's [androidx.media3.inspector.MetadataRetriever] (used by [TagReader] for
+ * tags) only estimates VBR MP3 duration from the first frame's bitrate, so this fills the
+ * gap: it drives the platform [MediaMetadataRetriever] over a [MediaDataSource] that is
+ * itself backed by our own [DinkDataSourceFactory]. The extractor pulls only the bytes it needs
  * (container header for MP3/FLAC, metadata atom for M4A) over smbj or HTTP Range.
  *
  * A byte BUDGET caps total transfer so a probe can never fall through to downloading a
@@ -38,31 +38,43 @@ object DurationReader {
      *  rejected (see truncated check) rather than stored wrong. */
     private const val PROBE_TIMEOUT_MS = 20_000L
 
-    fun read(context: Context, uri: String): Long? {
+    /** Duration probe outcome: [durationMs] (null = none), and the transient-or-not
+     *  [failure] that cut the probe short, if any (null when the file was read conclusively
+     *  or only the byte budget stopped it). See [ReadFailures]. */
+    internal data class Probe(val durationMs: Long?, val failure: Throwable? = null)
+
+    fun read(context: Context, uri: String): Long? = probe(context, uri).durationMs
+
+    internal fun probe(context: Context, uri: String): Probe {
         // MP3s (≈the whole library): parse the Xing/Info VBR header directly — ~4KB, exact,
-        // no whole-file scan. The platform retriever below is the fallback for everything
+        // no whole-file scan. Inside an SmbProbe session both paths read one shared handle. The platform retriever below is the fallback for everything
         // else (M4A/FLAC) and for any MP3 the parser can't confidently read.
         if (uri.substringBefore('?').endsWith(".mp3", ignoreCase = true)) {
-            Mp3DurationParser.read(context, uri)?.let { return it }
+            Mp3DurationParser.read(context, uri)?.let { return Probe(it) }
         }
         val retriever = MediaMetadataRetriever()
         val deadline = android.os.SystemClock.elapsedRealtime() + PROBE_TIMEOUT_MS
         val src = Media3MediaDataSource(context.applicationContext, uri, PROBE_BUDGET_BYTES, deadline)
         return try {
             retriever.setDataSource(src)
-            val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLongOrNull()
-                ?.takeIf { it > 0 }
-            // CRITICAL: a probe cut short by our budget/deadline/a read error makes the platform
-            // retriever derive duration from the PARTIAL stream — a too-short bogus value, not
-            // null. Discard it and fall back to playback-time enrichment instead of storing a
-            // wrong duration that would also be sticky (retag skips rows that already have one).
-            if (src.truncated) null else dur
+            resolve(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION), src.truncated, src.failure)
         } catch (t: Throwable) {
-            null
+            Probe(null, src.failure)
         } finally {
             runCatching { retriever.release() }
             runCatching { src.close() }
         }
+    }
+
+    /**
+     * The platform retriever's raw duration string → [Probe]. CRITICAL: a probe cut short by
+     * our budget/deadline/a read error ([truncated]) makes the platform retriever derive
+     * duration from the PARTIAL stream — a too-short bogus value, not null. Discard it and fall
+     * back to playback-time enrichment instead of storing a wrong duration that would also be
+     * sticky (retag skips rows that already have one).
+     */
+    internal fun resolve(rawDuration: String?, truncated: Boolean, failure: Throwable?): Probe {
+        val dur = rawDuration?.trim()?.toLongOrNull()?.takeIf { it > 0 }
+        return Probe(if (truncated) null else dur, failure)
     }
 }
