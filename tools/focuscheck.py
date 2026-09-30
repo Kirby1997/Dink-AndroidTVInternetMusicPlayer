@@ -68,16 +68,28 @@ def dump():
         root = ET.fromstring(m.group(0))
     except ET.ParseError:
         return None
+    def box(n):
+        b = re.findall(r"\d+", n.get("bounds", ""))
+        return tuple(int(x) for x in b[:4]) if len(b) >= 4 else (0, 0, 0, 0)
+
     for n in root.iter("node"):
         if n.get("focused") == "true":
-            b = re.findall(r"\d+", n.get("bounds", ""))
-            bounds = tuple(int(x) for x in b[:4]) if len(b) >= 4 else (0, 0, 0, 0)
+            bounds = box(n)
+            # What the focused item SHOWS: the text of every node drawn inside it. A
+            # scrolling list keeps the focused item at the same screen position, so
+            # bounds alone can't tell "moved to the next row" from "didn't move".
+            x1, y1, x2, y2 = bounds
+            shown = tuple(
+                m.get("text", "") for m in root.iter("node")
+                if m.get("text") and x1 <= box(m)[0] <= x2 and y1 <= box(m)[1] <= y2
+            )
             return {
                 "id": n.get("resource-id", ""),
                 "cls": (n.get("class", "") or "").split(".")[-1],
                 "text": n.get("text", ""),
                 "desc": n.get("content-desc", ""),
                 "bounds": bounds,
+                "shown": shown,
             }
     return None
 
@@ -127,11 +139,19 @@ SEQ = ["DOWN", "DOWN", "DOWN", "RIGHT", "RIGHT", "DOWN",
        "UP", "UP", "RIGHT", "DOWN", "DOWN", "UP"]
 
 
-def left_reaches_rail():
-    """True if LEFT from the current (content) focus lands on the rail. Restores focus
-    to content afterwards (RIGHT, else re-commit via CENTER)."""
+def same_item(a, b):
+    """Same focused item: same node, same place, showing the same thing."""
+    return bool(a and b and a["bounds"] == b["bounds"] and a["id"] == b["id"]
+                and a.get("shown") == b.get("shown"))
+
+
+def left_escapes(before):
+    """True if LEFT gets the user out of [before]: either onto the rail, or onto a
+    sibling (a grid's right-hand column — LEFT walks back along the row, which is not a
+    trap). Restores focus afterwards (RIGHT, else re-commit via CENTER)."""
     press("LEFT")
-    ok = zone(dump()) == "RAIL"
+    after = dump()
+    ok = zone(after) == "RAIL" or not same_item(before, after)
     if ok:
         press("RIGHT")
         if zone(dump()) != "CONTENT":
@@ -177,19 +197,19 @@ def crawl(name):
         if pz == "CONTENT" and z == "RAIL" and key not in RAIL_OK_KEYS:
             issues.append(f"DRAWER_LEAK {key} (step {i}) opened the rail from content")
         # movement tracking for trap detection
-        if cur and prev and cur["bounds"] == prev["bounds"] and cur["id"] == prev["id"]:
+        if same_item(cur, prev):
             stuck += 1
             if stuck >= 4:
                 # One focusable and nowhere else to go is legitimate as long as LEFT
                 # still reaches the rail; only flag when the user truly can't leave.
                 if escape_checked or zone(cur) != "CONTENT":
                     pass
-                elif left_reaches_rail():
-                    rows.append(("LEFT", "RAIL", "single focusable; LEFT reaches rail — not a trap"))
+                elif left_escapes(cur):
+                    rows.append(("LEFT", "-", "LEFT leaves this item (rail or sibling) — not a trap"))
                     cur = dump()
                 else:
                     issues.append(f"TRAP        focus stuck at {label(cur)} for {stuck} presses "
-                                  f"and LEFT does not reach the rail")
+                                  f"and LEFT does not leave it")
                 escape_checked = True
                 stuck = 0
         else:
@@ -351,8 +371,8 @@ def empty_states():
             shot(f"empty_{target}")
             if zone(cur) != "CONTENT":
                 issues.append("CENTER left focus in the rail — screen has no focus target")
-            elif not left_reaches_rail():
-                issues.append(f"TRAP        LEFT from {label(cur)} does not reach the rail")
+            elif not left_escapes(cur):
+                issues.append(f"TRAP        LEFT from {label(cur)} does not leave it")
         total += report(f"{target} (UI-19)", rows, issues)
     return total
 
