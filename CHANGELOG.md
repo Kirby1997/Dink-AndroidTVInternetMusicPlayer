@@ -3,7 +3,7 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
-## [Unreleased]
+## [1.3.1] - 2026-09-30
 
 ### Removed
 - The unfinished Google Drive (cloud) source. It was never reachable in a release —
