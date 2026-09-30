@@ -3,9 +3,9 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
-## [Unreleased]
+## [1.3.0] - 2026-09-30
 
-Fixes from a full codebase audit.
+Fixes from a full codebase audit, a second review pass and on-device testing.
 
 ### Playback
 - **Playback runs in the background service**, so the remote's media keys and a cold
@@ -14,6 +14,12 @@ Fixes from a full codebase audit.
 - **Fewer stream drops on SMB.** Stale connections are detected and replaced instead of
   hanging, a missing file is skipped in under a second, and reads are buffered ahead for
   smoother start and seek.
+- **Music keeps playing after you leave the app.** Playback now holds a foreground
+  service, so pressing Home or removing Dink from Recents no longer risks Android
+  stopping it; tracks keep advancing in the background.
+- The system Now Playing card shows a title for tracks whose tags can't be read while
+  streaming; replaying the current song no longer blanks its lyrics.
+- Fixed a crash when the remote's Play key arrived with no saved session.
 - Updated the audio engine (Media3 1.11).
 
 ### Library and sources
@@ -26,6 +32,12 @@ Fixes from a full codebase audit.
 - **Albums are grouped by album artist + title.** Two different "Greatest Hits" stay
   separate, and compilations stay one album. Dink now reads the album-artist tag; use
   Settings → Library → *Force full re-tag* to pick it up for tracks already imported.
+- **Background scans read tags properly when the app isn't open**, no longer replace good
+  tags with file names after a failed read, and finish in seconds once caught up. A
+  renamed or deleted monitored folder is reported on the share instead of blocking
+  cleanup of its other folders.
+- Saved share passwords are no longer reset by a one-off keystore error.
+- The SMB share card shows the real track count, size and last sync.
 - Deleting a share or removing a folder mid-import is now safe, with a confirmation first.
 - Old tags (ID3v1 / APEv2) with accented characters read correctly; NAS housekeeping
   folders (@eaDir, #recycle) are skipped.
@@ -44,12 +56,16 @@ Fixes from a full codebase audit.
 ### Interface
 - Back navigation, focus after opening items and empty screens (Playlists, Now Playing)
   behave consistently; Back in the side menu offers to exit.
+- Fixed a crash on Home after scrolling a shelf and moving up or down.
+- "Saved", "Deleted" and "Imported" messages now appear only once the change is stored.
 - Settings, toasts and key repeat polish; Now Playing and the mini player redraw less.
 
 ### Other
 - Dink is now listed for Android TV only.
 - Release builds no longer carry development cloud sign-in credentials, and backups
   exclude caches.
+- Smaller download (about half the size) and a security update to the SMB encryption
+  library.
 
 ## [1.2.4] - 2026-07-13
 
