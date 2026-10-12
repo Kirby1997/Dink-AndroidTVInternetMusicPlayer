@@ -1,6 +1,7 @@
 package com.example.dink_smb_player.data.library
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.example.dink_smb_player.data.index.IndexDao
 import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.index.MediaIndex
@@ -116,7 +117,12 @@ object LibraryRepository {
      *  the index before a (retried) restore finished survive it. */
     private suspend fun restore(context: Context) {
         when (val result = io.load(context)) {
-            is LibraryStore.LoadResult.Missing -> persistGate.onLoaded()
+            is LibraryStore.LoadResult.Missing -> {
+                persistGate.onLoaded()
+                // Fresh install: every row will be keyed by the current scheme, so a second
+                // boot needn't force a full regroup + rewrite.
+                groupingFlags(context)?.edit()?.putInt(FLAG_GROUPING_SCHEME, LibraryGrouping.SCHEME)?.apply()
+            }
             is LibraryStore.LoadResult.Ok -> {
                 val dao = dao(context)
                 // Rows of the removed cloud source are dropped here; the write below takes
@@ -133,7 +139,18 @@ object LibraryRepository {
                 // Recompute once and persist so subsequent boots (and the Albums/Artists views)
                 // read ready-made keys instead of normalizing at display. The raw write: we
                 // hold restoreMutex, which isn't reentrant.
-                if (migrateGroupingKeys(dao, tracks) || droppedCloud) persistNow(context)
+                // A grouping-rule change (LibraryGrouping.SCHEME bump) leaves keys that look
+                // current to keysStale, so force the recompute once per scheme; the flag is
+                // only recorded after the regrouped index is on disk.
+                val flags = groupingFlags(context)
+                val schemeOld = flags != null &&
+                    flags.getInt(FLAG_GROUPING_SCHEME, 0) < LibraryGrouping.SCHEME
+                val migrated = migrateGroupingKeys(dao, tracks, force = schemeOld)
+                val saved = if (migrated || droppedCloud) persistNow(context).isSuccess else true
+                if (schemeOld) android.util.Log.i("LibraryRepository", "grouping scheme ${LibraryGrouping.SCHEME}: recomputed=$migrated saved=$saved")
+                // Only a restore that actually regrouped rows consumes the bump: an empty
+                // snapshot must not mark a later-populated library as current.
+                if (schemeOld && saved && tracks.isNotEmpty()) flags?.edit()?.putInt(FLAG_GROUPING_SCHEME, LibraryGrouping.SCHEME)?.apply()
             }
             is LibraryStore.LoadResult.Corrupt -> {
                 // The unreadable file(s) were quarantined aside (timestamped copies) when the
@@ -224,10 +241,10 @@ object LibraryRepository {
      *  library-wide solo-artist stats, so this must see every row — hence a single pass at
      *  authoritative write boundaries (import/retag) rather than per-batch. Off-main (Default).
      *  Does NOT persist — callers persist after, so the recompute and their other writes land in
-     *  one snapshot. */
-    internal suspend fun recomputeGroupingKeys(dao: IndexDao) {
+     *  one snapshot. Returns how many rows' keys changed. */
+    internal suspend fun recomputeGroupingKeys(dao: IndexDao): Int {
         val all = dao.snapshot().first
-        if (all.isEmpty()) return
+        if (all.isEmpty()) return 0
         val updated = withContext(Dispatchers.Default) { LibraryGrouping.computeGroupingKeys(all) }
         // computeGroupingKeys preserves order and returns unchanged rows by data equality, so
         // upsert only what actually differs (typically all rows on first migration, few after).
@@ -239,18 +256,29 @@ object LibraryRepository {
         // Keys-only patch against the CURRENT rows: a play or a retag landing during the
         // recompute isn't reverted, and a row pruned meanwhile isn't re-created.
         if (changed.isNotEmpty()) dao.upsertTracks(changed, TrackMerges.keys(bases))
+        return changed.size
     }
+
+    private const val FLAG_GROUPING_SCHEME = "grouping_scheme"
 
     /** Recompute the grouping keys if any restored row's are missing or from an older scheme
      *  ([LibraryGrouping.keysStale]: pre-precompute nulls, pre-LIB-6 title-only album keys).
      *  Goes through [recomputeGroupingKeys], i.e. the keys-only merge: play stats (IndexDao's
-     *  map), addedAt and every other field stay as restored. Returns true if it ran — the
-     *  caller then persists once so the next boot finds current keys and skips this. */
-    internal suspend fun migrateGroupingKeys(dao: IndexDao, restored: List<TrackEntity>): Boolean {
-        if (restored.none(LibraryGrouping::keysStale)) return false
-        recomputeGroupingKeys(dao)
-        return true
+     *  map), addedAt and every other field stay as restored. [force] recomputes even when the
+     *  keys look current (a grouping-scheme bump). Returns true if any row's keys changed —
+     *  the caller then persists once so the next boot finds current keys and skips this. */
+    internal suspend fun migrateGroupingKeys(
+        dao: IndexDao,
+        restored: List<TrackEntity>,
+        force: Boolean = false,
+    ): Boolean {
+        if (restored.isEmpty() || (!force && restored.none(LibraryGrouping::keysStale))) return false
+        return recomputeGroupingKeys(dao) > 0
     }
+
+    /** "dink_flags" prefs; null under a mocked Context in JVM tests. */
+    private fun groupingFlags(context: Context): SharedPreferences? =
+        context.getSharedPreferences("dink_flags", Context.MODE_PRIVATE)
 
     // Process-cached, app-scoped projection of the index into the UI [Song] model.
     // Built once and shared via stateIn: the (up to 25k-row) sort + TrackEntity->Song
@@ -639,7 +667,19 @@ object LibraryRepository {
      * the end, not per row. Call from a long-lived scope (appScope) — it can take minutes.
      */
     suspend fun retagAll(context: Context, force: Boolean = false): Int {
-        if (_retagProgress.value?.running == true) return 0
+        // Atomic single-flight gate; released in finally so a cancel/throw can't wedge it.
+        if (!retagGate.compareAndSet(false, true)) return 0
+        try {
+            return retagAllGated(context, force)
+        } finally {
+            _retagProgress.value?.let { if (it.running) _retagProgress.value = it.copy(running = false) }
+            retagGate.set(false)
+        }
+    }
+
+    private val retagGate = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private suspend fun retagAllGated(context: Context, force: Boolean): Int {
         ensureRestored(context)
         val dao = dao(context)
         // Remote rows that still look filename-derived (title == file stem) OR are missing

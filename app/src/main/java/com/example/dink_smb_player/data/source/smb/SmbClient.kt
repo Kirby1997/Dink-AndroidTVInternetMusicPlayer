@@ -13,6 +13,7 @@ import com.hierynomus.smbj.session.Session
 import com.hierynomus.smbj.share.DiskShare
 import java.io.Closeable
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -108,7 +109,11 @@ object SmbClient {
         val disk: DiskShare,
         private val entry: CacheEntry,
     ) : Closeable {
+        private val closed = AtomicBoolean(false)
+
         override fun close() {
+            // Idempotent: a double close must not drop another holder's pin.
+            if (!closed.compareAndSet(false, true)) return
             entry.activeLeases.updateAndGet { if (it > 0) it - 1 else 0 }
             entry.lastUsedMs = System.currentTimeMillis()
         }
@@ -352,14 +357,23 @@ object SmbClient {
         // e.g. NoRouteToHostException "…EHOSTUNREACH (No route to host)", which none of the
         // text keys below match — and the walk's circuit breaker must see it as a dead host.
         var c: Throwable? = t
+        var sawStatus = false
         while (c != null) {
             if (c is java.net.SocketException || c is java.net.SocketTimeoutException ||
                 c is java.net.UnknownHostException || c is java.io.EOFException ||
                 c is java.util.concurrent.TimeoutException ||
                 c is com.hierynomus.protocol.transport.TransportException
             ) return true
+            if (c is com.hierynomus.mssmb2.SMBApiException) {
+                // A status-bearing failure is classified by its NtStatus alone: its message
+                // embeds the file path, so text-matching it misreads "Reset.mp3" etc. Keep
+                // walking on other statuses — a transport cause can still sit underneath.
+                if (c.status.name in DEAD_LINK_STATUSES) return true
+                sawStatus = true
+            }
             c = c.cause
         }
+        if (sawStatus) return false
         val text = buildString {
             var e: Throwable? = t
             while (e != null) { append(e.message ?: e::class.simpleName.orEmpty()); append(' '); e = e.cause }
@@ -370,6 +384,14 @@ object SmbClient {
             "UNREACH" in text || "NO ROUTE" in text ||
             "USER_SESSION_DELETED" in text || "NETWORK_NAME_DELETED" in text
     }
+
+    /** NtStatus names that mean the session/link is gone (not a per-file failure).
+     *  IO_TIMEOUT kept: it used to match the "TIMEOUT" text key and evict-and-retry. */
+    private val DEAD_LINK_STATUSES = setOf(
+        "STATUS_NETWORK_NAME_DELETED", "STATUS_USER_SESSION_DELETED",
+        "STATUS_NETWORK_SESSION_EXPIRED", "STATUS_CONNECTION_DISCONNECTED",
+        "STATUS_CONNECTION_RESET", "STATUS_CONNECTION_ABORTED", "STATUS_IO_TIMEOUT",
+    )
 
     /** True when [t] is a request/socket TIMEOUT: the reply didn't come in time, which on a
      *  busy link doesn't mean the link is dead (see [keepAfterFailure]). */

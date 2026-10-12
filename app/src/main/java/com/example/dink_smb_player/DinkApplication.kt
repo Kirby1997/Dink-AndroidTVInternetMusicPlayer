@@ -1,5 +1,6 @@
 package com.example.dink_smb_player
 
+import kotlinx.coroutines.CancellationException
 import android.app.Application
 import android.content.Context
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -50,8 +51,8 @@ class DinkApplication : Application() {
         // Start the tiny UI-pref reads now so the first composition already has them
         // (see preloadUiScale); if they lose the race the UI falls back as before.
         appScope.launch(Dispatchers.IO) {
-            runCatching { preloadThemeMode(this@DinkApplication) }
-            runCatching { preloadUiScale(this@DinkApplication) }
+            runCatching { preloadThemeMode(this@DinkApplication) }.onFailure { if (it is CancellationException) throw it }
+            runCatching { preloadUiScale(this@DinkApplication) }.onFailure { if (it is CancellationException) throw it }
         }
         // No boot-time MediaStore scan here: this runs for every process start (media
         // button, workers, receivers), and a UI launch already scans via DinkApp's
@@ -72,7 +73,7 @@ class DinkApplication : Application() {
         // auto-update without the user re-toggling anything. Then fire a catch-up scan
         // so files added while Dink was closed appear shortly after launch.
         appScope.launch {
-            runCatching { migrateAutoMonitorOnce(this@DinkApplication) }
+            runCatching { migrateAutoMonitorOnce(this@DinkApplication) }.onFailure { if (it is CancellationException) throw it }
             MonitorWorker.enqueueNow(this@DinkApplication)
         }
     }

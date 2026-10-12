@@ -40,6 +40,19 @@ class SmbWalkClassificationTest {
     }
 
     @Test
+    fun `per-file status with connection-ish word in path is not a dead connection`() {
+        for (name in listOf("Reset.mp3", "Connection.mp3", "Socket Timeout EOF.mp3")) {
+            val path = "\\\\nas\\music\\$name"
+            for (s in listOf(NtStatus.STATUS_OBJECT_NAME_NOT_FOUND, NtStatus.STATUS_ACCESS_DENIED, NtStatus.STATUS_SHARING_VIOLATION)) {
+                val e = RuntimeException(api(s, path))
+                assertFalse("$s $name", SmbClient.isConnectionError(e))
+            }
+        }
+        assertTrue(SmbClient.isConnectionError(api(NtStatus.STATUS_NETWORK_SESSION_EXPIRED)))
+        assertTrue(SmbClient.isConnectionError(api(NtStatus.STATUS_CONNECTION_DISCONNECTED)))
+    }
+
+    @Test
     fun `permission denied or vanished subfolder is skipped, walk stays complete`() {
         for (s in listOf(
             NtStatus.STATUS_ACCESS_DENIED,

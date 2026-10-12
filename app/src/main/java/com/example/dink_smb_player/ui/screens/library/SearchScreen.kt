@@ -21,17 +21,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Album
-import androidx.compose.material.icons.outlined.MusicNote
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.runtime.Composable
@@ -39,6 +39,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -51,7 +52,6 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -62,7 +62,6 @@ import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
-import com.example.dink_smb_player.data.index.LibraryGrouping
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.nav.ScreenId
@@ -74,6 +73,7 @@ import com.example.dink_smb_player.ui.components.SongContextMenu
 import com.example.dink_smb_player.ui.components.synthAlbumFor
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
+import java.text.Normalizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -88,8 +88,14 @@ private const val SONG_CAP = 80
 private const val ALBUM_CAP = 30
 private const val ARTIST_CAP = 30
 
-/** What the query matches against, chosen by the user. Also drives result layout. */
-enum class SearchFacet { Songs, Albums, Artists }
+/** Per-section caps on the All facet: a preview of each kind; the facet tabs show the rest. */
+private const val ALL_ARTIST_CAP = 5
+private const val ALL_ALBUM_CAP = 8
+private const val ALL_SONG_CAP = 25
+
+/** What the query matches against, chosen by the user. Also drives result layout.
+ *  [All] = every kind at once, in Artists / Albums / Songs sections. */
+enum class SearchFacet { All, Artists, Albums, Songs }
 
 /**
  * Search state that outlives the screen. `DinkNav` swaps screens by composition, so plain
@@ -99,7 +105,7 @@ enum class SearchFacet { Songs, Albums, Artists }
  */
 object SearchMemo {
     val query = mutableStateOf("")
-    val facet = mutableStateOf(SearchFacet.Songs)
+    val facet = mutableStateOf(SearchFacet.All)
     var index: Int = 0
     var offset: Int = 0
     /** Lazy-list key of the result row that opened a detail. */
@@ -125,27 +131,33 @@ object SearchMemo {
     }
 }
 
-/** One matched artist, expanded into their albums (each with its tracks) so an
- *  artist search reads as an organised discography, not a flat row. */
-internal data class ArtistResult(
-    val name: String,
-    val trackCount: Int,
-    val albums: List<LibraryGroup>,
-)
-
+/**
+ * One search pass. Artists and albums are the SAME [LibraryGroup]s the Artists / Albums
+ * screens show (key, title, subtitle, tracks), so opening one lands on an identical detail.
+ * [facet] is the facet these were computed for — the list lays out by it, not the live
+ * picker, so a facet switch never renders the previous facet's results in the new layout.
+ * The totals count matches before the cap, for the section headers.
+ */
 internal data class SearchResults(
-    val songs: List<Song>,
+    val facet: SearchFacet,
+    val artists: List<LibraryGroup>,
     val albums: List<LibraryGroup>,
-    val artists: List<ArtistResult>,
+    val songs: List<Song>,
+    val artistTotal: Int = artists.size,
+    val albumTotal: Int = albums.size,
+    val songTotal: Int = songs.size,
+    /** The query these results answer; lags the field while a search is in flight. */
+    val query: String = "",
 ) {
     val isEmpty: Boolean get() = songs.isEmpty() && albums.isEmpty() && artists.isEmpty()
 }
 
 /**
- * Library-wide search across Songs / Albums / Artists. Embedded-tag metadata
+ * Library-wide search across Artists / Albums / Songs. Embedded-tag metadata
  * (title, artist, albumTitle on [Song]) is the match key — same truth the library
  * facets group by — so a tag-corrected SMB track is findable by its real name,
- * not its filename.
+ * not its filename. Artist and album results open their detail page (as the
+ * Artists / Albums screens do); song results play.
  *
  * TV input: the field is a tap-to-edit chip (OK opens leanback IME, Back/Done
  * commits) like [com.example.dink_smb_player.ui.screens.sources.AddShareWizard]'s.
@@ -175,9 +187,12 @@ fun SearchScreen(
     // full scan + groupBy that would jank the field while typing if run inline.
     // null = first pass not done yet (only ever shows for a frame).
     // UI-16: a keystroke restarts this block, so the delay debounces typing (the superseded
-    // scan is cancelled via ensureActive), and lowercase match keys are built once per
-    // library instance (SearchIndex.of), not per keystroke. The first pass (screen entry,
+    // scan is cancelled via ensureActive), and match keys are built once per library
+    // instance (SearchIndex.of), not per keystroke. The first pass (screen entry,
     // back from a detail) and facet changes run at once.
+    // Build the match keys while the user is still opening the keyboard: the first build is
+    // seconds on the TV, and the blank-query pass below never touches the index.
+    LaunchedEffect(library) { withContext(Dispatchers.Default) { SearchIndex.of(library).warm() } }
     val lastQuery = remember { arrayOfNulls<String>(1) }
     val results: SearchResults? by produceState<SearchResults?>(initialValue = null, query, library, facet) {
         val prev = lastQuery[0]
@@ -212,16 +227,18 @@ fun SearchScreen(
         Spacer(Modifier.height(12.dp))
 
         // Facet picker — what the query matches against (and how results are laid out).
+        // Only the first pill routes Left to the rail; the rest move between pills.
         Box(modifier = Modifier.focusGroup().focusRequester(facetFocus)) {
             Seg(
                 selected = facet,
                 options = listOf(
-                    SegOption(SearchFacet.Songs, "Songs"),
-                    SegOption(SearchFacet.Albums, "Albums"),
+                    SegOption(SearchFacet.All, "All"),
                     SegOption(SearchFacet.Artists, "Artists"),
+                    SegOption(SearchFacet.Albums, "Albums"),
+                    SegOption(SearchFacet.Songs, "Songs"),
                 ),
                 onSelect = { facet = it },
-                modifier = Modifier.focusProperties { left = railRequester },
+                firstItemModifier = Modifier.focusProperties { left = railRequester },
             )
         }
 
@@ -235,7 +252,7 @@ fun SearchScreen(
         var returnKey by remember { mutableStateOf<String?>(null) }
         LaunchedEffect(r) {
             if (r == null || !SearchMemo.armBackFocus) return@LaunchedEffect
-            returnKey = SearchMemo.consumeBackFocus(resultKeys(facet, r))
+            returnKey = SearchMemo.consumeBackFocus(resultKeys(r))
             val target = if (returnKey != null) returnFocus else contentFocus
             repeat(20) {
                 delay(30)
@@ -243,15 +260,27 @@ fun SearchScreen(
             }
         }
         when {
-            query.isBlank() -> Hint("Type to search by ${facet.name.lowercase().removeSuffix("s")}.")
-            r == null -> Hint("Searching…")
-            r.isEmpty -> Hint("No ${facet.name.lowercase()} match “$query”.")
-            else -> ResultsList(
-                facet, r, player, onNavigate, railRequester,
-                onLongClickSong = { menuSong = it },
-                returnKey = returnKey,
-                returnFocus = returnFocus,
+            query.isBlank() -> Hint(
+                if (facet == SearchFacet.All) "Type to search artists, albums, and songs."
+                else "Type to search by ${facet.name.lowercase().removeSuffix("s")}.",
             )
+            // An empty result for an older query (the blank-query pass on entry, while the
+            // first index build runs for seconds) isn't "nothing matches" — it's not done yet.
+            r == null || (r.isEmpty && r.query != query) -> Hint("Searching…")
+            r.isEmpty -> Hint(
+                if (r.facet == SearchFacet.All) "Nothing matches “$query”."
+                else "No ${r.facet.name.lowercase()} match “$query”.",
+            )
+            // Keyed by facet + query so switching facet or typing a new query starts the
+            // list at the top (a Back return keeps both, so its restored scroll survives).
+            else -> key(r.facet, query) {
+                ResultsList(
+                    r, player, onNavigate, railRequester,
+                    onLongClickSong = { menuSong = it },
+                    returnKey = returnKey,
+                    returnFocus = returnFocus,
+                )
+            }
         }
     }
 
@@ -274,7 +303,6 @@ private fun Hint(text: String) {
 
 @Composable
 private fun ResultsList(
-    facet: SearchFacet,
     results: SearchResults,
     player: PlayerState,
     onNavigate: (ScreenId) -> Unit,
@@ -283,9 +311,9 @@ private fun ResultsList(
     returnKey: String?,
     returnFocus: FocusRequester,
 ) {
-    // Open an album/artist's track list (detail screen). Parent = Search so the rail
-    // highlights Search and Back returns here with the query intact (was Albums/Artists,
-    // which dropped the user on a different screen with the search gone — UI-6).
+    // Open an artist/album's detail screen — the same page its Artists/Albums tile opens
+    // (an artist → their album wall, an album → its tracks). Parent = Search so the rail
+    // highlights Search and Back returns here with the query intact (UI-6).
     fun openDetail(group: LibraryGroup, facetLabel: String, rowKey: String) {
         SearchMemo.rememberOpened(rowKey)
         LibraryDetailNav.open(group, facetLabel, ScreenId.Search)
@@ -293,6 +321,9 @@ private fun ResultsList(
     }
     fun Modifier.returnTarget(rowKey: String): Modifier =
         if (rowKey == returnKey) this.focusRequester(returnFocus) else this
+
+    // Section headers only on All, where three kinds of row share one list.
+    val headers = results.facet == SearchFacet.All
 
     // Scroll survives the detail round-trip only on a Back return (armed); a fresh visit
     // or new query starts at the top. Saved on the way out either way.
@@ -312,68 +343,52 @@ private fun ResultsList(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        when (facet) {
-            SearchFacet.Songs -> {
-                items(results.songs, key = { "s-${it.id}" }) { song ->
-                    val idx = results.songs.indexOf(song)
-                    SongResultRow(
-                        song = song,
-                        onClick = {
-                            player.playFrom(results.songs, idx)
-                            onNavigate(ScreenId.NowPlaying)
-                        },
-                        onLongClick = { onLongClickSong(song) },
-                        railRequester = railRequester,
-                    )
-                }
+        if (results.artists.isNotEmpty()) {
+            if (headers) item(key = "h-artists") { SectionHeader(sectionLabel("ARTISTS", results.artists.size, results.artistTotal)) }
+            items(results.artists, key = { artistRowKey(it) }) { group ->
+                GroupResultRow(
+                    group = group,
+                    round = true,
+                    onClick = { openDetail(group, "Artist", artistRowKey(group)) },
+                    railRequester = railRequester,
+                    modifier = Modifier.returnTarget(artistRowKey(group)),
+                )
             }
+        }
 
-            SearchFacet.Albums -> {
-                items(results.albums, key = { albumRowKey(it) }) { group ->
-                    AlbumResultRow(
-                        group = group,
-                        onClick = { openDetail(group, "Album", albumRowKey(group)) },
-                        railRequester = railRequester,
-                        modifier = Modifier.returnTarget(albumRowKey(group)),
-                    )
-                }
+        if (results.albums.isNotEmpty()) {
+            if (headers) item(key = "h-albums") { SectionHeader(sectionLabel("ALBUMS", results.albums.size, results.albumTotal)) }
+            items(results.albums, key = { albumRowKey(it) }) { group ->
+                GroupResultRow(
+                    group = group,
+                    round = false,
+                    onClick = { openDetail(group, "Album", albumRowKey(group)) },
+                    railRequester = railRequester,
+                    modifier = Modifier.returnTarget(albumRowKey(group)),
+                )
             }
+        }
 
-            SearchFacet.Artists -> {
-                // Each artist → header, then their albums (each a tappable sub-header
-                // opening the album's detail) with the album's songs listed beneath.
-                results.artists.forEach { artist ->
-                    item(key = "arh-${artist.name}") {
-                        SectionHeader("${artist.name.uppercase()} · ${artist.trackCount} TRACKS · ${artist.albums.size} ALBUMS")
-                    }
-                    artist.albums.forEach { album ->
-                        item(key = artistAlbumRowKey(artist.name, album)) {
-                            AlbumResultRow(
-                                group = album,
-                                onClick = { openDetail(album, "Album", artistAlbumRowKey(artist.name, album)) },
-                                railRequester = railRequester,
-                                modifier = Modifier.returnTarget(artistAlbumRowKey(artist.name, album)),
-                            )
-                        }
-                        items(album.songs, key = { "as-${artist.name}-${album.key}-${it.id}" }) { song ->
-                            val idx = album.songs.indexOf(song)
-                            SongResultRow(
-                                song = song,
-                                onClick = {
-                                    player.playFrom(album.songs, idx)
-                                    onNavigate(ScreenId.NowPlaying)
-                                },
-                                onLongClick = { onLongClickSong(song) },
-                                railRequester = railRequester,
-                                indent = true,
-                            )
-                        }
-                    }
-                }
+        if (results.songs.isNotEmpty()) {
+            if (headers) item(key = "h-songs") { SectionHeader(sectionLabel("SONGS", results.songs.size, results.songTotal)) }
+            itemsIndexed(results.songs, key = { _, song -> "s-${song.id}" }) { idx, song ->
+                SongResultRow(
+                    song = song,
+                    onClick = {
+                        player.playFrom(results.songs, idx)
+                        onNavigate(ScreenId.NowPlaying)
+                    },
+                    onLongClick = { onLongClickSong(song) },
+                    railRequester = railRequester,
+                )
             }
         }
     }
 }
+
+/** "ARTISTS · 12", or "ARTISTS · 5 OF 12" when the All preview cut the section short. */
+private fun sectionLabel(label: String, shown: Int, total: Int): String =
+    if (shown < total) "$label · $shown OF $total" else "$label · $total"
 
 @Composable
 private fun SongResultRow(
@@ -381,7 +396,6 @@ private fun SongResultRow(
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     railRequester: FocusRequester,
-    indent: Boolean = false,
 ) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
@@ -404,7 +418,7 @@ private fun SongResultRow(
             .focusProperties { left = railRequester },
     ) {
         Row(
-            modifier = Modifier.fillMaxSize().padding(start = if (indent) 32.dp else 12.dp, end = 16.dp),
+            modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -417,9 +431,12 @@ private fun SongResultRow(
     }
 }
 
+/** An artist ([round] art, like a profile) or album result: cover, name, and the same
+ *  subtitle its Artists/Albums tile shows. */
 @Composable
-private fun AlbumResultRow(
+private fun GroupResultRow(
     group: LibraryGroup,
+    round: Boolean,
     onClick: () -> Unit,
     railRequester: FocusRequester,
     modifier: Modifier = Modifier,
@@ -450,12 +467,29 @@ private fun AlbumResultRow(
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             if (art != null) {
-                CoverArt(song = rep, palette = art.palette, shape = art.shape, modifier = Modifier.size(44.dp), cornerRadius = 8.dp)
+                CoverArt(
+                    song = rep,
+                    palette = art.palette,
+                    shape = art.shape,
+                    modifier = Modifier.size(44.dp),
+                    // Half the size → a circle for an artist.
+                    cornerRadius = if (round) 22.dp else 8.dp,
+                )
             } else {
                 Box(
-                    modifier = Modifier.size(44.dp).background(palette.accent.copy(alpha = 0.18f), RoundedCornerShape(8.dp)),
+                    modifier = Modifier.size(44.dp).background(
+                        palette.accent.copy(alpha = 0.18f),
+                        if (round) CircleShape else RoundedCornerShape(8.dp),
+                    ),
                     contentAlignment = Alignment.Center,
-                ) { Icon(Icons.Outlined.Album, null, tint = palette.accent, modifier = Modifier.size(20.dp)) }
+                ) {
+                    Icon(
+                        if (round) Icons.Outlined.Person else Icons.Outlined.Album,
+                        null,
+                        tint = palette.accent,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
             }
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(group.title, style = type.songTitleCompact.copy(color = palette.ink0), maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -602,65 +636,106 @@ private fun SearchField(
     }
 }
 
+private fun artistRowKey(group: LibraryGroup): String = "ar-${group.key}"
 private fun albumRowKey(group: LibraryGroup): String = "al-${group.key}"
-private fun artistAlbumRowKey(artist: String, album: LibraryGroup): String = "ab-$artist-${album.key}"
 
 /** Keys of the rows that can open a detail — what a Back return may refocus. */
-private fun resultKeys(facet: SearchFacet, r: SearchResults): Set<String> = when (facet) {
-    SearchFacet.Songs -> emptySet()
-    SearchFacet.Albums -> r.albums.mapTo(HashSet()) { albumRowKey(it) }
-    SearchFacet.Artists -> r.artists.flatMapTo(HashSet()) { a -> a.albums.map { artistAlbumRowKey(a.name, it) } }
-}
+private fun resultKeys(r: SearchResults): Set<String> =
+    r.artists.mapTo(HashSet<String>()) { artistRowKey(it) } + r.albums.map { albumRowKey(it) }
 
 private fun subtitleFor(song: Song): String = buildString {
     append(song.artist)
     song.albumTitle?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
 }
 
+// ---- Matching: pure, so it's JVM-testable (SearchIndexTest). ----
+
+private val SEARCH_WS = Regex("\\s+")
+private val SEARCH_MARKS = Regex("\\p{Mn}+")
+private val SEARCH_NON_ALNUM = Regex("[^\\p{L}\\p{Nd}]+")
+
+/** Case- and accent-insensitive form of [s] — lowercase, then NFD with the combining marks
+ *  dropped, as [com.example.dink_smb_player.data.index.LibraryGrouping.normKey] folds them
+ *  ("Motörhead" ≡ "motorhead"). Spacing and punctuation survive so the query can tokenise. */
+internal fun searchFold(s: String): String =
+    SEARCH_MARKS.replace(Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD), "")
+
+/** [searchFold]ed text with punctuation and spacing gone, so "acdc" / "ac-dc" find
+ *  "AC/DC" and "dont" finds "Don't" — the other half of the grouping fold. */
+private fun compactOf(folded: String): String = SEARCH_NON_ALNUM.replace(folded, "")
+
+/** One match string holding each distinct spelling, folded and compacted, a line apiece —
+ *  so a query matches any of them. Tokens hold no whitespace, so never span two lines. */
+internal fun searchKey(spellings: Iterable<String>): String =
+    spellings.asSequence().map(::searchFold).flatMap { sequenceOf(it, compactOf(it)) }
+        .filter { it.isNotEmpty() }.distinct().joinToString("\n")
+
 /**
- * Lowercase match keys for one library list, built once per list instance (UI-16) — the
- * search used to lowercase every title / album / artist on each keystroke. Album and artist
- * buckets are built lazily, the first time that facet is searched. [of] memoizes the last
- * library by identity: [LibraryRepository.songs] hands out the same list until the library
- * actually changes, so re-entering Search reuses it.
+ * How well a [searchFold]ed display name answers the folded [query]: 0 exact (ignoring
+ * punctuation), 1 the name starts with it, 2 a later word does ("The Beatles" for
+ * "beatles"), 3 a looser match. Sorts "Queen" above "Queens of the Stone Age".
  */
-internal class SearchIndex private constructor(val library: List<Song>) {
-    /** Lowercased title of each song, parallel to [library]. */
-    val titleKeys: Array<String> by lazy { Array(library.size) { library[it].title.lowercase() } }
+internal fun matchRank(folded: String, query: String): Int = when {
+    folded == query || compactOf(folded) == compactOf(query) -> 0
+    folded.startsWith(query) -> 1
+    " $folded".contains(" $query") -> 2
+    else -> 3
+}
 
-    /** Albums grouped exactly as the Albums screen groups them — by album key (album artist +
-     *  normalized title, UI-17) — so two "Greatest Hits" are two results and case/punctuation
-     *  variants are one. Matched on every title spelling in the album. */
+/**
+ * Match keys for one library list, built once per library content (UI-16) — the search used
+ * to lowercase every title / album / artist on each keystroke. Album and artist buckets are
+ * built lazily, the first time that facet is searched. [of] memoizes the last library by
+ * content: [LibraryRepository.songs] emits a new list on every row change, but the index is
+ * reused unless a field that affects search/grouping changed. Album/artist groups come from
+ * the shared [GroupMemo], so Search and the Albums/Artists screens compute grouping once.
+ */
+internal class SearchIndex private constructor(library: List<Song>) {
+    /** Latest content-equal list; rebound on a memo hit (see [of]) so the next lookup is an
+     *  identity hit. Derived lazies below were built from an equal-content earlier list. */
+    @Volatile var library: List<Song> = library
+        private set
+
+    /** [searchKey] of each song's title, parallel to [library]. The first line is the
+     *  folded title itself (what [matchRank] ranks by). */
+    val titleKeys: Array<String> by lazy { Array(library.size) { searchKey(listOf(library[it].title)) } }
+
+    /** The Albums screen's own groups ([albumGroups]: album artist + normalized title, UI-17)
+     *  — so two "Greatest Hits" are two results, case/punctuation variants are one, and the
+     *  detail opened is the one the Albums tile opens. Matched on every title spelling in
+     *  the album; untitled ("Unknown album") groups aren't searchable. */
     val albums: List<Bucket> by lazy {
-        library.filter { !it.albumTitle.isNullOrBlank() }
-            .groupBy(::albumKeyOf)
-            .map { (key, tracks) ->
-                val titles = tracks.mapNotNull { it.albumTitle }
-                Bucket(titles.mostCommon(), matchKey(titles), tracks, key)
-            }
+        GroupMemo.get("Album", library, ::albumGroups).mapNotNull { g ->
+            val titles = g.songs.mapNotNull { it.albumTitle?.takeIf(String::isNotBlank) }
+            if (titles.isEmpty()) null else Bucket(g, searchKey(titles))
+        }
     }
 
-    /** Artists grouped by artist key, as the Artists screen does (collaborations filed under
-     *  their primary artist, spelling variants merged). Named and matched by the clean labels. */
+    /** The Artists screen's own groups ([artistGroups]: collaborations filed under their
+     *  primary artist, spelling variants merged). Matched by the clean labels. */
     val artists: List<Bucket> by lazy {
-        library.groupBy { it.artistKey ?: LibraryGrouping.normKey(it.artist) }
-            .map { (key, tracks) ->
-                Bucket(artistLabelOf(tracks), matchKey(tracks.map { it.artistLabel ?: it.artist }), tracks, key)
-            }
+        GroupMemo.get("Artist", library, ::artistGroups).map { g -> Bucket(g, searchKey(g.songs.map { it.artistLabel ?: it.artist } + g.title)) }
     }
 
-    /** One lowercased string holding each distinct spelling, so a query matches any of them. */
-    private fun matchKey(spellings: List<String>): String =
-        spellings.distinct().joinToString("\n") { it.lowercase() }
+    /** Forces the lazy keys (a no-op once built). */
+    fun warm() { titleKeys; albums; artists }
 
-    /** [key] is the lowercase match text; [groupKey] the grouping key it was bucketed by. */
-    class Bucket(val name: String, val key: String, val tracks: List<Song>, val groupKey: String)
+    /** [key] is the [searchKey] match text for [group]. */
+    class Bucket(val group: LibraryGroup, val key: String)
 
     companion object {
         @Volatile private var last: SearchIndex? = null
 
+        /** Reuses the last index when [library] has the same grouping/search content
+         *  ([sameLibraryContent]) — a play-count or unrelated-row emission is a hit. */
+        @Synchronized
         fun of(library: List<Song>): SearchIndex {
-            last?.let { if (it.library === library) return it }
+            last?.let {
+                if (sameLibraryContent(it.library, library)) {
+                    it.library = library // rebind so the next call is an identity hit
+                    return it
+                }
+            }
             return SearchIndex(library).also { last = it }
         }
     }
@@ -670,66 +745,62 @@ internal class SearchIndex private constructor(val library: List<Song>) {
 private const val CANCEL_CHECK_EVERY = 1024
 
 /**
- * Tokenised, case-insensitive match driven by the chosen [facet]: Songs matches track
- * titles, Albums matches album titles, Artists matches artist names — so "search by
- * artist" is exactly that. A value matches if every whitespace-separated query token is
- * a substring of it ("slip wait" → Slipknot · Wait and Bleed). Only the active facet is
- * computed; the others stay empty. Albums/artists group ALL their tracks (not just the
- * matched ones) so play/detail is the whole album. Cancellable: a superseded query stops
- * scanning (UI-16).
+ * Tokenised, case- and accent-insensitive match driven by the chosen [facet]: Artists
+ * matches artist names, Albums album titles, Songs track titles — so "search by artist"
+ * is exactly that — and All runs all three, each capped to a preview. A value matches if
+ * every whitespace-separated query token is a substring of it ("bleed wait" → Wait and
+ * Bleed). Each kind is ordered by [matchRank], then name. Artists/albums carry ALL their
+ * tracks (not just the matched ones) so the detail is the whole artist/album.
+ * Cancellable: a superseded query stops scanning (UI-16).
  */
 internal suspend fun search(query: String, index: SearchIndex, facet: SearchFacet): SearchResults {
-    val tokens = query.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
-    if (tokens.isEmpty()) return SearchResults(emptyList(), emptyList(), emptyList())
-    fun matches(s: String): Boolean = tokens.all { s.contains(it) }
+    val tokens = query.trim().split(SEARCH_WS).filter { it.isNotEmpty() }.map(::searchFold)
+    if (tokens.isEmpty()) return SearchResults(facet, emptyList(), emptyList(), emptyList(), query = query)
+    val compactTokens = tokens.map(::compactOf)
+    // A punctuation-only token ("-" in "ac - dc") has no compact form; it can't be required
+    // literally or the folding is undone — skip it unless it's all the query has.
+    val hasWordToken = compactTokens.any { it.isNotEmpty() }
+    fun matches(key: String): Boolean = tokens.indices.all { i ->
+        if (compactTokens[i].isEmpty()) hasWordToken || key.contains(tokens[i])
+        else key.contains(tokens[i]) || key.contains(compactTokens[i])
+    }
+    val folded = tokens.joinToString(" ")
     val ctx = currentCoroutineContext()
+    val all = facet == SearchFacet.All
 
-    // Same grouping (and group keys) as the Albums screen, tracks in title order.
-    fun albumGroupsFor(tracks: List<Song>): List<LibraryGroup> =
-        albumGroups(tracks).map { g -> g.copy(songs = g.songs.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })) }
-
-    fun matching(buckets: List<SearchIndex.Bucket>): List<SearchIndex.Bucket> {
-        val out = ArrayList<SearchIndex.Bucket>()
+    fun rankedGroups(buckets: List<SearchIndex.Bucket>): List<LibraryGroup> {
+        val out = ArrayList<Pair<Int, LibraryGroup>>()
         buckets.forEachIndexed { i, b ->
             if (i % CANCEL_CHECK_EVERY == 0) ctx.ensureActive()
-            if (matches(b.key)) out += b
+            if (matches(b.key)) out += matchRank(searchFold(b.group.title), folded) to b.group
         }
-        return out
+        return out.sortedWith(compareBy<Pair<Int, LibraryGroup>> { it.first }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.second.title })
+            .map { it.second }
     }
 
-    return when (facet) {
-        SearchFacet.Songs -> {
-            val library = index.library
-            val keys = index.titleKeys
-            val hits = ArrayList<Song>()
-            for (i in keys.indices) {
-                if (i % CANCEL_CHECK_EVERY == 0) ctx.ensureActive()
-                if (matches(keys[i])) hits += library[i]
-            }
-            SearchResults(
-                songs = hits.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title }).take(SONG_CAP),
-                albums = emptyList(),
-                artists = emptyList(),
-            )
+    fun rankedSongs(): List<Song> {
+        val library = index.library
+        val keys = index.titleKeys
+        val hits = ArrayList<Pair<Int, Song>>()
+        for (i in keys.indices) {
+            if (i % CANCEL_CHECK_EVERY == 0) ctx.ensureActive()
+            if (matches(keys[i])) hits += matchRank(keys[i].substringBefore('\n'), folded) to library[i]
         }
-
-        SearchFacet.Albums -> {
-            val albums = matching(index.albums)
-                .map { b ->
-                    val sorted = b.tracks.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
-                    LibraryGroup(b.groupKey, b.name, "${albumArtistLabel(b.groupKey, b.tracks)} · ${b.tracks.size} tracks", sorted)
-                }
-                .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
-                .take(ALBUM_CAP)
-            SearchResults(emptyList(), albums, emptyList())
-        }
-
-        SearchFacet.Artists -> {
-            val artists = matching(index.artists)
-                .map { b -> ArtistResult(b.name, b.tracks.size, albumGroupsFor(b.tracks)) }
-                .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
-                .take(ARTIST_CAP)
-            SearchResults(emptyList(), emptyList(), artists)
-        }
+        return hits.sortedWith(compareBy<Pair<Int, Song>> { it.first }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.second.title })
+            .map { it.second }
     }
+
+    val artists = if (all || facet == SearchFacet.Artists) rankedGroups(index.artists) else emptyList()
+    val albums = if (all || facet == SearchFacet.Albums) rankedGroups(index.albums) else emptyList()
+    val songs = if (all || facet == SearchFacet.Songs) rankedSongs() else emptyList()
+    return SearchResults(
+        facet = facet,
+        artists = artists.take(if (all) ALL_ARTIST_CAP else ARTIST_CAP),
+        albums = albums.take(if (all) ALL_ALBUM_CAP else ALBUM_CAP),
+        songs = songs.take(if (all) ALL_SONG_CAP else SONG_CAP),
+        artistTotal = artists.size,
+        albumTotal = albums.size,
+        songTotal = songs.size,
+        query = query,
+    )
 }

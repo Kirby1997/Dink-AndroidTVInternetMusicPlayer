@@ -95,7 +95,7 @@ object MediaLibrary {
             // reuse it so TrackEntity.id == Song.id exactly.
             id = id,
             title = title,
-            artist = artist,
+            artist = artist.takeIf { it != MediaStoreAudio.UNKNOWN_ARTIST },
             albumTitle = albumTitle,
             durationMs = durationSec * 1000L,
             bitrate = bitrate.takeIf { it != "—" },

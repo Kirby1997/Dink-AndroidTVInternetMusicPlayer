@@ -107,9 +107,15 @@ fun SmbBrowseScreen(
     // False once this screen leaves composition. A delete's onDone can land long after the
     // user moved on (a dead NAS); it must not then navigate (commitNav steals focus).
     val screenAlive = remember { java.util.concurrent.atomic.AtomicBoolean(true) }
+    // True only when leaving via Back / the "Shares" button; any other exit (rail) drops
+    // ShareOpenMemo's arm so the next fresh SmbShares entry doesn't jump to the old card.
+    val returningToShares = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     DisposableEffect(Unit) {
         screenAlive.set(true)
-        onDispose { screenAlive.set(false) }
+        onDispose {
+            screenAlive.set(false)
+            if (!returningToShares.get()) ShareOpenMemo.armedId = null
+        }
     }
 
     // Current folder path (backslash, relative to share root; "" = root) + the
@@ -198,7 +204,10 @@ fun SmbBrowseScreen(
     // Not while the drawer is open: Back there is the app's exit dialog (UI-22).
     BackHandler(enabled = !LocalDrawerOpen.current.value) {
         if (path.isNotEmpty()) path = path.substringBeforeLast('\\', "")
-        else onNavigate(ScreenId.SmbShares)
+        else {
+            returningToShares.set(true)
+            onNavigate(ScreenId.SmbShares)
+        }
     }
 
     if (share == null) {
@@ -255,7 +264,10 @@ fun SmbBrowseScreen(
             GhostButton(
                 label = "Shares",
                 leadingIcon = Icons.Filled.ArrowBack,
-                onClick = { onNavigate(ScreenId.SmbShares) },
+                onClick = {
+                    returningToShares.set(true)
+                    onNavigate(ScreenId.SmbShares)
+                },
                 height = 44.dp,
                 modifier = Modifier
                     .focusRequester(contentFocus)
@@ -355,8 +367,7 @@ fun SmbBrowseScreen(
                             modifier = rowMod,
                             imported = imported,
                         )
-                    } else {
-                        val song = entry.song!!
+                    } else entry.song?.let { song ->
                         val songIndex = folderSongs.indexOf(song)
                         BrowseRow(
                             title = song.title,

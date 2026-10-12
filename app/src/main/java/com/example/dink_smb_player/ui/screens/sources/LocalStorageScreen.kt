@@ -102,6 +102,17 @@ fun LocalStorageScreen(
         }
     }
 
+    // Granting swaps "Grant access" for "Rescan" (a different node under the same requester),
+    // dropping focus to the rail — pull it back onto the new button.
+    val hadPermission = remember { hasPermission }
+    LaunchedEffect(hasPermission) {
+        if (!hasPermission || hadPermission) return@LaunchedEffect
+        repeat(15) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { contentFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()

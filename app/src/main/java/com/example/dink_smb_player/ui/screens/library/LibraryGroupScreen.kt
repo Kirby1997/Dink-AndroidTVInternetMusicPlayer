@@ -87,7 +87,13 @@ data class LibraryGroup(
  *  `group`/`facet`/`parent` read the top frame (kept as accessors so callers/crumbs are
  *  unchanged). `DinkNav` is screen-as-state and carries no arguments, hence this singleton. */
 object LibraryDetailNav {
-    data class Frame(val group: LibraryGroup, val facet: String, val parent: ScreenId)
+    data class Frame(val group: LibraryGroup, val facet: String, val parent: ScreenId) {
+        // Artist frame's album-grid position + last-focused album, so popping back from an
+        // album lands on the tile you opened (not the top / Play all). Not part of equality.
+        var gridIndex: Int = 0
+        var gridOffset: Int = 0
+        var focusedAlbumKey: String? = null
+    }
 
     val frames = mutableStateListOf<Frame>()
 
@@ -137,6 +143,8 @@ object ListScrollMemo {
         pos(facet).also { it.index = index; it.offset = offset }
     }
     fun setFocused(facet: String, key: String) { pos(facet).focusedKey = key }
+    /** Optional hygiene: forget the remembered tile. Not needed for correctness (refocus is
+     *  gated by [Pos.armBackFocus]); DinkApp may call it on a fresh rail entry. */
     fun clearFocused(facet: String) { map[facet]?.focusedKey = null }
     /** Called by Back when returning to a list — arms the one-shot tile refocus. */
     fun arm(facet: String) { pos(facet).armBackFocus = true }
@@ -285,14 +293,17 @@ fun LibraryGroupScreen(
                     }
                 }
                 // When we came BACK from a detail, focus the tile we opened (it's at the restored
-                // scroll position, so focusing it doesn't jump the list). Fresh rail entries clear
-                // focusedKey (in DinkApp), so this only fires on a return.
+                // scroll position, so focusing it doesn't jump the list). Gated by the one-shot
+                // armBackFocus (set by Back via ListScrollMemo.arm), so a fresh rail entry or a
+                // rail-hover preview never refocuses a stale focusedKey.
                 val returnKey = savedPos.focusedKey
                 val tileFocus = remember { FocusRequester() }
                 LaunchedEffect(groupList) {
-                    if (savedPos.armBackFocus && returnKey != null && groupList.any { it.key == returnKey }) {
+                    // One-shot: consumed on the first pass whether or not the opened group
+                    // still exists, so a vanished key can't leave it armed to steal focus later.
+                    if (savedPos.armBackFocus) {
                         savedPos.armBackFocus = false
-                        repeat(20) {
+                        if (returnKey != null && groupList.any { it.key == returnKey }) repeat(20) {
                             delay(30)
                             if (runCatching { tileFocus.requestFocus() }.isSuccess) return@LaunchedEffect
                         }
@@ -333,9 +344,9 @@ fun LibraryGroupScreen(
             val returnKey = savedPos.focusedKey
             val rowFocus = remember { FocusRequester() }
             LaunchedEffect(groupList) {
-                if (savedPos.armBackFocus && returnKey != null && groupList.any { it.key == returnKey }) {
+                if (savedPos.armBackFocus) {
                     savedPos.armBackFocus = false
-                    repeat(20) {
+                    if (returnKey != null && groupList.any { it.key == returnKey }) repeat(20) {
                         delay(30)
                         if (runCatching { rowFocus.requestFocus() }.isSuccess) return@LaunchedEffect
                     }
@@ -449,15 +460,38 @@ private fun GroupRow(
 }
 
 /**
- * Process-level memo of computed facet groupings, keyed by facet + the identity of the
- * song list. Because [LibraryRepository.songs] hands out a cached StateFlow, its value is
- * the same `List<Song>` instance across navigations until the library actually mutates —
- * so re-opening Albums/Artists/Folders returns the already-bucketed groups instead of
- * re-running the whole-library groupBy + sort. A real library change swaps the instance →
- * identity miss → exactly one recompute. One entry per facet (3 total), so it's tiny.
+ * True when [a] and [b] hold the same tracks with the same grouping/search/display fields.
+ * Play stats ([Song.playCount]) are deliberately ignored: nothing the grouping, search or
+ * detail screens show reads them off a grouped Song (live stats come from
+ * [LibraryRepository.playStats]; in-memory rows carry 0 anyway). Identity short-circuits.
  */
-private object GroupMemo {
-    private val cache = HashMap<String, Pair<Int, List<LibraryGroup>>>()
+internal fun sameLibraryContent(a: List<Song>, b: List<Song>): Boolean {
+    if (a === b) return true
+    if (a.size != b.size) return false
+    for (i in a.indices) {
+        val x = a[i]; val y = b[i]
+        if (x === y) continue
+        if (x.id != y.id || x.title != y.title || x.artist != y.artist || x.albumId != y.albumId ||
+            x.albumTitle != y.albumTitle || x.durationSec != y.durationSec || x.sourcePath != y.sourcePath ||
+            x.bitrate != y.bitrate || x.mediaUri != y.mediaUri || x.artistKey != y.artistKey ||
+            x.albumKey != y.albumKey || x.artistLabel != y.artistLabel
+        ) return false
+    }
+    return true
+}
+
+/**
+ * Process-level memo of computed facet groupings, keyed by facet + the CONTENT of the song
+ * list ([sameLibraryContent]; identity is the fast path). [LibraryRepository.songs] emits a
+ * new list on every row change (play counts, tag re-read upserts, monitor walks), so
+ * identity alone rebuilt the whole-library groupBy + sort each time; a content check reuses
+ * it when nothing grouping-relevant changed. Shared by Albums/Artists/Folders and Search
+ * (facet "Album"/"Artist" + same grouper), so one computation serves both. One entry per
+ * facet, so it's tiny.
+ */
+internal object GroupMemo {
+    private class Entry(val songs: List<Song>, val groups: List<LibraryGroup>)
+    private val cache = HashMap<String, Entry>()
 
     @Synchronized
     fun get(
@@ -465,12 +499,21 @@ private object GroupMemo {
         songs: List<Song>,
         compute: (List<Song>) -> List<LibraryGroup>,
     ): List<LibraryGroup> {
-        val token = System.identityHashCode(songs)
-        cache[facet]?.let { (cachedToken, cached) -> if (cachedToken == token) return cached }
+        cache[facet]?.let {
+            if (sameLibraryContent(it.songs, songs)) {
+                // Rebind to the new instance so the next call hits the `===` fast path
+                // instead of redoing the O(n) content compare.
+                if (it.songs !== songs) cache[facet] = Entry(songs, it.groups)
+                return it.groups
+            }
+        }
         val result = compute(songs)
-        cache[facet] = token to result
+        cache[facet] = Entry(songs, result)
         return result
     }
+
+    @Synchronized
+    fun clear() { cache.clear() }
 }
 
 @Composable

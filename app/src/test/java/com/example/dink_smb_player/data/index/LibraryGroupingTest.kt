@@ -69,17 +69,74 @@ class LibraryGroupingTest {
             // ...but a known solo member still wins.
             Case("Apocalyptica, Guest Singer", listOf("Apocalyptica"), "apocalyptica", "Apocalyptica"),
             Case("Guest, Apocalyptica", listOf("Apocalyptica"), "apocalyptica", "Apocalyptica"),
-            // Non-comma collaborations with no solo stats keep filing under the lead.
-            Case("Artist A & Artist B", emptyList(), "artista", "Artist A"),
-            Case("Artist A / Artist B", emptyList(), "artista", "Artist A"),
+            // Collaborations with no known solo member stay whole — never "the first member".
+            Case("Artist A & Artist B", emptyList(), "artistaartistb", "Artist A & Artist B"),
+            Case("Artist A / Artist B", emptyList(), "artistaartistb", "Artist A / Artist B"),
+            Case("Simon & Garfunkel", listOf("Paul Simon"), "simongarfunkel", "Simon & Garfunkel"),
+            // A known solo member wins, wherever it sits in the credit.
+            Case("Artist A & Artist B", listOf("Artist A"), "artista", "Artist A"),
+            Case("Artist A & Artist B", listOf("Artist B"), "artistb", "Artist B"),
+            Case("Artist A / Artist B", listOf("Artist B", "Artist B", "Artist A"), "artistb", "Artist B"),
+            // Equal solo stats → the lead.
+            Case("Artist A & Artist B", listOf("Artist A", "Artist B"), "artista", "Artist A"),
+            // Featured guests are always stripped to the primary — even a guest who is a known
+            // solo act, and even when the primary has no solo tracks of its own.
             Case("Lead feat. Guest", emptyList(), "lead", "Lead"),
             Case("Lead (feat. Guest)", emptyList(), "lead", "Lead"),
-            // A recurring slash name is a name, not a collaboration.
+            Case("Lead feat. Guest", listOf("Guest", "Guest"), "lead", "Lead"),
+            Case("AC/DC feat. Guest", listOf("Guest"), "acdc", "AC/DC"),
+            Case("Artist A & Artist B feat. Guest", listOf("Guest"), "artistaartistb", "Artist A & Artist B"),
+            // ...and a "Lead feat. X" credit makes Lead a known solo act for its collaborations.
+            Case("Lead & Other", listOf("Lead feat. Someone"), "lead", "Lead"),
+            // A slash name is a name, not a collaboration.
             Case("AC/DC", listOf("AC/DC", "AC/DC"), "acdc", "AC/DC"),
+            Case("AC/DC", listOf("Some Solo Act"), "acdc", "AC/DC"),
         )
         for (c in cases) {
             assertEquals("key for \"${c.artist}\"", c.key to c.label, keyFor(c.artist, c.library))
         }
+    }
+
+    /** Every artistKey when the library is [n] tracks credited to [artist] plus [others]. */
+    private fun keysWithCopies(artist: String, n: Int, others: List<String> = emptyList()): Set<String?> {
+        val rows = (List(n) { artist } + others).mapIndexed { i, a -> track(i, a) }
+        return LibraryGrouping.computeGroupingKeys(rows).take(n).map { it.artistKey }.toSet()
+    }
+
+    @Test
+    fun `delimiter-bearing names keep one key whatever their track count`() {
+        // Regression: the whole name used to survive only at >= 3 tracks, so a 1- or 2-track
+        // "AC/DC" filed under "ac" and adding/removing one track re-keyed the whole artist.
+        val cases = listOf(
+            "AC/DC" to "acdc",
+            "Simon & Garfunkel" to "simongarfunkel",
+            "Earth, Wind & Fire" to "earthwindfire",
+            "Artist A & Artist B" to "artistaartistb",
+        )
+        for ((artist, key) in cases) {
+            for (n in 1..4) {
+                assertEquals("\"$artist\" x$n", setOf(key), keysWithCopies(artist, n))
+                // Unrelated solo acts in the library don't change it either.
+                assertEquals("\"$artist\" x$n + others", setOf(key), keysWithCopies(artist, n, listOf("Queen", "ABBA")))
+            }
+        }
+    }
+
+    @Test
+    fun `collaboration with a known solo primary folds into it at any count`() {
+        for (n in 1..3) {
+            assertEquals(setOf("artista"), keysWithCopies("Artist A & Artist B", n, listOf("Artist A")))
+            assertEquals(setOf("lead"), keysWithCopies("Lead feat. Guest", n, listOf("Guest")))
+        }
+    }
+
+    @Test
+    fun `album-artist tag with a delimiter stays whole`() {
+        val k = albumKeys(
+            albumRow("1", "AC/DC", "Back in Black", "/acdc", albumArtist = "AC/DC"),
+            albumRow("2", "AC/DC", "Back in Black", "/acdc", albumArtist = "AC/DC"),
+        )
+        assertEquals(setOf("acdc|backinblack"), k.values.toSet())
     }
 
     @Test

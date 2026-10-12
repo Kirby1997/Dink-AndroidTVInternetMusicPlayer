@@ -41,11 +41,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -86,6 +88,7 @@ fun LibraryDetailScreen(
     val group = LibraryDetailNav.group
     if (group == null) {
         // Holder cleared (process death / direct nav) — bounce home instead of crashing.
+        LaunchedEffect(Unit) { onNavigate(ScreenId.Home) }
         Box(modifier = Modifier.fillMaxSize().background(palette.bg0)) {}
         return
     }
@@ -104,6 +107,8 @@ fun LibraryDetailScreen(
     // Whenever the shown facet changes (drilling artist → album, or Back popping album →
     // artist), pull focus onto this screen's primary action so focus never falls to the rail.
     LaunchedEffect(group.key) {
+        // Popping back to an artist's album grid: ArtistAlbumsGrid refocuses the opened tile.
+        if (LibraryDetailNav.frames.lastOrNull()?.focusedAlbumKey != null) return@LaunchedEffect
         repeat(15) { attempt ->
             kotlinx.coroutines.delay(40)
             if (runCatching { contentFocus.requestFocus() }.isSuccess) return@LaunchedEffect
@@ -172,6 +177,7 @@ fun LibraryDetailScreen(
 
         if (isArtist) {
             ArtistAlbumsGrid(
+                frame = LibraryDetailNav.frames.last(),
                 albums = albums,
                 railRequester = railRequester,
                 onOpen = { album ->
@@ -219,6 +225,7 @@ fun LibraryDetailScreen(
  *  bottom padding keep D-pad Down in the same column across scroll). */
 @Composable
 private fun ArtistAlbumsGrid(
+    frame: LibraryDetailNav.Frame,
     albums: List<LibraryGroup>,
     railRequester: FocusRequester,
     onOpen: (LibraryGroup) -> Unit,
@@ -227,7 +234,24 @@ private fun ArtistAlbumsGrid(
         val minTile = 124.dp
         val gap = 16.dp
         val columns = maxOf(1, ((maxWidth + gap) / (minTile + gap)).toInt())
-        val gridState = rememberLazyGridState()
+        val gridState = rememberLazyGridState(frame.gridIndex, frame.gridOffset)
+        LaunchedEffect(gridState) {
+            snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+                .collect { (i, o) -> frame.gridIndex = i; frame.gridOffset = o }
+        }
+        // Back from an album: refocus the tile that was opened (retry until it's composed).
+        val restoreReq = remember { FocusRequester() }
+        val contentFocus = LocalContentFocus.current
+        LaunchedEffect(frame) {
+            if (frame.focusedAlbumKey == null) return@LaunchedEffect
+            repeat(15) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { restoreReq.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+            // Tile never composed (scrolled out): the screen skipped its Play-all focus for
+            // us, so take it rather than leave focus to drift onto the rail.
+            runCatching { contentFocus.requestFocus() }
+        }
         LazyVerticalGrid(
             columns = GridCells.Fixed(columns),
             state = gridState,
@@ -240,9 +264,11 @@ private fun ArtistAlbumsGrid(
                 AlbumTile(
                     album = album,
                     onClick = { onOpen(album) },
-                    modifier = if (index % columns == 0) {
+                    modifier = (if (index % columns == 0) {
                         Modifier.focusProperties { left = railRequester }
-                    } else Modifier,
+                    } else Modifier)
+                        .then(if (album.key == frame.focusedAlbumKey) Modifier.focusRequester(restoreReq) else Modifier)
+                        .onFocusChanged { if (it.isFocused) frame.focusedAlbumKey = album.key },
                 )
             }
         }

@@ -45,6 +45,7 @@ object LibraryGrouping {
     // work is paid once per distinct string rather than per row across every pass.
     private val normKeyCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val tokensCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+    private val leadCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Collapse cosmetic spelling differences to a single grouping key. See class doc. */
     fun normKey(raw: String): String = normKeyCache.getOrPut(raw) {
@@ -53,28 +54,41 @@ object LibraryGrouping {
         s = FEAT_SUFFIX.replace(s, "")
         if (s.startsWith("the ")) s = s.removePrefix("the ").trim()
         s = NON_ALNUM.replace(s, "")
-        s.ifBlank { raw.trim().lowercase() }
+        // Symbol-only names fall back to the raw text; keep ALBUM_KEY_SEP out of it.
+        s.ifBlank { raw.trim().lowercase().replace(ALBUM_KEY_SEP, '_') }
     }
 
     private fun artistTokens(raw: String): List<String> = tokensCache.getOrPut(raw) {
         raw.split(ARTIST_DELIM).map { normKey(it) }.filter { it.isNotEmpty() }
     }
 
-    /** Grouping key for an artist string: the whole name when it's a recognised act (so slashes
-     *  in names survive), else the best-known member of the collaboration, else the LEAD artist. */
-    private fun primaryArtistKey(raw: String, full: Map<String, Int>, solo: Map<String, Int>): String {
-        val whole = normKey(raw)
-        val toks = artistTokens(raw)
-        if (toks.size <= 1) return whole
-        // A known standalone act among the members wins FIRST — so "Apocalyptica, <guest>" folds
-        // into Apocalyptica even though that exact collaboration recurs.
+    /** [raw] with any featured-artist suffix removed ("Lead feat. Guest" → "Lead"): the part of
+     *  a credit that can decide its bucket. Featured guests never do. */
+    private fun leadPart(raw: String): String = leadCache.getOrPut(raw) {
+        FEAT_SUFFIX.replace(raw, "").trim().ifEmpty { raw }
+    }
+
+    /** Members of the lead part of [raw] (see [leadPart]) as normKeys. One element = a solo credit. */
+    private fun leadTokens(raw: String): List<String> = artistTokens(leadPart(raw))
+
+    /**
+     * Grouping key for an artist string. Featured guests are dropped first ([leadPart]); then:
+     *  - one name → that name ("Little Feat", "AC-DC" — [normKey] folds the cosmetics);
+     *  - several names, at least one a KNOWN SOLO ACT (has tracks credited to it alone) → the
+     *    member with the most solo tracks (ties → the earlier/lead one), so "Apocalyptica, Guest"
+     *    and "Guest & Apocalyptica" both fold into Apocalyptica;
+     *  - otherwise → the whole name ("AC/DC", "Simon & Garfunkel", "Earth, Wind & Fire", "A & B").
+     *
+     * Deliberately NOT a function of how many tracks carry the whole name: an earlier rule kept
+     * the whole name only at >= 3 tracks and otherwise fell back to the first member, so a 2-track
+     * "AC/DC" filed under "AC" and adding/removing one track re-keyed the whole artist.
+     */
+    private fun primaryArtistKey(raw: String, solo: Map<String, Int>): String {
+        val toks = leadTokens(raw)
+        if (toks.size <= 1) return normKey(raw)
         val best = toks.maxByOrNull { solo[it] ?: 0 }
         if (best != null && (solo[best] ?: 0) > 0) return best
-        if ((full[whole] ?: 0) >= 3) return whole   // e.g. "AC/DC" — a name, not a collab
-        // A comma inside a name with no known solo member is far more often one act ("Crosby,
-        // Stills, Nash & Young", "Earth, Wind & Fire") than a lead + guests — keep it whole.
-        if (',' in raw) return whole
-        return toks.first()
+        return normKey(leadPart(raw))
     }
 
     /** A clean, feat-free spelling of the part of [raw] that maps to bucket [key], or null. */
@@ -109,6 +123,10 @@ object LibraryGrouping {
     fun albumArtistKeyOf(albumKey: String): String? =
         albumKey.substringBefore(ALBUM_KEY_SEP, missingDelimiterValue = "").ifEmpty { null }
 
+    /** Bump when the grouping rules change in a way [keysStale] can't see, so restore
+     *  recomputes every row's keys once. 2: stable delimiter-name attribution (AC/DC). */
+    const val SCHEME = 2
+
     /** True when [t]'s stored keys are missing or were written by an older grouping scheme,
      *  so a restore must recompute them once (see LibraryRepository.migrateGroupingKeys). */
     fun keysStale(t: TrackEntity): Boolean =
@@ -134,7 +152,6 @@ object LibraryGrouping {
     private fun albumArtistKeys(
         tracks: List<TrackEntity>,
         artistKeys: List<String>,
-        full: Map<String, Int>,
         solo: Map<String, Int>,
     ): Array<String> {
         val out = Array(tracks.size) { artistKeys[it] }
@@ -143,7 +160,7 @@ object LibraryGrouping {
         for (i in tracks.indices) {
             val t = tracks[i]
             t.albumArtist?.trim()?.takeIf { it.isNotEmpty() }?.let { tag ->
-                val k = primaryArtistKey(tag, full, solo)
+                val k = primaryArtistKey(tag, solo)
                 tagKeys[i] = if (k in VARIOUS_ALIASES) VARIOUS_ARTISTS_KEY else k
             }
             buckets.getOrPut(folderOf(t) + ALBUM_KEY_SEP + normKey(t.albumTitle ?: "Unknown album")) { ArrayList(4) } += i
@@ -180,16 +197,15 @@ object LibraryGrouping {
      */
     fun computeGroupingKeys(tracks: List<TrackEntity>): List<TrackEntity> {
         if (tracks.isEmpty()) return tracks
-        val full = HashMap<String, Int>()
+        // Solo-act stats: a track credited to ONE name (featured guests don't count against it,
+        // so "Lead feat. Guest" is a Lead solo track) makes that name a known standalone act.
         val solo = HashMap<String, Int>()
         for (t in tracks) {
-            val a = t.artist ?: "Unknown"
-            full.merge(normKey(a), 1, Int::plus)
-            val toks = artistTokens(a)
+            val toks = leadTokens(t.artist ?: "Unknown")
             if (toks.size == 1) solo.merge(toks[0], 1, Int::plus)
         }
-        val artistKeys = tracks.map { primaryArtistKey(it.artist ?: "Unknown", full, solo) }
-        val albumArtists = albumArtistKeys(tracks, artistKeys, full, solo)
+        val artistKeys = tracks.map { primaryArtistKey(it.artist ?: "Unknown", solo) }
+        val albumArtists = albumArtistKeys(tracks, artistKeys, solo)
         return tracks.mapIndexed { i, t ->
             val a = t.artist ?: "Unknown"
             val aKey = artistKeys[i]

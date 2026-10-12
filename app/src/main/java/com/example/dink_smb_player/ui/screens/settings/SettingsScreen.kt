@@ -201,7 +201,7 @@ fun SettingsScreen() {
                                     SegOption(ThemeMode.Light, "Light"),
                                 ),
                                 onSelect = { theme.set(it) },
-                                modifier = Modifier.focusProperties { left = railReq },
+                                firstItemModifier = Modifier.focusProperties { left = railReq },
                             )
                         }
                         val navSounds = LocalNavSounds.current
@@ -253,7 +253,7 @@ fun SettingsScreen() {
                                         SegOption(2, "Advanced"),
                                     ),
                                     onSelect = { section = it },
-                                    modifier = Modifier.focusProperties { left = railReq },
+                                    firstItemModifier = Modifier.focusProperties { left = railReq },
                                 )
                                 when (section) {
                                     0 -> {
@@ -261,7 +261,7 @@ fun SettingsScreen() {
                                             selected = eq.currentPreset,
                                             options = eq.presets.map { SegOption(it, it) },
                                             onSelect = { EqEngine.applyPreset(it) },
-                                            modifier = Modifier.focusProperties { left = railReq },
+                                            firstItemModifier = Modifier.focusProperties { left = railReq },
                                         )
                                         GhostButton(
                                             label = "Reset equalizer",

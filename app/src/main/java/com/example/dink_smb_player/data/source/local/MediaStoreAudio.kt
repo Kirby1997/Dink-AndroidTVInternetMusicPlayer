@@ -58,9 +58,9 @@ object MediaStoreAudio {
                     // Canonical index id, so this Song == its local TrackEntity row.
                     id = trackIdFor(SourceType.Local, MediaLibrary.LOCAL_SOURCE_ID, pathKey),
                     title = c.getString(titleCol) ?: "Unknown",
-                    artist = c.getString(artistCol) ?: "Unknown",
+                    artist = knownTag(c.getString(artistCol)) ?: UNKNOWN_ARTIST,
                     albumId = null,
-                    albumTitle = c.getString(albumCol),
+                    albumTitle = knownTag(c.getString(albumCol)),
                     durationSec = (c.getLong(durCol) / 1000).toInt(),
                     playCount = 0,
                     sourcePath = data,
@@ -71,4 +71,12 @@ object MediaStoreAudio {
         }
         return out
     }
+
+    /** What a Song shows for a missing artist; [MediaLibrary] stores such rows with a null artist. */
+    internal const val UNKNOWN_ARTIST = "Unknown"
+
+    /** MediaStore reports an untagged artist/album as the literal "<unknown>"; treat that
+     *  (and blank) as missing so it isn't indexed as a real name. */
+    internal fun knownTag(raw: String?): String? =
+        raw?.trim()?.takeIf { it.isNotEmpty() && it != MediaStore.UNKNOWN_STRING && !it.equals("<unknown>", true) }
 }

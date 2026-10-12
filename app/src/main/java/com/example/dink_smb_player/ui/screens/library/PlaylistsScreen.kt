@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Delete
@@ -28,6 +29,7 @@ import androidx.compose.material.icons.outlined.MusicNote
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.QueueMusic
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -38,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -50,6 +53,7 @@ import androidx.tv.material3.Text
 import com.example.dink_smb_player.ui.components.LocalToast
 import com.example.dink_smb_player.DinkApplication
 import com.example.dink_smb_player.LocalContentFocus
+import com.example.dink_smb_player.LocalDrawerOpen
 import com.example.dink_smb_player.LocalRailFocusRequester
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.library.PlaylistRepository
@@ -93,6 +97,29 @@ fun PlaylistsScreen(
 
     var menuFor by remember { mutableStateOf<Playlist?>(null) }
 
+    // Deleting removes the focused row, which drops focus to the rail — re-seat it on the
+    // row now at the deleted index (clamped), or the empty-state button, when the count
+    // shrinks. Row 0 owns contentFocus; other rows get per-index requesters. Scroll to the
+    // target first: a row scrolled out of the lazy window has no attached requester.
+    val listState = rememberLazyListState()
+    val rowRequesters = remember { HashMap<Int, FocusRequester>() }
+    var lastFocusedIdx by remember { mutableStateOf(0) }
+    var lastCount by remember { mutableStateOf(playlists.size) }
+    val drawerOpen = LocalDrawerOpen.current
+    LaunchedEffect(playlists.size) {
+        val shrank = playlists.size < lastCount
+        lastCount = playlists.size
+        if (!shrank) return@LaunchedEffect
+        val target = lastFocusedIdx.coerceIn(0, (playlists.size - 1).coerceAtLeast(0))
+        if (playlists.isNotEmpty()) runCatching { listState.scrollToItem(target) }
+        val req = if (target == 0) contentFocus else rowRequesters.getOrPut(target) { FocusRequester() }
+        repeat(15) {
+            kotlinx.coroutines.delay(40)
+            if (drawerOpen.value) return@LaunchedEffect // user moved to the drawer; don't pull focus back
+            if (runCatching { req.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 24.dp)) {
         Text("Playlists", style = type.screenTitle.copy(color = palette.ink0), maxLines = 1)
         Spacer(Modifier.height(4.dp))
@@ -122,6 +149,7 @@ fun PlaylistsScreen(
             )
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
@@ -132,7 +160,9 @@ fun PlaylistsScreen(
                         subtitle = "${resolved.size} tracks",
                         railRequester = railRequester,
                         // First row takes contentFocus so a drawer commit lands in the list.
-                        modifier = if (idx == 0) Modifier.focusRequester(contentFocus) else Modifier,
+                        modifier = (if (idx == 0) Modifier.focusRequester(contentFocus)
+                        else Modifier.focusRequester(rowRequesters.getOrPut(idx) { FocusRequester() }))
+                            .onFocusChanged { if (it.hasFocus) lastFocusedIdx = idx },
                         onClick = {
                             if (resolved.isNotEmpty()) {
                                 player.playFrom(resolved, 0)

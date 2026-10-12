@@ -1,5 +1,6 @@
 package com.example.dink_smb_player.data.source
 
+import kotlinx.coroutines.CancellationException
 import android.content.Context
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
@@ -65,7 +66,7 @@ class MonitorWorker(
         SmbConnectionRegistry.hydrate(ctx)
 
         // Local media — re-query MediaStore and mirror into the index.
-        runCatching { MediaLibrary.refresh(ctx) }
+        runCatching { MediaLibrary.refresh(ctx) }.onFailure { if (it is CancellationException) throw it }
 
         val prefs = SharePrefs(ctx)
         val store = EncryptedShareStore.get(ctx)
@@ -73,16 +74,16 @@ class MonitorWorker(
 
         // SMB monitored folders. Each share runs under its SourceLocks lock (never
         // concurrently with an import of it) as a job a share delete can cancel.
-        val shares = runCatching { prefs.shares.first() }.getOrDefault(emptyList())
+        val shares = runCatching { prefs.shares.first() }.onFailure { if (it is CancellationException) throw it }.getOrDefault(emptyList())
         for (listed in shares.filter { it.monitoredPaths.isNotEmpty() }) {
             outcomes += SourceLocks.runExclusive(listed.id, listed.monitoredPaths) {
                 // Re-read under the lock: the share may have been deleted, or its folders
                 // edited, while this pass waited behind an import.
-                val share = runCatching { prefs.shares.first() }.getOrDefault(emptyList())
+                val share = runCatching { prefs.shares.first() }.onFailure { if (it is CancellationException) throw it }.getOrDefault(emptyList())
                     .firstOrNull { it.id == listed.id }
                     ?.takeIf { it.monitoredPaths.isNotEmpty() }
                     ?: return@runExclusive SourceOutcome.SKIPPED
-                val creds = runCatching { store.getSmbCreds(share.id) }.getOrNull()
+                val creds = runCatching { store.getSmbCreds(share.id) }.onFailure { if (it is CancellationException) throw it }.getOrNull()
                 // Reuse already-indexed rows so only NEW files are tag-read this pass.
                 val existing = LibraryRepository.sourceTrackMap(ctx, SourceType.Smb, share.id)
                 SmbImporter.enumerate(ctx, share, creds, share.monitoredPaths, existing).fold(

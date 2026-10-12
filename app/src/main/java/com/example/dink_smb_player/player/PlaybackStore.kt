@@ -1,6 +1,8 @@
 package com.example.dink_smb_player.player
 
 import android.content.Context
+import android.util.Log
+import com.example.dink_smb_player.data.library.SafeFiles
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -53,6 +55,7 @@ object PlaybackStore {
     private val json = Json { ignoreUnknownKeys = true }
     private val ioLock = Mutex()
 
+    private const val TAG = "PlaybackStore"
     private const val SESSION_FILE = "nowplaying.json"
     private const val POSITION_FILE = "nowplaying_pos.json"
 
@@ -119,10 +122,11 @@ object PlaybackStore {
     }
 
     private fun writeAtomic(f: File, text: String) {
-        runCatching {
-            val tmp = File(f.parentFile, "${f.name}.tmp")
-            tmp.writeText(text)
-            if (!tmp.renameTo(f)) { tmp.copyTo(f, overwrite = true); tmp.delete() }
+        try {
+            SafeFiles.writeAtomic(f) { it.write(text.toByteArray(Charsets.UTF_8)) }
+        } catch (t: Throwable) {
+            // A lost checkpoint must not crash playback, but it shouldn't vanish silently.
+            Log.w(TAG, "write ${f.name} failed", t)
         }
     }
 }

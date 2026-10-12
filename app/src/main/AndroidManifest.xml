@@ -38,9 +38,12 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.DinkSMBPlayer">
+        <!-- configChanges: Compose re-reads LocalConfiguration (System theme, density, font
+             scale) in place. Recreating reset nav to Home and dropped wizard/scroll state. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="uiMode|orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|density|fontScale|locale|layoutDirection|colorMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 

@@ -141,7 +141,9 @@ fun ConfirmDialog(
                         onClick = onConfirm,
                         shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(24.dp)),
                         colors = ClickableSurfaceDefaults.colors(
-                            containerColor = palette.bad,
+                            // Dimmed until focused: same red both ways gave no focus cue
+                            // beyond the 1.1× scale, so Exit looked unselectable.
+                            containerColor = palette.bad.copy(alpha = 0.45f),
                             focusedContainerColor = palette.bad,
                             contentColor = palette.ink0,
                             focusedContentColor = palette.ink0,

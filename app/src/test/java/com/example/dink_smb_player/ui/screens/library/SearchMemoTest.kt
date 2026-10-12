@@ -12,7 +12,7 @@ class SearchMemoTest {
     @After
     fun reset() {
         SearchMemo.query.value = ""
-        SearchMemo.facet.value = SearchFacet.Songs
+        SearchMemo.facet.value = SearchFacet.All
         SearchMemo.openedKey = null
         SearchMemo.armBackFocus = false
     }

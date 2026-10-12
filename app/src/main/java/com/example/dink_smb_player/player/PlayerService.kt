@@ -47,6 +47,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -191,19 +192,20 @@ class PlayerService : MediaSessionService() {
         }
     }
 
-    /** Capture on main (Compose state), write on IO in a process-lived scope so a final
-     *  save from [onDestroy] still lands. */
+    /** Capture on main (Compose state), write on IO through the process-lived, in-order
+     *  [persistWriter], so a final save from [onDestroy] / [exitPlayback] still lands and
+     *  an older checkpoint can never overwrite a newer one. */
     private fun persist(state: PlayerState, action: SessionPersistPolicy.Action) {
         val ctx = applicationContext
         when (action) {
             SessionPersistPolicy.Action.SaveSession -> {
                 val snap = state.snapshot()
-                persistScope.launch {
+                persistWriter.submit {
                     if (snap != null) PlaybackStore.save(ctx, snap) else PlaybackStore.clear(ctx)
                 }
             }
             SessionPersistPolicy.Action.SavePosition -> state.positionRecord()?.let { pos ->
-                persistScope.launch { PlaybackStore.savePosition(ctx, pos) }
+                persistWriter.submit { PlaybackStore.savePosition(ctx, pos) }
             }
             SessionPersistPolicy.Action.None -> Unit
         }
@@ -382,20 +384,21 @@ class PlayerService : MediaSessionService() {
             }
             if (win != null) return win.toMediaItems()
         }
-        val resolved = snap.queueIds.mapNotNull { byId[it] }.filter { it.mediaUri != null }
-        if (resolved.isEmpty()) {
-            throw IllegalStateException("saved session resolves to no playable tracks")
-        }
-        val wantedId = snap.queueIds.getOrNull(snap.index)
-        val idx = resolved.indexOfFirst { it.id == wantedId }
-            .let { if (it >= 0) it else snap.index.coerceIn(0, resolved.lastIndex) }
+        // Follow the saved current SLOT through the dropped-ids compaction (same helper as
+        // PlayerState.restore): finding it by id resumed a song queued twice on its first copy.
+        val rq = resolveSavedQueue(snap.queueIds, snap.index) { id -> byId[id]?.takeIf { it.mediaUri != null } }
+            ?: throw IllegalStateException("saved session resolves to no playable tracks")
+        val resolved = rq.songs
+        val found = rq.found
+        val idx = rq.index
         val start = (idx - RESUME_WINDOW / 2)
             .coerceIn(0, (resolved.size - RESUME_WINDOW).coerceAtLeast(0))
         val window = resolved.subList(start, minOf(resolved.size, start + RESUME_WINDOW))
         return MediaSession.MediaItemsWithStartPosition(
             window.map { resumptionItemFor(it) },
             idx - start,
-            (snap.positionSec * 1000).toLong(),
+            // The saved offset belongs to the saved track; a fallback track starts from 0.
+            if (found >= 0) (snap.positionSec * 1000).toLong() else 0L,
         )
     }
 
@@ -442,6 +445,8 @@ class PlayerService : MediaSessionService() {
 
     companion object {
         const val ACTION_BIND_LOCAL = "com.example.dink_smb_player.player.BIND_LOCAL"
+        /** startService action: the user chose Exit — stop playback and shut down. */
+        const val ACTION_EXIT = "com.example.dink_smb_player.player.EXIT"
         private const val TAG = "PlayerService"
 
         /** Queue slice handed to the engine on media-button playback resumption. */
@@ -451,6 +456,11 @@ class PlayerService : MediaSessionService() {
 
         /** Session writes outlive the service (the final save in onDestroy). */
         private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        /** All session/position writes, applied one at a time in submission order. A
+         *  launch per write raced on the IO pool: an older position could land after a
+         *  newer session save and restore a few seconds stale. */
+        private val persistWriter = SerialWriter(persistScope)
 
         /** Set by [PlayerState.attachEngine] while it holds the engine; lets
          *  [onPlaybackResumption] serve the live in-memory session instead of
@@ -505,6 +515,29 @@ class PlayerService : MediaSessionService() {
         return if (intent?.action == ACTION_BIND_LOCAL) binder else super.onBind(intent)
     }
 
+    /** [ACTION_EXIT] from the app's Exit dialog; everything else is Media3's (media buttons). */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val result = super.onStartCommand(intent, flags, startId)
+        if (intent?.action != ACTION_EXIT) return result
+        exitPlayback()
+        return START_NOT_STICKY
+    }
+
+    /**
+     * Exit means "Playback will stop": the activity finishing only unbinds, and a playing
+     * (foreground) service carried on with no UI. Pause and stop like [onTaskRemoved] does
+     * when idle — the service goes once the closing activity unbinds — and checkpoint the
+     * paused spot now, so the next launch restores it (paused) even if this cached process
+     * is killed before [onDestroy]'s flush.
+     */
+    private fun exitPlayback() {
+        pauseAllPlayersAndStopSelf()
+        PlayerState.sharedOrNull()?.let { state ->
+            state.pollTick() // position as of the pause, not the last 250 ms poll
+            persist(state, persistPolicy.flush(SystemClock.elapsedRealtime(), state.saveSignature()))
+        }
+    }
+
     /**
      * Keep playing when the task is swiped away mid-play; otherwise shut down. Deliberately
      * does NOT call super: Media3's default stops unless [Player.isPlaying], which is false
@@ -538,6 +571,35 @@ class PlayerService : MediaSessionService() {
         super.onDestroy()
     }
 
+}
+
+/**
+ * Runs submitted suspend writes strictly one after another, in [submit] order, on a single
+ * consumer in [scope]. Each write runs to completion (including its own suspensions, e.g.
+ * PlaybackStore's withContext + Mutex) before the next starts — a limitedParallelism(1)
+ * dispatcher wouldn't give that, since a write that suspends frees the slot for the next.
+ * [submit] never blocks, so it is safe from the main thread. A failing write is logged and
+ * the queue carries on.
+ */
+internal class SerialWriter(scope: CoroutineScope) {
+    private val writes = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+
+    init {
+        scope.launch {
+            for (write in writes) {
+                try {
+                    write()
+                } catch (t: Throwable) {
+                    if (t is CancellationException && !isActive) throw t
+                    Log.w("SerialWriter", "write failed", t)
+                }
+            }
+        }
+    }
+
+    fun submit(write: suspend () -> Unit) {
+        writes.trySend(write)
+    }
 }
 
 /**

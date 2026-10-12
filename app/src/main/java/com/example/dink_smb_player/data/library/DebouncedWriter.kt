@@ -1,5 +1,7 @@
 package com.example.dink_smb_player.data.library
 
+import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -28,7 +30,15 @@ internal class DebouncedWriter(
         scope.launch {
             for (signal in wake) {
                 delay(delayMs)
-                writeIfDirty()
+                // A throw must not kill this loop: persistence would stop for the process.
+                // (writeIfDirty already re-marks dirty, so the next request retries.)
+                try {
+                    writeIfDirty()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.e("DebouncedWriter", "debounced write failed; will retry on next request", t)
+                }
             }
         }
     }

@@ -2,8 +2,12 @@ package com.example.dink_smb_player
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
@@ -59,6 +63,7 @@ import kotlinx.coroutines.withContext
 import com.example.dink_smb_player.nav.RailGroup
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.nav.rememberDinkNav
+import com.example.dink_smb_player.player.PlayerService
 import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.player.rememberPlayerState
 import com.example.dink_smb_player.ui.components.DinkDrawerContent
@@ -272,9 +277,13 @@ fun DinkApp() {
             BackAction.DetailToParent -> {
                 navSounds.select()
                 val parent = LibraryDetailNav.parent
-                ListScrollMemo.facetOf(parent)?.let { ListScrollMemo.arm(it) }
+                val facet = ListScrollMemo.facetOf(parent)
+                facet?.let { ListScrollMemo.arm(it) }
                 if (parent == ScreenId.Search) SearchMemo.arm()
                 nav.go(parent)
+                // Parents without their own restore (Home) would be left with no focus once
+                // the detail's focused node is disposed; fall back to the primary focusable.
+                if (facet == null && parent != ScreenId.Search) commitSeq++
             }
             // Otherwise (a top-level screen) → focus the rail; Back again (drawer open) exits.
             BackAction.FocusRail -> runCatching { railRequester.requestFocus() }
@@ -380,10 +389,30 @@ fun DinkApp() {
             onCancel = { exitDialog = false },
             onConfirm = {
                 exitDialog = false
-                (context as? Activity)?.finish()
+                exitApp(context)
             },
         )
     }
+}
+
+/**
+ * The Exit dialog's promise: playback stops and the app closes. finish() alone only
+ * unbound PlayerService, so a playing (foreground) service kept the music going with no
+ * UI. The service pauses, checkpoints the session (restored paused on the next launch)
+ * and stops itself once this activity unbinds; the task leaves Recents too.
+ */
+private fun exitApp(context: Context) {
+    runCatching {
+        context.startService(Intent(context, PlayerService::class.java).setAction(PlayerService.ACTION_EXIT))
+    }.onFailure { Log.w("DinkApp", "exit: couldn't stop PlayerService", it) }
+    context.findActivity()?.finishAndRemoveTask()
+}
+
+/** LocalContext can be a ContextWrapper around the activity; a bare cast would no-op Exit. */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 @Composable

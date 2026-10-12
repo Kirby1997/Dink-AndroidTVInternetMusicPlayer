@@ -47,6 +47,35 @@ data class EngineTags(
     val durationMs: Long? = null,
 )
 
+/** A saved queue ([PlaybackStore.Snapshot.queueIds]) resolved to songs. */
+internal class ResolvedQueue(
+    val songs: List<Song>,
+    /** Saved slot → index in [songs]; -1 where that id didn't resolve (dropped). */
+    val compactOf: IntArray,
+    /** Where the saved current slot landed in [songs]; -1 when that track dropped out. */
+    val found: Int,
+    /** Track to resume on: [found], else the saved index clamped into [songs]. A fallback
+     *  track belongs to no saved position, so callers start it from 0 when [found] < 0. */
+    val index: Int,
+)
+
+/**
+ * Resolve saved queue [ids] through [resolve] (null = drop the slot), following the saved
+ * current slot [savedIndex] through the compaction. By slot, not id: a song queued twice
+ * would otherwise resume on its FIRST copy. Null when nothing resolves.
+ */
+internal fun resolveSavedQueue(ids: List<String>, savedIndex: Int, resolve: (String) -> Song?): ResolvedQueue? {
+    val songs = ArrayList<Song>(ids.size)
+    val compactOf = IntArray(ids.size) { -1 }
+    ids.forEachIndexed { i, id ->
+        resolve(id)?.let { compactOf[i] = songs.size; songs += it }
+    }
+    if (songs.isEmpty()) return null
+    val found = compactOf.getOrNull(savedIndex) ?: -1
+    val index = if (found >= 0) found else savedIndex.coerceIn(0, songs.lastIndex)
+    return ResolvedQueue(songs, compactOf, found, index)
+}
+
 /**
  * Façade that holds player state for the UI and drives a [Player] engine when one
  * is attached. The engine is provided by [PlayerService]; until it binds (or for
@@ -259,11 +288,36 @@ class PlayerState(
     // first, rest shuffled), unshuffle restores [baseOrder]. Engine shuffle stays off.
     private var baseOrder: List<Song> = emptyList()
 
-    private fun buildShuffled(songs: List<Song>, startIndex: Int): List<Song> {
-        if (songs.size <= 1) return songs
-        val first = songs[startIndex]
-        val rest = songs.toMutableList().apply { removeAt(startIndex) }.also { it.shuffle() }
-        return ArrayList<Song>(songs.size).apply { add(first); addAll(rest) }
+    // Where each queue slot sits in [baseOrder] while the queue is a shuffled arrangement
+    // of it: basePos[q] = index in baseOrder of _queue[q]. Null = the queue mirrors the
+    // base slot-for-slot (unshuffled). The queue may hold the same song id twice
+    // (addToQueue), so finding "the current track" in the base by id picked the FIRST
+    // copy — unshuffle then jumped currentIndex (highlight + next track) to that copy.
+    private var basePos: MutableList<Int>? = null
+
+    // Bumped on every queue reorder / structural change and folded into [saveSignature].
+    // A reshuffle while already shuffled at index 0 (or a shuffled replay of the same
+    // list) keeps track, index, modes and length identical, so without this the new
+    // order + basePos never reached disk and a relaunch restored the old shuffle.
+    private var reorderCount = 0
+
+    /** [basePos] when it still lines up with the queue and base, else null. */
+    private fun liveBasePos(): List<Int>? =
+        basePos?.takeIf { it.size == _queue.size && baseOrder.size == _queue.size }
+
+    /** Index in [baseOrder] of queue slot [q] (holding song [id]); falls back to the first
+     *  base copy of [id] when the slot mapping is unknown or stale (-1 if absent). */
+    private fun baseIndexOf(q: Int, id: String): Int {
+        val mapped = if (basePos == null) q else liveBasePos()?.getOrNull(q)
+        if (mapped != null && baseOrder.getOrNull(mapped)?.id == id) return mapped
+        return baseOrder.indexOfFirst { it.id == id }
+    }
+
+    /** A shuffled play order over `0 until size` as indices: [startIndex] first, rest random. */
+    private fun shuffledIndices(size: Int, startIndex: Int): List<Int> {
+        if (size <= 1) return List(size) { it }
+        val rest = (0 until size).filter { it != startIndex }.shuffled()
+        return ArrayList<Int>(size).apply { add(startIndex); addAll(rest) }
     }
 
     val durationSec: Int get() = currentSong?.durationSec ?: 0
@@ -293,14 +347,26 @@ class PlayerState(
         if (_queue.isEmpty()) {
             _queue.add(song)
             baseOrder = listOf(song)
+            basePos = null
+            reorderCount++
             currentIndex = 0
         } else {
-            val existing = _queue.indexOfFirst { it.id == song.id }
+            // Re-loading the current track stays on ITS slot: the queue may hold the same
+            // id twice, and the first copy is a different queue position.
+            val cur = currentIndex
+            val existing = if (cur in _queue.indices && _queue[cur].id == song.id) cur
+                else _queue.indexOfFirst { it.id == song.id }
             currentIndex = if (existing >= 0) existing else {
                 _queue.add(song)
+                reorderCount++
                 // Keep the unshuffled base in step, or a later shuffle toggle rebuilds the
                 // queue without this track and plays a different song than the UI shows.
-                if (baseOrder.isNotEmpty()) baseOrder = baseOrder + song
+                if (baseOrder.isNotEmpty()) {
+                    baseOrder = baseOrder + song
+                    basePos?.add(baseOrder.lastIndex)
+                } else {
+                    basePos = null
+                }
                 _queue.lastIndex
             }
         }
@@ -314,7 +380,10 @@ class PlayerState(
         val safeStart = startIndex.coerceIn(0, songs.lastIndex)
         // Shuffle = reorder the queue (chosen track first, rest shuffled) and play it
         // sequentially. Engine never shuffles; works the same windowed or not.
-        val order = if (shuffle) buildShuffled(songs, safeStart) else songs
+        val perm = if (shuffle) shuffledIndices(songs.size, safeStart) else null
+        basePos = perm?.toMutableList()
+        reorderCount++
+        val order = perm?.map { songs[it] } ?: songs
         val startIdx = if (shuffle) 0 else safeStart
         _queue.clear()
         _queue.addAll(order)
@@ -332,7 +401,14 @@ class PlayerState(
     fun addToQueue(song: Song) {
         val wasEmpty = _queue.isEmpty()
         _queue.add(song)
-        baseOrder = (if (baseOrder.isEmpty()) _queue.dropLast(1) else baseOrder) + song
+        reorderCount++
+        if (baseOrder.isEmpty()) {
+            baseOrder = _queue.toList() // adopt the queue (already holding song) as base
+            basePos = null
+        } else {
+            baseOrder = baseOrder + song
+            basePos?.add(baseOrder.lastIndex)
+        }
         if (wasEmpty || currentIndex < 0 || currentSong == null) {
             currentIndex = _queue.lastIndex
             clearLyricsOnSongChange(song)
@@ -371,6 +447,8 @@ class PlayerState(
         pendingEngineApply = false
         _queue.clear()
         baseOrder = emptyList()
+        basePos = null
+        reorderCount++
         currentIndex = -1
         clearLyricsOnSongChange(null)
         currentSong = null
@@ -439,13 +517,21 @@ class PlayerState(
         if (_queue.isEmpty()) return
         // A base that lost track of the current song (or the queue) would rebuild a queue
         // without it and play something other than what's shown — re-adopt the queue.
-        if (baseOrder.isEmpty() || baseOrder.none { it.id == current.id }) baseOrder = _queue.toList()
-        val curInBase = baseOrder.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
-        val order = if (shuffled) buildShuffled(baseOrder, curInBase) else baseOrder
+        if (baseOrder.isEmpty() || baseOrder.none { it.id == current.id }) {
+            baseOrder = _queue.toList()
+            basePos = null
+        }
+        // By slot, not id: with the same song queued twice, the first copy is the wrong one.
+        val curInBase = baseIndexOf(currentIndex, current.id).coerceAtLeast(0)
+        val perm = if (shuffled) shuffledIndices(baseOrder.size, curInBase) else null
+        val order = perm?.map { baseOrder[it] } ?: baseOrder
         val pos = timeSec
         _queue.clear()
         _queue.addAll(order)
-        currentIndex = order.indexOfFirst { it.id == current.id }.coerceAtLeast(0)
+        basePos = perm?.toMutableList()
+        reorderCount++
+        // Shuffled: the current track leads the new order. Unshuffled: back on its base slot.
+        currentIndex = if (perm != null) 0 else curInBase
         // Seed the start position into the rebuild itself so the engine prepares at the
         // current spot, rather than preparing at 0 and then seeking (a second buffer).
         pendingSeekMs = if (current.mediaUri != null && pos > 0f) (pos * 1000).toLong() else 0L
@@ -573,10 +659,24 @@ class PlayerState(
         if (newDur == song.durationSec) return
         // Persist real duration into the index (import leaves it 0 for streamed tracks).
         onMetadataResolved?.invoke(EngineTags(songId = song.id, durationMs = durMs))
-        val updated = song.copy(durationSec = newDur)
-        currentSong = updated
-        val idx = currentIndex
-        if (idx in _queue.indices) _queue[idx] = updated
+        currentSong = song.copy(durationSec = newDur)
+        // Every copy of this id (queue + unshuffled base) is the same file.
+        replaceSongEverywhere(song.id) { it.copy(durationSec = newDur) }
+    }
+
+    /** Apply [transform] to every copy of song [id] in the queue AND in [baseOrder] — all
+     *  copies are the same file. Fixing only the queue let an unshuffle (which rebuilds
+     *  the queue from baseOrder) revert rows to filename titles / stale durations. */
+    private fun replaceSongEverywhere(id: String, transform: (Song) -> Song) {
+        for (i in _queue.indices) {
+            val s = _queue[i]
+            if (s.id != id) continue
+            val t = transform(s)
+            if (t != s) _queue[i] = t
+        }
+        if (baseOrder.any { it.id == id }) {
+            baseOrder = baseOrder.map { if (it.id == id) transform(it) else it }
+        }
     }
 
     /**
@@ -586,9 +686,8 @@ class PlayerState(
      * persist. Local tracks already carry clean MediaStore tags — skip them.
      */
     internal fun onEngineMetadata(metadata: MediaMetadata, currentMediaId: String?) {
-        val idx = _queue.indexOfFirst { it.id == currentMediaId }
-        if (idx < 0) return
-        val song = _queue[idx]
+        if (currentMediaId == null) return
+        val song = _queue.firstOrNull { it.id == currentMediaId } ?: return
         val uri = song.mediaUri ?: return
         if (!isRemoteUri(uri)) return
 
@@ -599,17 +698,20 @@ class PlayerState(
         val track = metadata.trackNumber
         if (title == null && artist == null && album == null && year == null && track == null) return
 
-        val enriched = song.copy(
-            title = title ?: song.title,
-            artist = artist ?: song.artist,
-            albumTitle = album ?: song.albumTitle,
-        )
-        if (enriched != song) {
-            _queue[idx] = enriched
-            if (idx == currentIndex) {
-                currentSong = enriched
-                currentAlbum = albumLookup(enriched.albumId)
-            }
+        // Every queued copy of this id is the same file: enrich them all (and the
+        // unshuffled base). Enriching only the first copy missed the playing one when the
+        // song was queued twice (the now-playing title stayed on the filename-derived name).
+        replaceSongEverywhere(currentMediaId) { s ->
+            s.copy(
+                title = title ?: s.title,
+                artist = artist ?: s.artist,
+                albumTitle = album ?: s.albumTitle,
+            )
+        }
+        val cur = _queue.getOrNull(currentIndex)
+        if (cur != null && cur.id == currentMediaId && cur != currentSong) {
+            currentSong = cur
+            currentAlbum = albumLookup(cur.albumId)
         }
         onMetadataResolved?.invoke(
             EngineTags(song.id, title, artist, album, year, track, null),
@@ -959,10 +1061,11 @@ class PlayerState(
     // --- Session persistence ---------------------------------------------------
 
     /** A cheap value that changes whenever the persisted-worthy STRUCTURE of the session
-     *  changes (track, order, modes, queue length) — but NOT on every position tick. The
+     *  changes (track, order, modes, queue length, any reorder via [reorderCount]) — but
+     *  NOT on every position tick. The
      *  persistence loop keys a debounced save on this; position is captured at save time. */
     fun saveSignature(): String =
-        "${currentSong?.id}|$currentIndex|$shuffle|$repeatMode|${_queue.size}"
+        "${currentSong?.id}|$currentIndex|$shuffle|$repeatMode|${_queue.size}|$reorderCount"
 
     /** Snapshot of the current session for [PlaybackStore], or null when nothing is
      *  playing. Windows the queue to [PlaybackStore.MAX_QUEUE] ids centred on the current
@@ -980,7 +1083,7 @@ class PlayerState(
             positionSec = timeSec,
             shuffle = shuffle,
             repeat = repeatMode.name,
-            baseOrder = if (shuffle) baseOrderIndices(ids) else null,
+            baseOrder = if (shuffle) baseOrderIndices(ids, start) else null,
         )
     }
 
@@ -988,10 +1091,14 @@ class PlayerState(
     fun positionRecord(): PlaybackStore.Position? =
         currentSong?.let { PlaybackStore.Position(it.id, timeSec) }
 
-    /** [baseOrder] restricted to the saved window, as indices into [ids] (duplicates
-     *  matched in turn). Null when there's no usable base. */
-    private fun baseOrderIndices(ids: List<String>): List<Int>? {
+    /** [baseOrder] restricted to the saved window (queue slots [start] + [ids] indices),
+     *  as indices into [ids]. Exact per slot when [basePos] is live; otherwise duplicates
+     *  are matched in turn. Null when there's no usable base. */
+    private fun baseOrderIndices(ids: List<String>, start: Int): List<Int>? {
         if (baseOrder.isEmpty()) return null
+        liveBasePos()?.let { bp ->
+            return ids.indices.sortedBy { bp[start + it] }.takeIf { it.isNotEmpty() }
+        }
         val slots = HashMap<String, ArrayDeque<Int>>(ids.size * 2)
         ids.forEachIndexed { i, id -> slots.getOrPut(id) { ArrayDeque() }.addLast(i) }
         return baseOrder.mapNotNull { slots[it.id]?.removeFirstOrNull() }.takeIf { it.isNotEmpty() }
@@ -1012,20 +1119,24 @@ class PlayerState(
             adoptEngineSession(byId)
             return
         }
-        val songs = snapshot.queueIds.mapNotNull { byId[it] }
-        if (songs.isEmpty()) return
-        // Keep the current track pinned even if earlier ids dropped: find it by its old
-        // window index, then locate where it landed after the mapNotNull compaction.
-        val wantedId = snapshot.queueIds.getOrNull(snapshot.index)
-        val idx = (wantedId?.let { id -> songs.indexOfFirst { it.id == id } } ?: -1)
-            .let { if (it >= 0) it else snapshot.index.coerceIn(0, songs.lastIndex) }
+        // Resolve ids, remembering where each saved slot landed after the compaction
+        // (rows deleted from the library since drop out). Keep the current track pinned
+        // even if earlier ids dropped: follow its saved slot through the compaction. By
+        // slot, not id — a song queued twice would otherwise resume on its first copy.
+        val resolved = resolveSavedQueue(snapshot.queueIds, snapshot.index) { byId[it] } ?: return
+        val songs = resolved.songs
+        val compactOf = resolved.compactOf
+        val found = resolved.found
+        val idx = resolved.index
+        reorderCount++
         _queue.clear()
         _queue.addAll(songs)
         // A shuffled session saved its unshuffled order; without it the shuffled queue
         // became the "original" and turning shuffle off changed nothing.
-        val base = snapshot.baseOrder?.takeIf { snapshot.shuffle }
-            ?.mapNotNull { i -> snapshot.queueIds.getOrNull(i)?.let { byId[it] } }
+        val savedBase = snapshot.baseOrder?.takeIf { snapshot.shuffle }
+        val base = savedBase?.mapNotNull { i -> snapshot.queueIds.getOrNull(i)?.let { byId[it] } }
         baseOrder = if (base.isNullOrEmpty()) songs else base
+        basePos = if (base.isNullOrEmpty()) null else restoredBasePos(savedBase, compactOf, songs.size)
         currentIndex = idx
         val song = songs[idx]
         clearLyricsOnSongChange(song)
@@ -1033,7 +1144,9 @@ class PlayerState(
         currentAlbum = albumLookup(song.albumId)
         shuffle = snapshot.shuffle
         repeatMode = runCatching { RepeatMode.valueOf(snapshot.repeat) }.getOrDefault(RepeatMode.Off)
-        val posSec = snapshot.positionSec.coerceAtLeast(0f)
+        // The saved position belongs to the saved track; if that track is gone, the
+        // fallback song starts from the top rather than mid-way through a stranger.
+        val posSec = if (found >= 0) snapshot.positionSec.coerceAtLeast(0f) else 0f
         timeSec = posSec
         isPlaying = false
         pendingSeekMs = (posSec * 1000).toLong()
@@ -1043,21 +1156,46 @@ class PlayerState(
         pendingEngineApply = true
     }
 
+    /** [basePos] for a restored shuffle: the saved base order [saved] (indices into the
+     *  saved queue ids) followed through [compactOf] to restored queue slots. Null unless
+     *  it covers each of the [size] restored slots exactly once. */
+    private fun restoredBasePos(saved: List<Int>?, compactOf: IntArray, size: Int): MutableList<Int>? {
+        if (saved == null) return null
+        val pos = MutableList(size) { -1 }
+        var b = 0
+        for (i in saved) {
+            val q = compactOf.getOrNull(i) ?: continue
+            if (q < 0) continue // dropped from the library: not in the base list either
+            if (pos[q] >= 0) return null
+            pos[q] = b++
+        }
+        return pos.takeIf { b == size }
+    }
+
     /** Mirror an already-playing engine queue into this façade (see [restore] and
      *  [attachEngine]). */
     private fun adoptEngineSession(byId: Map<String, Song>) {
         val eng = engine ?: return
         val ids = (0 until eng.mediaItemCount).map { eng.getMediaItemAt(it).mediaId }
-        val songs = ids.mapNotNull { byId[it] }
+        val curId = eng.currentMediaItem?.mediaId
+        // The engine's current slot, followed through the unresolved-id compaction, so a
+        // song queued twice adopts on the copy actually playing (not the first by id).
+        val engIdx = eng.currentMediaItemIndex.takeIf { ids.getOrNull(it) == curId } ?: -1
+        val songs = ArrayList<Song>(ids.size)
+        var curSlot = -1
+        ids.forEachIndexed { i, id ->
+            byId[id]?.let { if (i == engIdx) curSlot = songs.size; songs += it }
+        }
         if (songs.isEmpty()) return
         pendingSeekMs = 0L // a restore() that lost the bind race must not seek us back
         pendingEngineApply = false // engine queue is authoritative here
         _queue.clear()
         _queue.addAll(songs)
         baseOrder = songs
+        basePos = null
+        reorderCount++
         engineBase = 0
-        val curId = eng.currentMediaItem?.mediaId
-        currentIndex = songs.indexOfFirst { it.id == curId }.coerceAtLeast(0)
+        currentIndex = (if (curSlot >= 0) curSlot else songs.indexOfFirst { it.id == curId }).coerceAtLeast(0)
         val song = songs[currentIndex]
         clearLyricsOnSongChange(song)
         currentSong = song

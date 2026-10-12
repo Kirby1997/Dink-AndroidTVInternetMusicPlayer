@@ -45,6 +45,11 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -79,6 +84,7 @@ import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 
 private data class HomeFeed(
@@ -140,10 +146,16 @@ fun HomeScreen(
     // rendering the hero earlier made "Continue Playing" act on a player whose queue and
     // engine weren't populated yet (press → nothing plays), and showed the index's stale
     // resume guess instead of the actually-restored track.
+    // recentPlayed starts null on every visit, so each entry renders HomeLoading for a
+    // frame first. A rail commit (or Back from a detail) lands focus on its placeholder,
+    // which is then disposed when the hero swaps in — focus fell to the rail. Remember
+    // that the placeholder held focus so the hero can take it over.
+    var loadingHadFocus by remember { mutableStateOf(false) }
     if (feed == null || !player.sessionRestoreDone) {
         val indexEmpty = restored && player.sessionRestoreDone &&
             LibraryRepository.trackCountNow(context) == 0
-        if (indexEmpty) EmptyHome(onNavigate = onNavigate) else HomeLoading()
+        if (indexEmpty) EmptyHome(onNavigate = onNavigate)
+        else HomeLoading(onFocused = { loadingHadFocus = it })
         return
     }
 
@@ -153,6 +165,14 @@ fun HomeScreen(
     val newFirstRequester = remember { FocusRequester() }
     val acrossFirstRequester = remember { FocusRequester() }
     val heroRequester = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        if (!loadingHadFocus) return@LaunchedEffect
+        loadingHadFocus = false
+        repeat(15) {
+            delay(40)
+            if (runCatching { heroRequester.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
     // Hoisted so the chain can check whether a shelf's first card is still composed.
     // Scroll a shelf right past card 0 and LazyRow disposes it — its requester detaches,
     // and routing Up/Down/enter to it threw "FocusRequester is not initialized" (UI-1).
@@ -162,11 +182,23 @@ fun HomeScreen(
     val acrossState = rememberLazyListState()
     val toHero: () -> FocusRequester = { heroRequester }
     val toRecent: () -> FocusRequester =
-        { shelfFirstCardTarget(recentState.firstVisibleItemIndex, recentFirstRequester) }
+        {
+            // Empty list → shelf isn't composed, requester never attaches; let Compose pick.
+            if (feed.recentlyPlayed.isEmpty()) FocusRequester.Default
+            else shelfFirstCardTarget(recentState.firstVisibleItemIndex, recentFirstRequester)
+        }
     val toNew: () -> FocusRequester =
-        { shelfFirstCardTarget(newState.firstVisibleItemIndex, newFirstRequester) }
+        {
+            // Empty list → shelf isn't composed, requester never attaches; let Compose pick.
+            if (feed.newOnShares.isEmpty()) FocusRequester.Default
+            else shelfFirstCardTarget(newState.firstVisibleItemIndex, newFirstRequester)
+        }
     val toAcross: () -> FocusRequester =
-        { shelfFirstCardTarget(acrossState.firstVisibleItemIndex, acrossFirstRequester) }
+        {
+            // Empty list → shelf isn't composed, requester never attaches; let Compose pick.
+            if (feed.acrossShares.isEmpty()) FocusRequester.Default
+            else shelfFirstCardTarget(acrossState.firstVisibleItemIndex, acrossFirstRequester)
+        }
 
     LaunchedEffect(feed.resumeSong.id) {
         // Preload the resume track so the mini player + Now Playing have data before the
@@ -396,7 +428,7 @@ private fun cardFocus(
 
 @OptIn(ExperimentalTvMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
-private fun HomeLoading() {
+private fun HomeLoading(onFocused: (Boolean) -> Unit) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
     val contentFocus = LocalContentFocus.current
@@ -415,6 +447,14 @@ private fun HomeLoading() {
                 .widthIn(max = 640.dp)
                 .focusRequester(contentFocus)
                 .focusProperties { left = railRequester }
+                .onFocusChanged { if (it.isFocused) onFocused(true) }
+                // Left (its only way out, to the rail) forgets it so the hero doesn't pull
+                // focus back out of the drawer. Not keyed on drawer state: that still reads
+                // Open while the drawer animates shut after a rail commit.
+                .onPreviewKeyEvent {
+                    if (it.key == Key.DirectionLeft && it.type == KeyEventType.KeyDown) onFocused(false)
+                    false
+                }
                 .focusable(),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {

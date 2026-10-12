@@ -99,7 +99,11 @@ fun SongContextMenu(
     }
 
     Dialog(
-        onDismissRequest = onDismiss,
+        // Back in the name-entry step steps back to the playlist picker (as its hint says)
+        // rather than closing the whole menu.
+        onDismissRequest = {
+            if (mode == MenuMode.NewPlaylist) mode = MenuMode.PickPlaylist else onDismiss()
+        },
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         Column(

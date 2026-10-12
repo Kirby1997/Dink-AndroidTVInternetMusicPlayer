@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -34,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.focusRequester
@@ -57,6 +59,12 @@ import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.launch
+
+/** One-shot: the share whose Open card launched the browser, so Back refocuses that card
+ *  (not "Add share"). Armed in onOpen, consumed on the first successful refocus. */
+internal object ShareOpenMemo {
+    var armedId: String? = null
+}
 
 @Composable
 fun SmbSharesScreen(
@@ -82,7 +90,34 @@ fun SmbSharesScreen(
     // contentFocus is bound to the "Add share" button below.
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(120)
-        runCatching { contentFocus.requestFocus() }
+        // Returning from a share's browser: the card refocus below owns focus instead.
+        if (ShareOpenMemo.armedId == null) runCatching { contentFocus.requestFocus() }
+    }
+
+    // Back from SmbBrowse: DinkApp's commitNav grabs contentFocus ("Add share") on 40ms
+    // retries; land on the opened card slightly later so it wins. Scroll the grid to it
+    // first so its requester is attached.
+    val gridState = rememberLazyGridState()
+    val cardRequesters = remember { HashMap<String, FocusRequester>() }
+    LaunchedEffect(shares) {
+        val id = ShareOpenMemo.armedId ?: return@LaunchedEffect
+        val idx = shares.indexOfFirst { it.id == id }
+        if (idx < 0) {
+            // Share deleted: drop the stale arm once the list has actually loaded.
+            if (shares.isNotEmpty()) ShareOpenMemo.armedId = null
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(200)
+        runCatching { gridState.scrollToItem(idx) }
+        val req = cardRequesters.getOrPut(id) { FocusRequester() }
+        repeat(15) {
+            if (runCatching { req.requestFocus() }.isSuccess) {
+                ShareOpenMemo.armedId = null
+                return@LaunchedEffect
+            }
+            kotlinx.coroutines.delay(40)
+        }
+        ShareOpenMemo.armedId = null
     }
 
     // Track counts come from the persisted per-share total (updated on import), not
@@ -144,6 +179,7 @@ fun SmbSharesScreen(
         } else {
             LazyVerticalGrid(
                 columns = GridCells.Fixed(3),
+                state = gridState,
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 modifier = Modifier.fillMaxSize(),
@@ -158,12 +194,14 @@ fun SmbSharesScreen(
                         // Leftmost column (every 3rd card) routes Left → rail; interior
                         // columns keep spatial Left to the card on their left. `idx == 0`
                         // alone stranded the leftmost cards of rows 2+.
-                        modifier = if (idx % 3 == 0) Modifier.focusProperties { left = railRequester } else Modifier,
+                        modifier = (if (idx % 3 == 0) Modifier.focusProperties { left = railRequester } else Modifier)
+                            .focusRequester(cardRequesters.getOrPut(share.id) { FocusRequester() }),
                         onOpen = {
                             // Open the per-share folder browser — all share ops (Import,
                             // Monitor, Re-import, Delete) and playback live there now, so the
                             // card stays a single uncramped target.
                             SharesLibrary.activeBrowseShareId = share.id
+                            ShareOpenMemo.armedId = share.id
                             onNavigate(ScreenId.SmbBrowse)
                         },
                     )

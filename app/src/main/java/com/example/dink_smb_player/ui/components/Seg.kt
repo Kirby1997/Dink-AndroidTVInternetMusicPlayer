@@ -35,6 +35,8 @@ fun <T> Seg(
     options: List<SegOption<T>>,
     onSelect: (T) -> Unit,
     modifier: Modifier = Modifier,
+    // Applied to the first pill only, so just the leftmost item routes Left -> rail.
+    firstItemModifier: Modifier = Modifier,
 ) {
     val palette = LocalDinkPalette.current
     Row(
@@ -45,12 +47,12 @@ fun <T> Seg(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        options.forEach { opt ->
+        options.forEachIndexed { i, opt ->
             SegButton(
                 label = opt.label,
                 active = opt.value == selected,
                 onClick = { onSelect(opt.value) },
-                modifier = Modifier.fillMaxHeight(),
+                modifier = (if (i == 0) firstItemModifier else Modifier).fillMaxHeight(),
             )
         }
     }

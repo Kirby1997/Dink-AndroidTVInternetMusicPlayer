@@ -56,6 +56,17 @@ class GroupingMigrationTest {
     }
 
     @Test
+    fun `a forced scheme recompute that changes nothing asks for no rewrite`() = runBlocking {
+        val (tracks, dao) = dao()
+        dao.restoreTracks(listOf(oldRow("q", "Queen", plays = 0, addedAt = 1)))
+        LibraryRepository.migrateGroupingKeys(dao, tracks.value)
+        val current = tracks.value
+
+        assertFalse(LibraryRepository.migrateGroupingKeys(dao, current, force = true))
+        assertSame(current, tracks.value)
+    }
+
+    @Test
     fun `a play landing during the migration is not lost`() = runBlocking {
         val (tracks, dao) = dao()
         val disk = listOf(oldRow("q", "Queen", plays = 1, addedAt = 1))
