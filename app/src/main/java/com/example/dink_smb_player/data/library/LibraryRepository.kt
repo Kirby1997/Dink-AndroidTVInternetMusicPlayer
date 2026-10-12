@@ -755,7 +755,9 @@ object LibraryRepository {
                                 // Title still filename-derived → re-read embedded tags; already
                                 // a real title → skip the 1-3s tag retrieve. Duration missing →
                                 // probe it; already present → skip a whole second SMB open.
-                                val tagsNeeded = force || looksFilenameDerived(row)
+                                // Below the current version the row was read before genre was —
+                                // read tags too, or stamping v2 here would skip it for backfill.
+                                val tagsNeeded = force || looksFilenameDerived(row) || row.retagVersion < RETAG_VERSION
                                 val durationNeeded = row.durationMs <= 0L || durationLooksBogus(row)
                                 // One shared SMB handle for this row's duration probe, its
                                 // retriever fallback and the tail tag read (WP-I), as import does.
@@ -849,8 +851,9 @@ object LibraryRepository {
 
     /** Version of the retag stamping logic. Stamps written by an older version (retagVersion
      *  below this) count as unstamped, so the residue is re-read once under the new logic.
-     *  v1: transient read failures are no longer stamped (v0 stamped every outcome). */
-    internal const val RETAG_VERSION = 1
+     *  v1: transient read failures are no longer stamped (v0 stamped every outcome).
+     *  v2: genre is read; rows stamped earlier get it from [backfillGenres]. */
+    internal const val RETAG_VERSION = 2
 
     /** Whether a normal (or [force]d) retag should read [row]: never conclusively read, or
      *  only stamped by an older [RETAG_VERSION]. */
@@ -870,6 +873,85 @@ object LibraryRepository {
     internal fun retagStamped(merged: TrackEntity, result: ReadResult<*>, nowMs: Long): TrackEntity =
         if (result is ReadResult.Error) merged
         else merged.copy(retagAttemptedMs = nowMs, retagVersion = RETAG_VERSION)
+
+    /** Whether [backfillGenres] should read [row]: a remote row conclusively read by an older
+     *  reader (no genre support) that has no genre. Never-read rows are left to retag/walk,
+     *  which read genre now — stamping them here would hide a missing title or duration. */
+    internal fun needsGenreBackfill(row: TrackEntity): Boolean =
+        row.sourceType != SourceType.Local && row.genre == null &&
+            row.retagAttemptedMs != null && row.retagVersion < RETAG_VERSION
+
+    /** The row [backfillGenres] writes for [result]: genre (and year when the row has none)
+     *  plus the stamp; every other field untouched. Null on a transient error (retry later). */
+    internal fun genreBackfilled(row: TrackEntity, result: ReadResult<TagReader.Tags>, nowMs: Long): TrackEntity? {
+        if (result is ReadResult.Error) return null
+        val tags = result.valueOrNull()
+        return row.copy(
+            genre = tags?.genre?.ifBlank { null } ?: row.genre,
+            year = row.year ?: tags?.year,
+            retagAttemptedMs = nowMs,
+            retagVersion = RETAG_VERSION,
+        )
+    }
+
+    /**
+     * One-off (resumable) genre fill for rows indexed before genre was read: tags-only reads,
+     * low concurrency so it doesn't compete with playback streaming, persisted per chunk.
+     * Writes only genre/year + stamp via [TrackMerges.retag], so plays and enrichment that land
+     * meanwhile survive. Returns the number of rows that gained a genre. Single-flight with
+     * [retagAll]; returns 0 if a rescan is running (the next launch picks up the rest).
+     */
+    suspend fun backfillGenres(context: Context): Int {
+        if (!retagGate.compareAndSet(false, true)) return 0
+        try {
+            ensureRestored(context)
+            val dao = dao(context)
+            val rows = dao.snapshot().first.filter { needsGenreBackfill(it) && dao.acceptsWrites(it.sourceId) }
+            if (rows.isEmpty()) return 0
+            android.util.Log.i("LibraryRepository", "genre backfill: ${rows.size} rows")
+            val gate = Semaphore(GENRE_BACKFILL_CONCURRENCY)
+            val gained = AtomicInteger(0)
+            withContext(Dispatchers.IO) {
+                val bases = rows.associateBy { it.id }
+                rows.chunked(RETAG_CHUNK).forEach { chunk ->
+                    val updates = Collections.synchronizedList(ArrayList<TrackEntity>())
+                    coroutineScope {
+                        chunk.forEach { row ->
+                            launch {
+                                if (!dao.acceptsWrites(row.sourceId)) return@launch
+                                gate.withPermit {
+                                    val knownSize = row.sizeBytes.takeIf { it > 0 } ?: -1L
+                                    val result = TagReadGate.withPermit(row.path) {
+                                        SmbProbe.session(row.uri, knownSize) {
+                                            TagReader.readResult(context, row.uri, tagsNeeded = true, durationNeeded = false)
+                                        }
+                                    }
+                                    genreBackfilled(row, result, System.currentTimeMillis())?.let { out ->
+                                        if (out.genre != null) gained.incrementAndGet()
+                                        updates.add(out)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (updates.isNotEmpty()) {
+                        dao.upsertTracks(updates, TrackMerges.retag(bases))
+                        persist(context).onFailure { t ->
+                            android.util.Log.e("LibraryRepository", "genre backfill: chunk not saved — ${t.message}")
+                        }
+                    }
+                }
+            }
+            android.util.Log.i("LibraryRepository", "genre backfill: done, ${gained.get()} gained a genre")
+            return gained.get()
+        } finally {
+            retagGate.set(false)
+        }
+    }
+
+    /** In-flight reads for [backfillGenres]: well under the rescan's caps — it runs unasked
+     *  in the background, often while music streams from the same NAS. */
+    private const val GENRE_BACKFILL_CONCURRENCY = 4
 
     /** True when the row's title still equals its filename stem — i.e. it was indexed
      *  from the path and never got real embedded tags. Cheap heuristic, no I/O. */

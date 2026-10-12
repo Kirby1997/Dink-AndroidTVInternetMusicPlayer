@@ -29,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import kotlinx.coroutines.delay
+import kotlin.coroutines.cancellation.CancellationException
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -101,6 +102,9 @@ import com.example.dink_smb_player.ui.sound.rememberNavSounds
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalUiScale
 import com.example.dink_smb_player.ui.theme.rememberUiScaleController
+
+/** Cold-start grace before the one-off genre backfill starts reading tags over SMB. */
+private const val GENRE_BACKFILL_DELAY_MS = 60_000L
 
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
@@ -204,6 +208,13 @@ fun DinkApp() {
         withContext(Dispatchers.IO) {
             secretStore.purgeLegacyCloudTokens()
             sharePrefs.purgeLegacyCloud()
+        }
+        // One-off genre fill for rows indexed before genre was read (radio similarity).
+        // Delayed past cold start; resumable, so a kill mid-way just continues next launch.
+        (context.applicationContext as? DinkApplication)?.appScope?.launch(Dispatchers.Default) {
+            delay(GENRE_BACKFILL_DELAY_MS)
+            runCatching { LibraryRepository.backfillGenres(context.applicationContext) }
+                .onFailure { if (it is CancellationException) throw it; Log.e("DinkApp", "genre backfill failed", it) }
         }
         sharePrefs.shares.collect { shares -> SmbConnectionRegistry.update(shares) }
     }
