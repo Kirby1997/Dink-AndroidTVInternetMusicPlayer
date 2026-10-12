@@ -60,7 +60,7 @@ object GenreKeys {
 
     // Tags taggers write when they have nothing real to say; matching on them would link
     // unrelated tracks.
-    private val PLACEHOLDERS = setOf("other", "unknown", "genre", "misc", "none")
+    private val PLACEHOLDERS = setOf("other", "unknown", "genre", "misc", "none", "remix", "cover")
 
     /** Normalized match keys: split on ; / , NUL, resolve numeric forms, lowercase, keep only
      *  letters/digits, drop placeholders. "Hip-Hop", "hip hop" and "HipHop" all give "hiphop". */

@@ -435,16 +435,29 @@ class PlayerState(
             return
         }
         // Append-only: extend the engine queue if it's still all-URI so gapless
-        // survives. Skip when windowed — the engine holds a slice, not the tail, so
-        // the appended track loads when the window slides to it.
+        // survives. When windowed, append only if the engine slice already ends at the old
+        // queue tail (radio refills) — otherwise the engine would run out of its slice and
+        // rebuild (~0.7 s on Main) every refill; a slice elsewhere loads the tail on slide.
         val player = engine
-        // Skip the engine append while a session-restore apply is still deferred — the
-        // engine is empty then, and the eventual full apply includes these tracks anyway.
-        if (player != null && !pendingEngineApply &&
-            !isWindowed && _queue.all { it.mediaUri != null }
+        val oldSize = _queue.size - songs.size
+        // Skip the engine append while the engine doesn't hold our queue (deferred restore
+        // or lost) — the eventual full apply includes these tracks anyway.
+        if (player != null && !engineApplyOutstanding() &&
+            _queue.all { it.mediaUri != null } &&
+            (!isWindowed || engineBase + player.mediaItemCount == oldSize)
         ) {
             if (songs.size == 1) player.addMediaItem(mediaItemFor(songs[0]))
             else player.addMediaItems(songs.map { mediaItemFor(it) })
+            // Keep the engine at ~engineWindow items by dropping played head items, but
+            // never the current one or the one before it (prev stays gapless).
+            if (player.mediaItemCount > engineWindow) {
+                val engineCur = currentIndex - engineBase
+                val k = minOf(player.mediaItemCount - engineWindow, engineCur - 1).coerceAtLeast(0)
+                if (k > 0) {
+                    player.removeMediaItems(0, k)
+                    engineBase += k
+                }
+            }
         }
         // Growing past the engine window flips Repeat-All from engine-driven to
         // façade-driven (see engineRepeatMode); without this the engine keeps looping
@@ -1184,7 +1197,8 @@ class PlayerState(
     private fun engineRepeatMode(): Int = when {
         // Windowed: the engine only holds a slice, so REPEAT_ALL would loop the
         // slice. Queue-wide repeat is handled in onTrackEnded → moveTo instead.
-        isWindowed && repeatMode == RepeatMode.All -> Player.REPEAT_MODE_OFF
+        // engineBase > 0: the slice doesn't start at queue 0 either.
+        (isWindowed || engineBase > 0) && repeatMode == RepeatMode.All -> Player.REPEAT_MODE_OFF
         repeatMode == RepeatMode.Off -> Player.REPEAT_MODE_OFF
         repeatMode == RepeatMode.All -> Player.REPEAT_MODE_ALL
         else -> Player.REPEAT_MODE_ONE
@@ -1386,7 +1400,14 @@ class PlayerState(
                                 android.util.Log.e("PlayerState", "radio pick failed", it)
                             }.getOrDefault(emptyList())
                         }
-                        onResult(picks)
+                        try {
+                            onResult(picks)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // appScope has no exception handler; don't let an append bug kill the process.
+                            android.util.Log.e("PlayerState", "radio append failed", e)
+                        }
                     }
                 }
                 sharedInstance = state

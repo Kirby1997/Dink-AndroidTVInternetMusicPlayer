@@ -673,8 +673,19 @@ object LibraryRepository {
             // A second rescan press returns 0, but the unasked background genre backfill must not
             // swallow the user's request for hours: ask it to stop and take the gate when it does.
             if (!genreBackfillRunning.get()) return 0
+            // A second press while the first is still waiting must not queue a second full retag.
+            if (!rescanWaiting.compareAndSet(false, true)) return 0
+            // Show running right away so the Settings button disables during the wait.
+            _retagProgress.value = RetagProgress(0, 0, 0, true)
             genreBackfillYield.set(true)
-            while (!retagGate.compareAndSet(false, true)) delay(100)
+            try {
+                while (!retagGate.compareAndSet(false, true)) delay(100)
+            } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+                _retagProgress.value?.let { if (it.running) _retagProgress.value = it.copy(running = false) }
+                throw e
+            } finally {
+                rescanWaiting.set(false)
+            }
         }
         try {
             return retagAllGated(context, force)
@@ -688,6 +699,9 @@ object LibraryRepository {
 
     /** [backfillGenres] holds [retagGate]; a user rescan sets [genreBackfillYield] to make it stop. */
     private val genreBackfillRunning = AtomicBoolean(false)
+
+    /** A rescan press is waiting for [backfillGenres] to yield; further presses are ignored. */
+    private val rescanWaiting = AtomicBoolean(false)
     private val genreBackfillYield = AtomicBoolean(false)
 
     private suspend fun retagAllGated(context: Context, force: Boolean): Int {

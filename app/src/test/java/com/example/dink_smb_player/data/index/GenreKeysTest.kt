@@ -55,4 +55,12 @@ class GenreKeysTest {
         assertTrue(GenreKeys.keysOf("Unknown; Genre").isEmpty())
         assertEquals(setOf("jazz"), GenreKeys.keysOf("misc; Jazz"))
     }
+
+    @Test
+    fun `remix and cover codes are not genre keys`() {
+        assertEquals(emptySet<String>(), GenreKeys.keysOf("(RX)"))
+        assertEquals(emptySet<String>(), GenreKeys.keysOf("(CR)"))
+        assertEquals("Remix", GenreKeys.resolveDisplay("(RX)"))
+        assertEquals("Cover", GenreKeys.resolveDisplay("(CR)"))
+    }
 }

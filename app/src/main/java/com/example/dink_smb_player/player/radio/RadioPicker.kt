@@ -51,7 +51,7 @@ object RadioPicker {
             album = album,
             albumArtist = albumArtist,
             genres = GenreKeys.keysOf(song.genre),
-            year = song.year,
+            year = song.year?.takeIf { it > 0 }, // ID3v1 "0000" is not a year
             parent = dirs.takeIf { it.isNotEmpty() }?.joinToString("/"),
             grandparent = dirs.takeIf { it.size >= 2 }?.dropLast(1)?.joinToString("/"),
         )
@@ -96,7 +96,10 @@ object RadioPicker {
             return p
         }
 
-        val pool = candidates
+        // Shuffled BEFORE scoring so the stable sort breaks score ties randomly; otherwise
+        // thousands of equal scores always yield the first POOL_SIZE in library-index order.
+        val wildOrder = candidates.shuffled(random)
+        val pool = wildOrder
             .map { c -> val f = features.getValue(c.id); c to seedFeatures.sumOf { (s, w) -> w * similarity(s, f) } }
             .filter { it.second > 0.0 }
             .sortedByDescending { it.second }
@@ -134,7 +137,6 @@ object RadioPicker {
             return pool.removeAt(chosen).first
         }
 
-        val wildOrder = candidates.shuffled(random)
         fun pickWild(): Song? =
             wildOrder.firstOrNull { it.id !in used && fits(features.getValue(it.id)) }
                 // Diversity is a preference: break it rather than end the station early.

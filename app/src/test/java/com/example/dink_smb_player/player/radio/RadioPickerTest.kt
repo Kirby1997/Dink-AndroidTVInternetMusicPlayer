@@ -122,4 +122,28 @@ class RadioPickerTest {
         // no signal at all → pure wildcards; just ensure no crash and full batch
         assertEquals(15, pick(seed, listOf(seed) + va + others, count = 15).size)
     }
+
+    @Test
+    fun `equal-score pool is a random slice, not the first POOL_SIZE in library order`() {
+        val seed = song("s", genre = "Rock")
+        val same = (1..500).map { song("c$it", genre = "Rock") }
+        val lib = listOf(seed) + same
+        val idx = same.withIndex().associate { it.value.id to it.index }
+        // count < 5 means no wildcard slots, so every pick comes from the scored pool.
+        val a = pick(seed, lib, count = 4, rnd = 1).map { it.id }
+        val b = pick(seed, lib, count = 4, rnd = 2).map { it.id }
+        assertNotEquals(a, b)
+        assertTrue((a + b).any { idx.getValue(it) >= RadioPicker.POOL_SIZE })
+    }
+
+    @Test
+    fun `year zero is not a year`() {
+        val seed = song("s", year = 0)
+        val zeros = (1..20).map { song("z$it", year = 0) }
+        val others = (1..300).map { song("o$it", year = 2000) }
+        val picks = pick(seed, listOf(seed) + zeros + others, count = 20)
+        assertEquals(20, picks.size)
+        // Were 0 == 0 a year match the zeros would form the whole scored pool (~18 of 20 picks).
+        assertTrue(picks.count { it.id.startsWith("z") } <= 8)
+    }
 }
