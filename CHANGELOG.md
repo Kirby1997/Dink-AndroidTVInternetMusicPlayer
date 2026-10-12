@@ -3,6 +3,32 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.5.0] - 2026-10-12
+
+### Radio
+- **Pick a song, get a station.** Choosing a song in Home → "Across your sources" now
+  plays it straight away and follows it with similar music from your library instead of
+  just the ten random songs on the shelf. More songs are added automatically as the queue
+  runs low, so it keeps going until you stop it.
+- "Similar" means the same artist, the same genre, the same album artist, a nearby release
+  year, or the same artist/album folder. A few random picks keep it fresh, and one artist
+  never plays twice in a row or more than three times in a batch.
+- New **Radio** button on Now Playing: turn what's playing into a station (the current song
+  keeps playing, what's next is replaced), or turn radio off to keep the queue as it is.
+  The queue panel shows "UP NEXT · RADIO" while a station is on.
+- A station survives a restart: it's restored (paused) and keeps refilling.
+- Long stations stay gapless past 100 tracks.
+
+### Library
+- **Genre is now read from your files** (ID3v2, ID3v1, APE, FLAC/Vorbis and MP4 tags, and
+  Android's media index for local files). Tags listing several genres ("Rock; Indie",
+  "Heavy Metal | Hard Rock") match on any of them.
+- Tracks imported before this version get their genre filled in once, in the background,
+  starting a minute after launch. It reads only the tags (no downloads), runs gently so
+  music keeps streaming, and carries on where it left off on the next launch. A large
+  library can take a few launches to finish. Radio works throughout.
+- Pressing "Re-read tags" while that runs pauses it and starts your rescan straight away.
+
 ## [1.4.0] - 2026-10-12
 
 ### Search
