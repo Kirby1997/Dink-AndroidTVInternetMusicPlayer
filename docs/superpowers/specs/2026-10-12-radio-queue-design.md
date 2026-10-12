@@ -74,6 +74,7 @@ object RadioPicker {
         seeds: List<WeightedSeed>,
         library: List<Song>,
         exclude: Set<String>,   // song ids
+        previous: Song?,        // last song already queued (diversity check for first pick)
         count: Int,
         random: Random,
     ): List<Song>
@@ -91,8 +92,10 @@ For candidate `c`, `score(c) = Σ seed.weight × s(seed.song, c)` where `s` sums
 | Both years known, \|Δ\| ≤ 3 / ≤ 8 | +2 / +1 |
 | Same parent folder / same grandparent folder of `sourcePath` | +2 / +1 |
 
-Folder signals only count when the folder is deeper than the share/volume root (a parent
-equal to the root, e.g. `//nas/music`, scores nothing). Null `artistKey`/`albumKey` fall
+Folder signals only count when the folder is small — parent holds ≤ 300 library songs,
+grandparent ≤ 1500 — so a share root or flat dump folder scores nothing, whatever the
+mount layout. Generic artist keys (`unknown`, `variousartists`, `va`, …) never earn the
+artist bonus. Null `artistKey`/`albumKey` fall
 back to `LibraryGrouping` on-the-fly keys, as the Albums/Artists views do.
 
 ### Seeds (drift)
@@ -109,7 +112,7 @@ batch uses only the original seed.
 4. Diversity, enforced while building the ordered batch:
    - ≤ 3 songs per `artistKey` per batch
    - never the same `artistKey` or `albumKey` as the previous song (including the last song
-     already in the queue, passed via seeds)
+     already in the queue, passed as `previous`)
    - a candidate violating a rule is skipped for that slot and stays in the pool.
 5. Returns fewer than `count` only when the library cannot supply them.
 
