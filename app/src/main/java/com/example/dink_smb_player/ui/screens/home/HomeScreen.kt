@@ -383,7 +383,7 @@ fun HomeScreen(
             if (feed.acrossShares.isNotEmpty()) {
                 ShelfRow(
                     title = "Across your sources",
-                    eyebrow = "A spin through everything you've added",
+                    eyebrow = "Pick one to start a station",
                     onViewAll = { onNavigate(ScreenId.Songs) },
                     onEnterRequester = acrossFirstRequester,
                     state = acrossState,
@@ -393,7 +393,8 @@ fun HomeScreen(
                             song = song,
                             album = album,
                             onClick = {
-                                player.playFrom(feed.acrossShares.map { it.first }, idx)
+                                // A station built around this song, not just the 10 shelf picks.
+                                player.startRadio(song)
                                 onNavigate(ScreenId.NowPlaying)
                             },
                             modifier = cardFocus(

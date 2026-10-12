@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.MusicNote
+import androidx.compose.material.icons.outlined.Radio
 import androidx.compose.material.icons.outlined.Repeat
 import androidx.compose.material.icons.outlined.RepeatOne
 import androidx.compose.material.icons.outlined.Shuffle
@@ -415,6 +416,13 @@ private fun V5TransportRow(
             active = player.repeatMode != PlayerRepeatMode.Off,
             onClick = player::cycleRepeatMode,
         )
+        // Radio: off → turn what's playing into an endless similar-songs station;
+        // on → stop growing the queue (it stays as it is).
+        V5TransportButton(
+            icon = Icons.Outlined.Radio,
+            active = player.radioSeed != null,
+            onClick = { if (player.radioSeed != null) player.stopRadio() else player.startRadioFromCurrent() },
+        )
         // Quick jump to the equalizer (Settings → Audio).
         V5TransportButton(icon = Icons.Outlined.GraphicEq, onClick = onOpenEq)
     }
@@ -707,7 +715,7 @@ private fun V5QueueColumn(player: PlayerState, playFocus: FocusRequester, modifi
                 .padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 24.dp),
         ) {
             Text(
-                text = "UP NEXT",
+                text = if (player.radioSeed != null) "UP NEXT · RADIO" else "UP NEXT",
                 style = type.monoSmall.copy(color = V5White50, fontSize = 10.sp),
             )
             Spacer(Modifier.height(6.dp))
