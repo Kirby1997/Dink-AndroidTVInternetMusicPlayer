@@ -19,8 +19,10 @@ class GenreBackfillTest {
         stampedMs: Long? = 10,
         version: Int = 1,
         year: Int? = null,
+        title: String = "Real Title",
+        durationMs: Long = 200_000,
     ) = TrackEntity(
-        id = "t", title = "Real Title", artist = "A", durationMs = 200_000, sourceType = type,
+        id = "t", title = title, artist = "A", durationMs = durationMs, sourceType = type,
         sourceId = "s", path = "/m/t.mp3", uri = "smb://nas/m/t.mp3", sizeBytes = 1, addedAtMs = 0,
         retagAttemptedMs = stampedMs, retagVersion = version, year = year, genre = genre,
     )
@@ -29,12 +31,24 @@ class GenreBackfillTest {
     fun `retag version is 2`() = assertEquals(2, LibraryRepository.RETAG_VERSION)
 
     @Test
-    fun `selects stamped old-version SMB rows without genre only`() {
+    fun `selects SMB rows without genre below current version that retag would not read`() {
         assertTrue(LibraryRepository.needsGenreBackfill(row()))
+        // Unstamped v0 row with a real title + duration: retag/walk never pick it up.
+        assertTrue(LibraryRepository.needsGenreBackfill(row(stampedMs = null, version = 0)))
+        assertTrue(LibraryRepository.needsGenreBackfill(row(stampedMs = 10, version = 0)))
         assertFalse(LibraryRepository.needsGenreBackfill(row(genre = "Rock")))
         assertFalse(LibraryRepository.needsGenreBackfill(row(version = 2)))
-        assertFalse(LibraryRepository.needsGenreBackfill(row(stampedMs = null)))
         assertFalse(LibraryRepository.needsGenreBackfill(row(type = SourceType.Local)))
+        // Rows retag WOULD read are left to it (stamping would hide the missing title/duration).
+        assertFalse(LibraryRepository.needsGenreBackfill(row(title = "t")))
+        assertFalse(LibraryRepository.needsGenreBackfill(row(durationMs = 0)))
+    }
+
+    @Test
+    fun `retagWouldRead matches the retag content filter`() {
+        assertTrue(LibraryRepository.retagWouldRead(row(title = "t")))
+        assertTrue(LibraryRepository.retagWouldRead(row(durationMs = 0)))
+        assertFalse(LibraryRepository.retagWouldRead(row()))
     }
 
     @Test

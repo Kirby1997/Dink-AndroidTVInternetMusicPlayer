@@ -39,6 +39,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -668,7 +669,13 @@ object LibraryRepository {
      */
     suspend fun retagAll(context: Context, force: Boolean = false): Int {
         // Atomic single-flight gate; released in finally so a cancel/throw can't wedge it.
-        if (!retagGate.compareAndSet(false, true)) return 0
+        if (!retagGate.compareAndSet(false, true)) {
+            // A second rescan press returns 0, but the unasked background genre backfill must not
+            // swallow the user's request for hours: ask it to stop and take the gate when it does.
+            if (!genreBackfillRunning.get()) return 0
+            genreBackfillYield.set(true)
+            while (!retagGate.compareAndSet(false, true)) delay(100)
+        }
         try {
             return retagAllGated(context, force)
         } finally {
@@ -678,6 +685,10 @@ object LibraryRepository {
     }
 
     private val retagGate = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** [backfillGenres] holds [retagGate]; a user rescan sets [genreBackfillYield] to make it stop. */
+    private val genreBackfillRunning = AtomicBoolean(false)
+    private val genreBackfillYield = AtomicBoolean(false)
 
     private suspend fun retagAllGated(context: Context, force: Boolean): Int {
         ensureRestored(context)
@@ -698,7 +709,7 @@ object LibraryRepository {
             it.sourceType != SourceType.Local &&
                 dao.acceptsWrites(it.sourceId) &&
                 needsRetagAttempt(it, force) &&
-                (force || looksFilenameDerived(it) || it.durationMs <= 0L || durationLooksBogus(it) || hasMojibake(it))
+                (force || retagWouldRead(it))
         }
         val total = rows.size
         if (total == 0) {
@@ -874,12 +885,20 @@ object LibraryRepository {
         if (result is ReadResult.Error) merged
         else merged.copy(retagAttemptedMs = nowMs, retagVersion = RETAG_VERSION)
 
-    /** Whether [backfillGenres] should read [row]: a remote row conclusively read by an older
-     *  reader (no genre support) that has no genre. Never-read rows are left to retag/walk,
-     *  which read genre now — stamping them here would hide a missing title or duration. */
+    /** Retag's content filter: the row's title/duration look unfixed (filename-derived title,
+     *  missing or bogus duration, mojibake), so a normal retag reads it. Shared with
+     *  [needsGenreBackfill] so the two passes partition the rows with no overlap. */
+    internal fun retagWouldRead(row: TrackEntity): Boolean =
+        looksFilenameDerived(row) || row.durationMs <= 0L || durationLooksBogus(row) || hasMojibake(row)
+
+    /** Whether [backfillGenres] should read [row]: a remote row below [RETAG_VERSION] (stamped by
+     *  an older reader OR never stamped at all — most of an old library) with no genre, that
+     *  retag would NOT read anyway ([retagWouldRead]). Rows retag would read are left to
+     *  retag/walk, which read genre now — a tags-only stamp here would hide their missing
+     *  title or duration. A row retag skips loses nothing by being stamped v2 after this read. */
     internal fun needsGenreBackfill(row: TrackEntity): Boolean =
         row.sourceType != SourceType.Local && row.genre == null &&
-            row.retagAttemptedMs != null && row.retagVersion < RETAG_VERSION
+            needsRetagAttempt(row, force = false) && !retagWouldRead(row)
 
     /** The row [backfillGenres] writes for [result]: genre (and year when the row has none)
      *  plus the stamp; every other field untouched. Null on a transient error (retry later). */
@@ -903,8 +922,15 @@ object LibraryRepository {
      */
     suspend fun backfillGenres(context: Context): Int {
         if (!retagGate.compareAndSet(false, true)) return 0
+        genreBackfillYield.set(false)
+        genreBackfillRunning.set(true)
         try {
             ensureRestored(context)
+            // Don't spend hours of SMB reads on results persist() would refuse to save.
+            if (!persistGate.canPersist) {
+                android.util.Log.w("LibraryRepository", "genre backfill: skipped, persistence closed (${persistGate.state})")
+                return 0
+            }
             val dao = dao(context)
             val rows = dao.snapshot().first.filter { needsGenreBackfill(it) && dao.acceptsWrites(it.sourceId) }
             if (rows.isEmpty()) return 0
@@ -913,13 +939,15 @@ object LibraryRepository {
             val gained = AtomicInteger(0)
             withContext(Dispatchers.IO) {
                 val bases = rows.associateBy { it.id }
-                rows.chunked(RETAG_CHUNK).forEach { chunk ->
+                for (chunk in rows.chunked(RETAG_CHUNK)) {
+                    if (genreBackfillYield.get()) break
                     val updates = Collections.synchronizedList(ArrayList<TrackEntity>())
                     coroutineScope {
                         chunk.forEach { row ->
                             launch {
                                 if (!dao.acceptsWrites(row.sourceId)) return@launch
                                 gate.withPermit {
+                                    if (genreBackfillYield.get()) return@withPermit
                                     val knownSize = row.sizeBytes.takeIf { it > 0 } ?: -1L
                                     val result = TagReadGate.withPermit(row.path) {
                                         SmbProbe.session(row.uri, knownSize) {
@@ -942,9 +970,15 @@ object LibraryRepository {
                     }
                 }
             }
+            if (genreBackfillYield.get()) {
+                android.util.Log.i("LibraryRepository", "genre backfill: yielding to rescan")
+            }
             android.util.Log.i("LibraryRepository", "genre backfill: done, ${gained.get()} gained a genre")
             return gained.get()
         } finally {
+            // Flags first, gate last: a waiting rescan must not see a stale yield flag.
+            genreBackfillRunning.set(false)
+            genreBackfillYield.set(false)
             retagGate.set(false)
         }
     }

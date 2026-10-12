@@ -106,6 +106,9 @@ import com.example.dink_smb_player.ui.theme.rememberUiScaleController
 /** Cold-start grace before the one-off genre backfill starts reading tags over SMB. */
 private const val GENRE_BACKFILL_DELAY_MS = 60_000L
 
+/** The LaunchedEffect re-runs on activity recreation; schedule the backfill once per process. */
+private val genreBackfillScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
 @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun DinkApp() {
@@ -211,7 +214,7 @@ fun DinkApp() {
         }
         // One-off genre fill for rows indexed before genre was read (radio similarity).
         // Delayed past cold start; resumable, so a kill mid-way just continues next launch.
-        (context.applicationContext as? DinkApplication)?.appScope?.launch(Dispatchers.Default) {
+        if (genreBackfillScheduled.compareAndSet(false, true)) (context.applicationContext as? DinkApplication)?.appScope?.launch(Dispatchers.Default) {
             delay(GENRE_BACKFILL_DELAY_MS)
             runCatching { LibraryRepository.backfillGenres(context.applicationContext) }
                 .onFailure { if (it is CancellationException) throw it; Log.e("DinkApp", "genre backfill failed", it) }
