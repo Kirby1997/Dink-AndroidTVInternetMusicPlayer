@@ -10,6 +10,7 @@ import androidx.media3.common.Metadata
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.inspector.MetadataRetriever
+import com.example.dink_smb_player.data.index.GenreKeys
 import com.example.dink_smb_player.data.source.smb.DinkDataSourceFactory
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -87,6 +88,8 @@ object TagReader {
         val year: Int? = null,
         val trackNumber: Int? = null,
         val durationMs: Long? = null,
+        /** Genre, numeric ID3 forms resolved (GenreKeys.resolveDisplay). */
+        val genre: String? = null,
     )
 
     // ID3v2 headers sit at the start of the file, so a healthy read returns well under a second.
@@ -168,6 +171,7 @@ object TagReader {
             year = mm?.recordingYear ?: mm?.releaseYear,
             trackNumber = mm?.trackNumber,
             durationMs = durationMs?.takeIf { it > 0 },
+            genre = GenreKeys.resolveDisplay(mm?.genre?.toString()),
         )
         // Media3 found no ID3v2 at the file start → this is likely an ID3v1/APEv2-only MP3
         // (common in old / EAC-ripped libraries). Read the trailing tag ourselves. Gated to
@@ -183,6 +187,7 @@ object TagReader {
                     albumArtist = tags.albumArtist ?: fb.albumArtist,
                     year = tags.year ?: fb.year,
                     trackNumber = tags.trackNumber ?: fb.trackNumber,
+                    genre = tags.genre ?: fb.genre,
                 )
             }
         }

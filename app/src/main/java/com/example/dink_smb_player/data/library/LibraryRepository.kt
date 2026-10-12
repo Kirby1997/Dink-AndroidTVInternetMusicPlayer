@@ -790,6 +790,7 @@ object LibraryRepository {
                                         albumTitle = tags.album?.ifBlank { null } ?: row.albumTitle,
                                         albumArtist = tags.albumArtist?.ifBlank { null } ?: row.albumArtist,
                                         year = tags.year ?: row.year,
+                                        genre = tags.genre?.ifBlank { null } ?: row.genre,
                                         trackNumber = tags.trackNumber ?: row.trackNumber,
                                         durationMs = tags.durationMs?.takeIf { it > 0 } ?: row.durationMs,
                                     )

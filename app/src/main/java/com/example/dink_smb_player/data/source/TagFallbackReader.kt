@@ -2,6 +2,7 @@ package com.example.dink_smb_player.data.source
 
 import android.content.Context
 import android.os.SystemClock
+import com.example.dink_smb_player.data.index.GenreKeys
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
@@ -46,7 +47,7 @@ object TagFallbackReader {
     private val CP1252_HIGH: Set<Char> =
         String(ByteArray(32) { (0x80 + it).toByte() }, CP1252).toSet() - '�'
 
-    private val APE_TEXT_KEYS = setOf("title", "artist", "album", "album artist", "albumartist", "year", "date", "track")
+    private val APE_TEXT_KEYS = setOf("title", "artist", "album", "album artist", "albumartist", "year", "date", "track", "genre")
 
     /** Positioned read over the file: up to [len] bytes at [pos]; count, or <= 0 at EOF/failure. */
     internal fun interface TailSource {
@@ -89,6 +90,7 @@ object TagFallbackReader {
             albumArtist = ape?.albumArtist, // ID3v1 has no album-artist field
             year = ape?.year ?: id3v1?.year,
             trackNumber = ape?.trackNumber ?: id3v1?.trackNumber,
+            genre = ape?.genre ?: id3v1?.genre,
         )
         return merged.takeUnless { it == TagReader.Tags() }
     }
@@ -125,6 +127,7 @@ object TagFallbackReader {
             album = decodeField(b, 63, 30),
             year = decodeField(b, 93, 4)?.toIntOrNull(),
             trackNumber = track,
+            genre = GenreKeys.id3v1Name(b[127].toInt() and 0xFF),
         )
     }
 
@@ -218,6 +221,7 @@ object TagFallbackReader {
         var albumArtist: String? = null
         var year: String? = null
         var track: String? = null
+        var genre: String? = null
         var p = itemsStart
         var n = 0
         while (n < itemCount && p + 8 < itemsEnd) {
@@ -245,6 +249,7 @@ object TagFallbackReader {
                     "album artist", "albumartist" -> albumArtist = albumArtist ?: value
                     "year", "date" -> year = year ?: value
                     "track" -> track = value
+                    "genre" -> genre = genre ?: GenreKeys.resolveDisplay(value)
                 }
             }
             p = valueStart + valueLen
@@ -257,6 +262,7 @@ object TagFallbackReader {
             albumArtist = albumArtist,
             year = year?.take(4)?.toIntOrNull(),
             trackNumber = track?.substringBefore('/')?.trim()?.toIntOrNull(),
+            genre = genre,
         )
         return if (tags == TagReader.Tags()) null else tags
     }

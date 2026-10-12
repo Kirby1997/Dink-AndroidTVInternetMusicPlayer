@@ -85,4 +85,13 @@ class SmbRereadRowTest {
         assertNull(merged.retagAttemptedMs)
         assertTrue(LibraryRepository.needsRescanRead(merged, 1000, 500))
     }
+
+    @Test
+    fun `re-read patches genre, absent genre keeps stored`() {
+        val withGenre = stored.copy(genre = "Rock")
+        val found = SmbImporter.rereadRow(withGenre, ReadResult.Found(TagReader.Tags(title = "T", genre = "Indie")), 2000, 900, nowMs = 77)
+        assertEquals("Indie", found.genre)
+        val noGenre = SmbImporter.rereadRow(withGenre, ReadResult.Found(TagReader.Tags(title = "T")), 2000, 900, nowMs = 77)
+        assertEquals("Rock", noGenre.genre)
+    }
 }

@@ -36,6 +36,7 @@ class TagFallbackReaderTest {
         album: ByteArray = ByteArray(0),
         year: String = "",
         track: Int? = null,
+        genre: Int = 255,
     ): ByteArray {
         val b = ByteArray(128)
         "TAG".toByteArray().copyInto(b, 0)
@@ -44,6 +45,7 @@ class TagFallbackReaderTest {
         field(album).copyInto(b, 63)
         field(year.toByteArray(), 4).copyInto(b, 93)
         if (track != null) { b[125] = 0; b[126] = track.toByte() }
+        b[127] = genre.toByte()
         return b
     }
 
@@ -202,5 +204,23 @@ class TagFallbackReaderTest {
         assertEquals("Queen", parse(audio + ape(apeItem("ALBUMARTIST", "Queen".toByteArray())))!!.albumArtist)
         // ID3v1 has no album-artist field.
         assertEquals(null, parse(audio + id3v1("V1".toByteArray()))!!.albumArtist)
+    }
+
+    @Test
+    fun `id3v1 genre byte maps through the genre table`() {
+        val tags = parse(audio + id3v1(title = "Song".toByteArray(), genre = 17))!!
+        assertEquals("Rock", tags.genre)
+    }
+
+    @Test
+    fun `id3v1 genre 255 means none`() {
+        val tags = parse(audio + id3v1(title = "Song".toByteArray(), genre = 255))!!
+        assertNull(tags.genre)
+    }
+
+    @Test
+    fun `ape Genre item is read`() {
+        val file = audio + ape(apeItem("Title", "Song".toByteArray()), apeItem("Genre", "Shoegaze".toByteArray()))
+        assertEquals("Shoegaze", parse(file)!!.genre)
     }
 }
