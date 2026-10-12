@@ -3,6 +3,51 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [1.4.0] - 2026-10-12
+
+### Search
+- **Artists and albums are results you can open.** Searching an artist name shows the
+  artist itself (opening the same page as the Artists screen) instead of a dump of every
+  song they've recorded; albums open their album page. Back returns to your search with
+  the query, scroll and highlighted row intact.
+- New **All** tab (now the default) shows Artists, Albums and Songs together; the
+  Artists / Albums / Songs tabs show more of one kind.
+- Matching ignores case, accents and punctuation ("motorhead" finds Motörhead; "acdc",
+  "ac dc" and "ac - dc" find AC/DC), and closer matches are listed first.
+- The first search after launch no longer flashes "Nothing matches" while it warms up.
+
+### Exit
+- **Exit now actually stops the music.** It used to close the screen but leave playback
+  running with no app visible. Your place is saved and restored (paused) next launch.
+- The Exit button is visibly highlighted when selected.
+
+### Library
+- Band names with a slash or "&" (AC/DC, Simon & Garfunkel) stay one artist however
+  many tracks they have; a small act is no longer filed under "AC". A "feat." guest never
+  decides where a track is filed. Your library is regrouped once on first launch.
+- Untagged local files no longer group under an artist called `<unknown>`.
+
+### Playback
+- With the same song queued twice, shuffle, resume and restore keep the right copy.
+- Saved position and queue are written in order and atomically, so a power cut or a
+  quick relaunch can't restore a stale or empty session; a reshuffle is now remembered.
+- If the saved track was removed, resume starts the fallback track from the beginning.
+
+### Navigation and focus
+- Home: Back from an album, or picking Home in the side menu, lands on Continue Playing
+  instead of the menu.
+- Settings: Left on Theme / EQ options moves between options instead of opening the menu.
+- An artist's album wall keeps its scroll and selected album when you come back from an
+  album. Back from a share returns to its card; deleting a playlist keeps focus nearby.
+- The app no longer resets to Home on a theme/display change.
+
+### Reliability
+- A song whose filename contains words like "Reset" or "Connection" no longer drops the
+  SMB connection for other reads.
+- Re-read tags can't get stuck after an interrupted run; play counts keep saving after a
+  write error.
+- Search no longer rebuilds its index on every play-count change.
+
 ## [1.3.1] - 2026-09-30
 
 ### Removed
