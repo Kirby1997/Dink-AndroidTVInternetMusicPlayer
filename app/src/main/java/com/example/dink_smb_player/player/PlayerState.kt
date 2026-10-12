@@ -20,13 +20,18 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import com.example.dink_smb_player.DinkApplication
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Album
 import com.example.dink_smb_player.data.model.LyricLine
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.lyrics.LyricsStatus
+import com.example.dink_smb_player.player.radio.RadioPicker
+import com.example.dink_smb_player.player.radio.WeightedSeed
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.cancellation.CancellationException
 
 enum class RepeatMode { Off, All, One }
 
@@ -331,6 +336,7 @@ class PlayerState(
     fun albumFor(song: Song): Album? = albumLookup(song.albumId)
 
     fun load(song: Song, album: Album?, lyrics: List<LyricLine>, autoplay: Boolean = true) {
+        if (song.id != currentSong?.id) endRadio()
         // Re-loading the track already showing keeps its resolved lyrics — the owner's
         // resolver is keyed on the song id and won't run again to refill them.
         if (lyrics.isNotEmpty()) {
@@ -375,6 +381,7 @@ class PlayerState(
 
     fun playFrom(songs: List<Song>, startIndex: Int, autoplay: Boolean = true) {
         if (songs.isEmpty()) return
+        endRadio()
         consecutiveErrors = 0 // fresh user-initiated playback — retry after a prior stop
         baseOrder = songs
         val safeStart = startIndex.coerceIn(0, songs.lastIndex)
@@ -398,19 +405,26 @@ class PlayerState(
         applyQueueToEngine(autoplay)
     }
 
-    fun addToQueue(song: Song) {
+    fun addToQueue(song: Song) = addAllToQueue(listOf(song))
+
+    /** Append [songs] in order. Starts playback when nothing was loaded; otherwise extends the
+     *  engine queue in one call when it holds the whole (all-URI, unwindowed) queue. */
+    fun addAllToQueue(songs: List<Song>) {
+        if (songs.isEmpty()) return
         val wasEmpty = _queue.isEmpty()
-        _queue.add(song)
+        _queue.addAll(songs)
         reorderCount++
         if (baseOrder.isEmpty()) {
-            baseOrder = _queue.toList() // adopt the queue (already holding song) as base
+            baseOrder = _queue.toList() // adopt the queue (already holding songs) as base
             basePos = null
         } else {
-            baseOrder = baseOrder + song
-            basePos?.add(baseOrder.lastIndex)
+            val firstNew = baseOrder.size
+            baseOrder = baseOrder + songs
+            basePos?.addAll(firstNew until baseOrder.size)
         }
         if (wasEmpty || currentIndex < 0 || currentSong == null) {
-            currentIndex = _queue.lastIndex
+            val song = songs.first()
+            currentIndex = _queue.size - songs.size
             clearLyricsOnSongChange(song)
             currentSong = song
             currentAlbum = albumLookup(song.albumId)
@@ -424,13 +438,13 @@ class PlayerState(
         // survives. Skip when windowed — the engine holds a slice, not the tail, so
         // the appended track loads when the window slides to it.
         val player = engine
-        val uri = song.mediaUri
         // Skip the engine append while a session-restore apply is still deferred — the
-        // engine is empty then, and the eventual full apply includes this track anyway.
-        if (player != null && uri != null && !pendingEngineApply &&
+        // engine is empty then, and the eventual full apply includes these tracks anyway.
+        if (player != null && !pendingEngineApply &&
             !isWindowed && _queue.all { it.mediaUri != null }
         ) {
-            player.addMediaItem(mediaItemFor(song))
+            if (songs.size == 1) player.addMediaItem(mediaItemFor(songs[0]))
+            else player.addMediaItems(songs.map { mediaItemFor(it) })
         }
         // Growing past the engine window flips Repeat-All from engine-driven to
         // façade-driven (see engineRepeatMode); without this the engine keeps looping
@@ -444,6 +458,7 @@ class PlayerState(
     }
 
     fun clearQueue() {
+        endRadio()
         pendingEngineApply = false
         _queue.clear()
         baseOrder = emptyList()
@@ -459,6 +474,121 @@ class PlayerState(
             stop()
             clearMediaItems()
         }
+    }
+
+    // --- Radio -------------------------------------------------------------------
+
+    /** Computes radio picks OFF the main thread and calls [onResult] back ON main. Injected
+     *  (see [shared]) so this façade stays free of coroutines and the library. */
+    fun interface RadioSource {
+        fun request(seeds: List<WeightedSeed>, exclude: Set<String>, previous: Song?, count: Int, onResult: (List<Song>) -> Unit)
+    }
+
+    var radioSource: RadioSource? = null
+
+    /** The song the current station was started from; null = not in radio mode. */
+    var radioSeed by mutableStateOf<Song?>(null)
+        private set
+
+    // Every id queued since the station began — never picked again this session.
+    private val radioSeen = HashSet<String>()
+    private var radioInFlight = false
+    // Bumped on every begin/end so a pick that returns after the user moved on is dropped.
+    private var radioGeneration = 0
+
+    /** Start a station from [seed]: plays it at once, similar songs follow. */
+    fun startRadio(seed: Song) {
+        playFrom(listOf(seed), 0)
+        beginRadio(seed)
+        requestRadioBatch(RADIO_INITIAL)
+    }
+
+    /** Turn the current queue into a station seeded by what's playing; playback continues. */
+    fun startRadioFromCurrent() {
+        val cur = currentSong ?: return
+        if (currentIndex !in _queue.indices) return
+        dropUpcoming()
+        beginRadio(cur)
+        requestRadioBatch(RADIO_INITIAL)
+    }
+
+    /** Leave radio mode; the queue stays as it is, it just stops growing. */
+    fun stopRadio() = endRadio()
+
+    private fun beginRadio(seed: Song) {
+        radioGeneration++
+        radioInFlight = false
+        radioSeed = seed
+        radioSeen.clear()
+        _queue.forEach { radioSeen += it.id }
+    }
+
+    private fun endRadio() {
+        if (radioSeed == null) return
+        radioGeneration++
+        radioInFlight = false
+        radioSeed = null
+        radioSeen.clear()
+    }
+
+    /** Remove everything after the current track — queue and engine — without touching
+     *  what's playing. */
+    private fun dropUpcoming() {
+        val keep = currentIndex + 1
+        if (keep >= _queue.size) return
+        val player = engine
+        if (player != null && !engineApplyOutstanding() && isQueueAllUri()) {
+            val engineCur = currentIndex - engineBase
+            val count = player.mediaItemCount
+            if (engineCur >= 0 && engineCur + 1 < count) player.removeMediaItems(engineCur + 1, count)
+        }
+        while (_queue.size > keep) _queue.removeAt(_queue.lastIndex)
+        baseOrder = _queue.toList()
+        basePos = null
+        reorderCount++
+        engine?.repeatMode = engineRepeatMode()
+    }
+
+    private fun maybeRefillRadio() {
+        if (radioSeed == null || radioInFlight) return
+        if (_queue.size - 1 - currentIndex > RADIO_LOW_WATER) return
+        requestRadioBatch(RADIO_REFILL)
+    }
+
+    private fun requestRadioBatch(count: Int, relaxed: Boolean = false) {
+        val source = radioSource ?: return
+        val seed = radioSeed ?: return
+        radioInFlight = true
+        val gen = radioGeneration
+        val exclude: Set<String> = if (relaxed) recentPlayedIds(RADIO_RELAXED_HISTORY) else HashSet(radioSeen)
+        source.request(radioSeeds(seed), exclude, _queue.lastOrNull(), count) { picks ->
+            if (gen != radioGeneration || radioSeed == null) return@request
+            radioInFlight = false
+            val fresh = if (relaxed) picks else picks.filter { it.id !in radioSeen }
+            if (fresh.isEmpty()) {
+                if (!relaxed) requestRadioBatch(count, relaxed = true)
+                return@request
+            }
+            fresh.forEach { radioSeen += it.id }
+            addAllToQueue(fresh)
+        }
+    }
+
+    /** Original seed at full weight plus the current track and the two before it, so the
+     *  station drifts with what's been playing instead of looping on one artist. */
+    private fun radioSeeds(seed: Song): List<WeightedSeed> {
+        val out = mutableListOf(WeightedSeed(seed, 1.0))
+        RADIO_DRIFT_WEIGHTS.forEachIndexed { back, w ->
+            val s = _queue.getOrNull(currentIndex - back) ?: return@forEachIndexed
+            if (s.id != seed.id) out += WeightedSeed(s, w)
+        }
+        return out
+    }
+
+    private fun recentPlayedIds(n: Int): Set<String> {
+        if (currentIndex !in _queue.indices) return emptySet()
+        val from = (currentIndex - n + 1).coerceAtLeast(0)
+        return _queue.subList(from, currentIndex + 1).mapTo(HashSet()) { it.id }
     }
 
     fun togglePlayPause() {
@@ -733,6 +863,7 @@ class PlayerState(
         currentSong = song
         currentAlbum = albumLookup(song.albumId)
         timeSec = 0f
+        maybeRefillRadio()
     }
 
     /** Owner sets lyrics once a background resolver returns. No-op if [currentSong]
@@ -985,6 +1116,7 @@ class PlayerState(
         } else {
             applyQueueToEngine(autoplay = true)
         }
+        maybeRefillRadio()
     }
 
     private fun applyQueueToEngine(autoplay: Boolean) {
@@ -1065,7 +1197,7 @@ class PlayerState(
      *  NOT on every position tick. The
      *  persistence loop keys a debounced save on this; position is captured at save time. */
     fun saveSignature(): String =
-        "${currentSong?.id}|$currentIndex|$shuffle|$repeatMode|${_queue.size}|$reorderCount"
+        "${currentSong?.id}|$currentIndex|$shuffle|$repeatMode|${_queue.size}|$reorderCount|${radioSeed?.id}"
 
     /** Snapshot of the current session for [PlaybackStore], or null when nothing is
      *  playing. Windows the queue to [PlaybackStore.MAX_QUEUE] ids centred on the current
@@ -1084,6 +1216,7 @@ class PlayerState(
             shuffle = shuffle,
             repeat = repeatMode.name,
             baseOrder = if (shuffle) baseOrderIndices(ids, start) else null,
+            radioSeedId = radioSeed?.id,
         )
     }
 
@@ -1154,6 +1287,8 @@ class PlayerState(
         // pendingEngineApply). The restored session is paused, so nothing is lost, and
         // the ~0.7s main-thread setMediaItems cost moves off the launch path.
         pendingEngineApply = true
+        // A saved station keeps refilling; the first track change requests the next batch.
+        snapshot.radioSeedId?.let { byId[it] }?.let { beginRadio(it) }
     }
 
     /** [basePos] for a restored shuffle: the saved base order [saved] (indices into the
@@ -1187,6 +1322,7 @@ class PlayerState(
             byId[id]?.let { if (i == engIdx) curSlot = songs.size; songs += it }
         }
         if (songs.isEmpty()) return
+        endRadio()
         pendingSeekMs = 0L // a restore() that lost the bind race must not seek us back
         pendingEngineApply = false // engine queue is authoritative here
         _queue.clear()
@@ -1214,6 +1350,12 @@ class PlayerState(
         /** A [playbackError] older than this when the UI consumes it is dropped. */
         internal const val PLAYBACK_ERROR_TTL_MS = 5_000L
 
+        internal const val RADIO_INITIAL = 24
+        internal const val RADIO_REFILL = 20
+        internal const val RADIO_LOW_WATER = 5
+        internal const val RADIO_RELAXED_HISTORY = 20
+        private val RADIO_DRIFT_WEIGHTS = doubleArrayOf(0.7, 0.4, 0.4)
+
         private var sharedInstance: PlayerState? = null
 
         /** The process-wide façade (see class doc), created on first use with the
@@ -1229,6 +1371,23 @@ class PlayerState(
                     val wanted = ids.toHashSet()
                     LibraryRepository.songsNow(appCtx)
                         .asSequence().filter { it.id in wanted }.associateBy { it.id }
+                }
+                // Radio picks: score the whole library off main, answer on main (appScope is
+                // Main-dispatched). No app scope (tests) → no picks.
+                state.radioSource = RadioSource { seeds, exclude, previous, count, onResult ->
+                    val app = appCtx as? DinkApplication
+                    if (app == null) { onResult(emptyList()); return@RadioSource }
+                    app.appScope.launch {
+                        val picks = withContext(Dispatchers.Default) {
+                            runCatching {
+                                RadioPicker.pick(seeds, LibraryRepository.songsNow(appCtx), exclude, previous, count, kotlin.random.Random.Default)
+                            }.onFailure {
+                                if (it is CancellationException) throw it
+                                android.util.Log.e("PlayerState", "radio pick failed", it)
+                            }.getOrDefault(emptyList())
+                        }
+                        onResult(picks)
+                    }
                 }
                 sharedInstance = state
             }

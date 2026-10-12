@@ -96,4 +96,12 @@ class PlaybackStoreTest {
         PlaybackStore.saveIn(dir, snap())
         assertTrue(PlaybackStore.hasSessionIn(dir))
     }
+
+    @Test
+    fun `radio seed round trips and old snapshots load without it`() = runBlocking {
+        PlaybackStore.saveIn(dir, snap().copy(radioSeedId = "b"))
+        assertEquals("b", PlaybackStore.loadFrom(dir)?.radioSeedId)
+        File(dir, "nowplaying.json").writeText("""{"queueIds":["a"],"index":0}""")
+        assertNull(PlaybackStore.loadFrom(dir)?.radioSeedId)
+    }
 }

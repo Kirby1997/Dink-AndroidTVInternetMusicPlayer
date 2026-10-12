@@ -46,6 +46,9 @@ object PlaybackStore {
         /** Unshuffled order of the saved tracks, as indices into [queueIds]; only written
          *  while [shuffle] is on, so a restored shuffle can be turned back off. */
         val baseOrder: List<Int>? = null,
+        /** Seed song id while the session is a radio station (PlayerState.radioSeed), so a
+         *  relaunch keeps refilling; null = ordinary queue. */
+        val radioSeedId: String? = null,
     )
 
     /** Position checkpoint for [songId]; ignored unless it matches the session's track. */
