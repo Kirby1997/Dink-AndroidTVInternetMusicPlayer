@@ -43,6 +43,10 @@ data class Song(
     val artistKey: String? = null,
     val albumKey: String? = null,
     val artistLabel: String? = null,
+    /** Genre tag (display form) and release year, when the index has them. Radio similarity
+     *  uses both; null on mock data and untagged files. */
+    val genre: String? = null,
+    val year: Int? = null,
 )
 
 /** One line of synchronised lyrics. timeSec is the start time of this line in the track. */

@@ -65,6 +65,10 @@ data class TrackEntity(
     // Source file's last-modified time (epoch ms) as last seen by the walk; null = unknown.
     // Paired with retagAttemptedMs so a file changed in place can be re-tagged (SRC-8).
     val fileMtimeMs: Long? = null,
+    // Genre tag as read (numeric ID3 forms resolved — see GenreKeys.resolveDisplay); null =
+    // untagged or not read yet. Radio similarity matches on GenreKeys.keysOf(genre). Defaulted
+    // so old snapshots deserialize; existing rows are filled by LibraryRepository.backfillGenres.
+    val genre: String? = null,
 )
 
 /** Live play stats of one track (see IndexDao.playStats). */

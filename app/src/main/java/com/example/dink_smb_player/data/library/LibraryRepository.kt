@@ -1008,4 +1008,6 @@ fun TrackEntity.toSong(): Song = Song(
     artistKey = artistKey,
     albumKey = albumKey,
     artistLabel = artistLabel,
+    genre = genre,
+    year = year,
 )

@@ -1,5 +1,6 @@
 package com.example.dink_smb_player.data.index
 
+import com.example.dink_smb_player.data.library.toSong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -232,5 +233,40 @@ class TrackMergeTest {
         // Walk: a changed file carries its re-read album artist.
         val changed = row().copy(sizeBytes = 2000, albumArtist = "Queen")
         assertEquals("Queen", TrackMerges.Walk.merge(state.value.single(), changed)!!.albumArtist)
+    }
+
+    @Test
+    fun `retag patches genre it read`() {
+        val base = enrichedPlayed()
+        val incoming = base.copy(genre = "Shoegaze", retagAttemptedMs = 50, retagVersion = 2)
+        val merged = TrackMerges.retag(mapOf(base.id to base)).merge(base, incoming)!!
+        assertEquals("Shoegaze", merged.genre)
+    }
+
+    @Test
+    fun `retag keeps a genre another writer set meanwhile`() {
+        val base = enrichedPlayed()
+        val current = base.copy(genre = "Jazz")
+        val incoming = base.copy(title = "Retitled", retagAttemptedMs = 50)
+        val merged = TrackMerges.retag(mapOf(base.id to base)).merge(current, incoming)!!
+        assertEquals("Jazz", merged.genre)
+    }
+
+    @Test
+    fun `walk re-read with newer stamp patches genre, older keeps it`() {
+        val current = enrichedPlayed().copy(genre = "Rock")
+        val reread = row().copy(genre = "Indie", retagAttemptedMs = 100, retagVersion = 2)
+        assertEquals("Indie", TrackMerges.Walk.merge(current, reread)!!.genre)
+        val noGenre = row().copy(genre = null, retagAttemptedMs = 100, retagVersion = 2)
+        assertEquals("Rock", TrackMerges.Walk.merge(current, noGenre)!!.genre)
+        val stale = row().copy(genre = "Indie")
+        assertEquals("Rock", TrackMerges.Walk.merge(current, stale)!!.genre)
+    }
+
+    @Test
+    fun `toSong maps genre and year`() {
+        val song = row().copy(genre = "Rock", year = 1997).toSong()
+        assertEquals("Rock", song.genre)
+        assertEquals(1997, song.year)
     }
 }

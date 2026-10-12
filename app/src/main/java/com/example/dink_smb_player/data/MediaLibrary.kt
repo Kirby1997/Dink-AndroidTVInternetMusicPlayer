@@ -97,6 +97,7 @@ object MediaLibrary {
             title = title,
             artist = artist.takeIf { it != MediaStoreAudio.UNKNOWN_ARTIST },
             albumTitle = albumTitle,
+            genre = genre,
             durationMs = durationSec * 1000L,
             bitrate = bitrate.takeIf { it != "—" },
             sourceType = SourceType.Local,

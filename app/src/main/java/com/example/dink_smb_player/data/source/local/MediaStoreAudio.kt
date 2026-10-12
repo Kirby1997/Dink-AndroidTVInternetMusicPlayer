@@ -4,6 +4,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.provider.MediaStore
 import com.example.dink_smb_player.data.MediaLibrary
+import com.example.dink_smb_player.data.index.GenreKeys
 import com.example.dink_smb_player.data.index.SourceType
 import com.example.dink_smb_player.data.library.trackIdFor
 import com.example.dink_smb_player.data.model.Song
@@ -28,6 +29,7 @@ object MediaStoreAudio {
             MediaStore.Audio.Media.DURATION,
             MediaStore.Audio.Media.DATA,
             MediaStore.Audio.Media.MIME_TYPE,
+            MediaStore.Audio.AudioColumns.GENRE,
         )
         val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
         val sortOrder = "${MediaStore.Audio.Media.TITLE} ASC"
@@ -46,6 +48,7 @@ object MediaStoreAudio {
             val durCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
             val dataCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
             val mimeCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE)
+            val genreCol = c.getColumnIndexOrThrow(MediaStore.Audio.AudioColumns.GENRE)
             while (c.moveToNext()) {
                 val id = c.getLong(idCol)
                 val uri = ContentUris.withAppendedId(
@@ -66,6 +69,7 @@ object MediaStoreAudio {
                     sourcePath = data,
                     bitrate = c.getString(mimeCol)?.substringAfter('/')?.uppercase() ?: "—",
                     mediaUri = uri.toString(),
+                    genre = GenreKeys.resolveDisplay(knownTag(c.getString(genreCol))),
                 )
             }
         }

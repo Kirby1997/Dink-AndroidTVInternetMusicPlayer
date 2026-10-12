@@ -19,7 +19,7 @@ fun interface TrackMerge {
  *    [IndexDao.playStats] (markPlayed patches that map, never a row); in memory the rows carry
  *    them as 0/null and [IndexDao.persistSnapshot] writes the live values to disk (LIB-15).
  *  - listing (walk): uri, path, sizeBytes, fileMtimeMs.
- *  - tags: title, artist, albumArtist, albumTitle, year, trackNumber, durationMs (+ the fields no
+ *  - tags: title, artist, albumArtist, albumTitle, year, genre, trackNumber, durationMs (+ the fields no
  *    reader fills yet: albumId, discNumber, bitrate, mimeType). albumArtist feeds the album key,
  *    so a writer that changes it must have the keys recomputed after (walk and retag both do).
  *  - grouping keys: artistKey, albumKey, artistLabel — [keys] (recompute) and [enrich].
@@ -72,6 +72,7 @@ object TrackMerges {
                     albumArtist = incoming.albumArtist?.ifBlank { null } ?: current.albumArtist,
                     albumTitle = incoming.albumTitle?.ifBlank { null } ?: current.albumTitle,
                     year = incoming.year ?: current.year,
+                    genre = incoming.genre?.ifBlank { null } ?: current.genre,
                     trackNumber = incoming.trackNumber ?: current.trackNumber,
                     durationMs = incoming.durationMs.takeIf { it > 0 } ?: listed.durationMs,
                     retagAttemptedMs = incoming.retagAttemptedMs,
@@ -148,6 +149,7 @@ object TrackMerges {
         albumArtist = pick(base.albumArtist, incoming.albumArtist, albumArtist),
         albumTitle = pick(base.albumTitle, incoming.albumTitle, albumTitle),
         year = pick(base.year, incoming.year, year),
+        genre = pick(base.genre, incoming.genre, genre),
         trackNumber = pick(base.trackNumber, incoming.trackNumber, trackNumber),
         durationMs = pick(base.durationMs, incoming.durationMs, durationMs),
     )
