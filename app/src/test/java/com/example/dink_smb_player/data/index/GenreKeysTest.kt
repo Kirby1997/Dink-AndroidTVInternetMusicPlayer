@@ -48,6 +48,14 @@ class GenreKeysTest {
     }
 
     @Test
+    fun `keys split pipe and backslash separators, not ampersand`() {
+        assertEquals(setOf("heavymetal", "hardrock", "nwobhm"), GenreKeys.keysOf("Heavy Metal | Hard Rock | NWOBHM"))
+        assertEquals(setOf("rock", "pop"), GenreKeys.keysOf("Rock\\Pop"))
+        assertEquals(setOf("rb"), GenreKeys.keysOf("R&B"))
+        assertEquals(setOf("drumbass"), GenreKeys.keysOf("Drum & Bass"))
+    }
+
+    @Test
     fun `placeholders and blanks give no keys`() {
         assertTrue(GenreKeys.keysOf(null).isEmpty())
         assertTrue(GenreKeys.keysOf("").isEmpty())

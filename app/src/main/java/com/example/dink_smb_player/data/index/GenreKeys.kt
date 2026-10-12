@@ -62,11 +62,12 @@ object GenreKeys {
     // unrelated tracks.
     private val PLACEHOLDERS = setOf("other", "unknown", "genre", "misc", "none", "remix", "cover")
 
-    /** Normalized match keys: split on ; / , NUL, resolve numeric forms, lowercase, keep only
-     *  letters/digits, drop placeholders. "Hip-Hop", "hip hop" and "HipHop" all give "hiphop". */
+    /** Normalized match keys: split on ; / , | \ NUL, resolve numeric forms, lowercase, keep only
+     *  letters/digits, drop placeholders. "Hip-Hop", "hip hop" and "HipHop" all give "hiphop".
+     *  Deliberately not split on '&' — it is part of names like "R&B" and "Drum & Bass". */
     fun keysOf(raw: String?): Set<String> {
         if (raw.isNullOrBlank()) return emptySet()
-        return raw.split(';', '/', ',', '\u0000')
+        return raw.split(';', '/', ',', '|', '\\', '\u0000')
             .mapNotNull { part ->
                 resolveDisplay(part)?.lowercase()?.filter { it.isLetterOrDigit() }?.ifEmpty { null }
             }
