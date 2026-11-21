@@ -82,6 +82,7 @@ internal fun UpdatesTab(activeTabFocus: FocusRequester, railReq: FocusRequester)
     // Play flavor has no background check: load the changelog when the tab opens.
     androidx.compose.runtime.LaunchedEffect(Unit) {
         UpdateRepository.attach(context)
+        UpdateRepository.onUpdatesTabShown()
         if (!selfUpdate && releases.isEmpty()) UpdateRepository.checkAsync()
     }
 
