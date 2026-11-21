@@ -83,7 +83,7 @@ import com.example.dink_smb_player.ui.screens.library.LibraryDetailScreen
 import com.example.dink_smb_player.ui.screens.library.LibraryGroupScreen
 import com.example.dink_smb_player.ui.screens.library.albumGroups
 import com.example.dink_smb_player.ui.screens.library.artistGroups
-import com.example.dink_smb_player.ui.screens.library.folderGroups
+import com.example.dink_smb_player.ui.screens.library.FolderTreeScreen
 import com.example.dink_smb_player.ui.screens.library.PlaylistsScreen
 import com.example.dink_smb_player.ui.screens.library.SearchMemo
 import com.example.dink_smb_player.ui.screens.library.SearchScreen
@@ -444,7 +444,7 @@ private fun ScreenHost(
         ScreenId.Albums -> LibraryGroupScreen("Albums", ScreenId.Albums.icon, player, onNavigate, ::albumGroups, facet = "Album", parent = ScreenId.Albums, artGrid = true)
         ScreenId.Artists -> LibraryGroupScreen("Artists", ScreenId.Artists.icon, player, onNavigate, ::artistGroups, facet = "Artist", parent = ScreenId.Artists, artGrid = true)
         ScreenId.Playlists -> PlaylistsScreen(player = player, onNavigate = onNavigate, onToast = onToast)
-        ScreenId.Folders -> LibraryGroupScreen("Folders", ScreenId.Folders.icon, player, onNavigate, ::folderGroups, facet = "Folder", parent = ScreenId.Folders)
+        ScreenId.Folders -> FolderTreeScreen(player = player, onNavigate = onNavigate, onToast = onToast)
         ScreenId.LibraryDetail -> LibraryDetailScreen(player = player, onNavigate = onNavigate, onToast = onToast)
         ScreenId.LocalStorage -> LocalStorageScreen(player = player, onNavigate = onNavigate)
         ScreenId.SmbShares -> SmbSharesScreen(player = player, onNavigate = onNavigate, onToast = onToast)

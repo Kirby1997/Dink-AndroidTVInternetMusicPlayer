@@ -178,7 +178,7 @@ fun SongContextMenu(
 }
 
 @Composable
-private fun MenuRow(
+internal fun MenuRow(
     label: String,
     icon: ImageVector,
     focusRequester: FocusRequester? = null,

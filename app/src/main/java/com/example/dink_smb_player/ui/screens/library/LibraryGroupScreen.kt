@@ -636,10 +636,3 @@ fun artistGroups(songs: List<Song>): List<LibraryGroup> =
             "${list.size} tracks · $albums albums"
         },
     )
-
-fun folderGroups(songs: List<Song>): List<LibraryGroup> = buildGroups(
-    songs,
-    keyOf = { it.sourcePath.substringBeforeLast('/', "").ifEmpty { "/" } },
-    titleOf = { key, _ -> key.substringAfterLast('/').ifEmpty { key } },
-    subtitleOf = { key, list -> "$key · ${list.size} tracks" },
-)
