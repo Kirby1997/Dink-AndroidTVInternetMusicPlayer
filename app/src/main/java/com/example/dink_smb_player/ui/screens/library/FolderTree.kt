@@ -1,6 +1,10 @@
 package com.example.dink_smb_player.ui.screens.library
 
 import com.example.dink_smb_player.data.model.Song
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /*
  * Pure (non-Compose) model behind the Folders directory tree: build a source → directory →
@@ -11,13 +15,16 @@ import com.example.dink_smb_player.data.model.Song
 
 /** One directory (or a source root) in the tree. Immutable once built. */
 class FolderNode(
-    /** Stable identity: the full normalised path of the deepest directory this row stands
-     *  for (a compacted "Music / Artists" row is keyed by ".../Music/Artists"). Expanded-state
-     *  and focus memos are keyed by it. */
+    /** Stable identity of the deepest directory this row stands for (a compacted
+     *  "Music / Artists" row is keyed by its "Artists" dir) — see [FolderTree.nodeId].
+     *  Expanded-state and focus memos are keyed by it. */
     val id: String,
     /** Row label. Source roots carry the source's display name; a compacted chain joins its
      *  segment names with " / ". */
     val name: String,
+    /** The deepest directory's own name (the last segment of a compacted chain; the source
+     *  label for a root) — the title when this folder is opened as a list. */
+    val leafName: String,
     val isRoot: Boolean,
     /** Sub-directories, case-insensitively sorted by name. */
     val children: List<FolderNode>,
@@ -73,25 +80,45 @@ sealed class TreeRow {
     }
 }
 
-/** Where a track's path splits into its source root and the directories inside it. */
-internal data class SourceSplit(val rootKey: String, val rootLabel: String, val segments: List<String>)
+/** Where a track's path splits into its source root and the directories inside it.
+ *  [rootKey] is the source identity (lowercased for SMB, whose paths are case-insensitive);
+ *  [caseInsensitive] says directory segments should be matched ignoring case too. */
+internal data class SourceSplit(
+    val rootKey: String,
+    val rootLabel: String,
+    val segments: List<String>,
+    val caseInsensitive: Boolean = false,
+)
 
 object FolderTree {
 
     private const val INTERNAL_LABEL = "Internal storage"
     private const val COMPACT_SEPARATOR = " / "
+    /** Separates the source root from the directory path inside a node id. A control char can't
+     *  appear in a share/volume/dir name, so ids from different sources never collide (a
+     *  "/" root's "Music" dir vs an SMB host called "music", say). */
+    private const val ROOT_SEP = '\u0001'
+
+    /** Node id for the directory [dirKeys] (already case-folded where the source needs it)
+     *  under source [rootKey]; empty [dirKeys] = the source root itself. */
+    fun nodeId(rootKey: String, dirKeys: List<String>): String =
+        rootKey + ROOT_SEP + dirKeys.joinToString("/")
+
+    /** The source root key a node id belongs to. */
+    fun rootKeyOf(id: String): String = id.substringBefore(ROOT_SEP)
 
     /**
      * Split a [Song.sourcePath] into source root + directory segments (+ file name last).
      *
-     * - SMB: `//host/share/dir/file` → root `//host/share`, labelled by the share's display
-     *   name from [labels] (keyed by mount path), else "share on host".
+     * - SMB: `//host/share/dir/file` → root `//host/share` (keyed lowercase: SMB is
+     *   case-insensitive), labelled by the share's display name from [labels] (keyed by mount
+     *   path), else "share on host" in the path's own spelling.
      * - Local: `/storage/emulated/N/…` (and `/sdcard/…`) → internal storage;
      *   `/storage/<VOLUME>/…` → that removable volume (USB / SD), labelled from [labels]
      *   (keyed by volume directory) else "USB / SD (VOLUME)".
      * - Anything else absolute → a "Device" root; a relative path → its first segment.
      *
-     * [labels] keys are compared case-insensitively.
+     * [labels] keys must be lowercase.
      */
     internal fun splitSource(rawPath: String, labels: Map<String, String>): SourceSplit {
         val path = rawPath.replace('\\', '/')
@@ -99,12 +126,12 @@ object FolderTree {
         fun label(root: String, fallback: String) = labels[root.lowercase()] ?: fallback
         return when {
             path.startsWith("//") && segs.size >= 3 -> {
-                val root = "//${segs[0]}/${segs[1]}"
-                SourceSplit(root, label(root, "${segs[1]} on ${segs[0]}"), segs.drop(2))
+                val root = "//${segs[0]}/${segs[1]}".lowercase()
+                SourceSplit(root, label(root, "${segs[1]} on ${segs[0]}"), segs.drop(2), caseInsensitive = true)
             }
             path.startsWith("//") && segs.isNotEmpty() -> {
-                val root = "//${segs[0]}"
-                SourceSplit(root, label(root, segs[0]), segs.drop(1))
+                val root = "//${segs[0]}".lowercase()
+                SourceSplit(root, label(root, segs[0]), segs.drop(1), caseInsensitive = true)
             }
             path.startsWith("/storage/emulated/") && segs.size >= 4 -> {
                 val root = "/storage/emulated/${segs[2]}"
@@ -121,6 +148,7 @@ object FolderTree {
         }
     }
 
+    /** [name] is the first spelling seen; children are keyed by the (case-folded) segment. */
     private class Builder(val id: String, val name: String) {
         val children = LinkedHashMap<String, Builder>()
         val tracks = ArrayList<Song>()
@@ -130,7 +158,8 @@ object FolderTree {
      * Build the tree: one root per source, then directories, tracks as leaves. Directory
      * chains with no tracks and a single sub-directory are compacted into one row (roots are
      * never merged into their child, so every source keeps its own labelled row). Roots sort
-     * by label, directories by name, tracks by file name — all case-insensitive.
+     * by label, directories by name, tracks by file name — all case-insensitive. On SMB,
+     * roots and directories differing only in case are one node, shown in the first spelling.
      */
     fun build(songs: List<Song>, labels: Map<String, String> = emptyMap()): List<FolderNode> {
         val lowered = if (labels.keys.all { it == it.lowercase() }) labels
@@ -138,12 +167,14 @@ object FolderTree {
         val roots = LinkedHashMap<String, Builder>()
         for (song in songs) {
             val split = splitSource(song.sourcePath, lowered)
-            var node = roots.getOrPut(split.rootKey) { Builder(split.rootKey, split.rootLabel) }
+            var node = roots.getOrPut(split.rootKey) { Builder(nodeId(split.rootKey, emptyList()), split.rootLabel) }
             // Last segment is the file name; everything before it is a directory.
             val dirs = if (split.segments.isEmpty()) emptyList() else split.segments.dropLast(1)
+            val keys = ArrayList<String>(dirs.size)
             for (dir in dirs) {
-                val parent = node
-                node = parent.children.getOrPut(dir) { Builder("${parent.id}/$dir", dir) }
+                val key = if (split.caseInsensitive) dir.lowercase() else dir
+                keys.add(key)
+                node = node.children.getOrPut(key) { Builder(nodeId(split.rootKey, keys), dir) }
             }
             node.tracks.add(song)
         }
@@ -171,6 +202,7 @@ object FolderTree {
         return FolderNode(
             id = cur.id,
             name = name,
+            leafName = cur.name,
             isRoot = isRoot,
             children = cur.children.values
                 .map { freeze(it, isRoot = false) }
@@ -196,13 +228,20 @@ object FolderTree {
         return out
     }
 
-    /** Drop expanded ids that no longer name a folder (library changed under the memo). */
+    /**
+     * Drop expanded ids whose source is still in the tree but whose folder is gone. Ids under a
+     * source that's absent right now are KEPT — a partial library (restore, re-import, a monitor
+     * pass mid-walk) mustn't wipe the user's open folders. An empty tree prunes nothing.
+     * Returns the same instance when nothing changes.
+     */
     fun pruneExpanded(roots: List<FolderNode>, expanded: Set<String>): Set<String> {
-        if (expanded.isEmpty()) return expanded
+        if (expanded.isEmpty() || roots.isEmpty()) return expanded
         val ids = HashSet<String>()
         fun collect(n: FolderNode) { ids.add(n.id); n.children.forEach(::collect) }
         roots.forEach(::collect)
-        return if (ids.containsAll(expanded)) expanded else expanded.filterTo(HashSet()) { it in ids }
+        val rootKeys = roots.mapTo(HashSet()) { rootKeyOf(it.id) }
+        fun keep(id: String) = id in ids || rootKeyOf(id) !in rootKeys
+        return if (expanded.all(::keep)) expanded else expanded.filterTo(HashSet(), ::keep)
     }
 }
 
@@ -216,8 +255,15 @@ internal object FolderTreeMemo {
     private class Entry(val songs: List<Song>, val labels: Map<String, String>, val roots: List<FolderNode>)
     private var entry: Entry? = null
 
-    /** Expanded folder ids. Written on every toggle, read when the screen composes. */
-    @Volatile var expanded: Set<String> = emptySet()
+    private val _expanded = MutableStateFlow<Set<String>>(emptySet())
+    /** Expanded folder ids. Every change is an atomic read-modify-write on the CURRENT value,
+     *  so key-repeat toggles landing before a recomposition are never lost. */
+    val expanded: StateFlow<Set<String>> = _expanded.asStateFlow()
+
+    fun expand(id: String) = _expanded.update { it + id }
+    fun collapse(id: String) = _expanded.update { it - id }
+    fun toggle(id: String) = _expanded.update { if (id in it) it - id else it + id }
+    fun prune(roots: List<FolderNode>) = _expanded.update { FolderTree.pruneExpanded(roots, it) }
 
     @Synchronized
     fun get(songs: List<Song>, labels: Map<String, String>): List<FolderNode> {
@@ -233,7 +279,7 @@ internal object FolderTreeMemo {
     }
 
     @Synchronized
-    fun clear() { entry = null; expanded = emptySet() }
+    fun clear() { entry = null; _expanded.value = emptySet() }
 }
 
 /** What a D-pad key does on a tree row. */
@@ -247,21 +293,27 @@ sealed class TreeNav {
     data class FocusRow(val rowKey: String) : TreeNav()
 }
 
+/**
+ * Left/Right decisions. They take the CURRENT expanded set (read at key time), not the
+ * row's composed `expanded` flag, so a burst of key repeats before the list recomposes still
+ * acts on the real state.
+ */
 object TreeKeys {
     /** Left: collapse an open folder; else jump to the parent row; a collapsed top-level row
      *  passes Left through so focus goes to the nav rail. */
-    fun left(rows: List<TreeRow>, index: Int): TreeNav {
-        val row = rows.getOrNull(index) ?: return TreeNav.PassThrough
-        if (row is TreeRow.Folder && row.expanded) return TreeNav.Collapse(row.node.id)
+    fun left(row: TreeRow, expanded: Set<String>): TreeNav {
+        if (row is TreeRow.Folder && row.node.id in expanded) return TreeNav.Collapse(row.node.id)
         return row.parentKey?.let { TreeNav.FocusRow(it) } ?: TreeNav.PassThrough
     }
 
-    /** Right: expand a closed folder; on an open one move into its first child; no-op on tracks. */
-    fun right(rows: List<TreeRow>, index: Int): TreeNav {
-        val row = rows.getOrNull(index) ?: return TreeNav.Consume
+    /** Right: expand a closed folder; on an open one move into its first child (sub-folders
+     *  are listed before tracks); no-op on tracks. */
+    fun right(row: TreeRow, expanded: Set<String>): TreeNav {
         if (row !is TreeRow.Folder) return TreeNav.Consume
-        if (!row.expanded) return TreeNav.Expand(row.node.id)
-        val next = rows.getOrNull(index + 1)
-        return if (next != null && next.parentKey == row.key) TreeNav.FocusRow(next.key) else TreeNav.Consume
+        val node = row.node
+        if (node.id !in expanded) return TreeNav.Expand(node.id)
+        node.children.firstOrNull()?.let { return TreeNav.FocusRow(TreeRow.folderKey(it.id)) }
+        node.tracks.firstOrNull()?.let { return TreeNav.FocusRow(TreeRow.trackKey(it.id)) }
+        return TreeNav.Consume
     }
 }
