@@ -3,7 +3,24 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
-## [Unreleased]
+## [1.6.0] - 2026-11-21
+
+### Folders
+- **Folders is now a folder tree.** Browse your shares and storage the way they're laid out
+  on disk: each source at the top, then its folders, with songs inside. Folder rows show how
+  many tracks they hold (including subfolders), and runs of single, empty folders collapse
+  into one row ("Music / Artists") so you reach your music in fewer presses.
+- OK opens or closes a folder; Right opens it or steps into it; Left closes it or jumps back
+  to the parent folder. OK on a song plays that folder from that song.
+- Hold OK on a folder for **Play folder**, **Shuffle folder** or **Open as list** (every song
+  in it and its subfolders). Open folders and your place in the list are kept when you leave
+  and come back.
+
+### Fixes
+- Holding OK to open a song or folder menu no longer picks the menu's first option the
+  moment you let go (it used to start playing a folder straight away, or jump into the
+  playlist picker).
+- Menu options are now vertically centred.
 
 ### Updates
 - **New Settings → Updates tab.** Shows the version you're running, checks GitHub for newer
