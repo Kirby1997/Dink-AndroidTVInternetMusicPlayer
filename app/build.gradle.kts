@@ -36,6 +36,21 @@ android {
         versionName = "1.5.0"
     }
 
+    // "github" = sideload build with the in-app updater (check + download + install).
+    // "play" = Play Store build: no REQUEST_INSTALL_PACKAGES, no self-update (Play policy).
+    // Same applicationId; the updater verifies the downloaded APK's signer before installing.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("github") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SELF_UPDATE", "true")
+        }
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SELF_UPDATE", "false")
+        }
+    }
+
     signingConfigs {
         if (hasUploadKey) {
             create("upload") {

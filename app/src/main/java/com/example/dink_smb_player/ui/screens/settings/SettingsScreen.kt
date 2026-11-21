@@ -63,6 +63,7 @@ import com.example.dink_smb_player.player.EqEngine
 import com.example.dink_smb_player.lyrics.LyricSettings
 import com.example.dink_smb_player.lyrics.OnlineLyricProviders
 import com.example.dink_smb_player.ui.components.GhostButton
+import com.example.dink_smb_player.update.UpdateRepository
 import com.example.dink_smb_player.ui.components.Seg
 import com.example.dink_smb_player.ui.components.SegOption
 import com.example.dink_smb_player.ui.sound.LocalNavSounds
@@ -81,7 +82,7 @@ import com.example.dink_smb_player.ui.theme.UiScaleStep
  *  (e.g. the EQ shortcut on Now Playing → Audio). Mirrors the screen-as-state nav
  *  pattern used elsewhere (LibraryDetailNav). One-shot: consumed on read. */
 object SettingsNav {
-    /** 0 = Display, 1 = Audio, 2 = Lyrics, 3 = Library, 4 = About. */
+    /** 0 = Display, 1 = Audio, 2 = Lyrics, 3 = Library, 4 = Updates, 5 = About. */
     var initialTab: Int? = null
     fun consume(): Int? {
         val t = initialTab
@@ -122,7 +123,8 @@ fun SettingsScreen() {
             // Categories as D-pad tabs (switch on focus) instead of one long scroll.
             // Honour a deep-link target (e.g. the Now Playing EQ shortcut → Audio).
             var tab by remember { mutableStateOf(SettingsNav.consume() ?: 0) }
-            val tabs = listOf("Display", "Audio", "Lyrics", "Library", "About")
+            val updateBadge by UpdateRepository.badge.collectAsState()
+            val tabs = listOf("Display", "Audio", "Lyrics", "Library", "Updates", "About")
             // Up from content returns to the ACTIVE tab (not the spatially-nearest one,
             // which would switch category). Bound to whichever tab is currently selected.
             val activeTabFocus = remember { FocusRequester() }
@@ -144,6 +146,7 @@ fun SettingsScreen() {
                         // The selected tab is the Up-target for content below it.
                         activeTabRequester = if (tab == i) activeTabFocus else null,
                         railReq = railReq,
+                        badge = label == "Updates" && updateBadge,
                     )
                 }
             }
@@ -411,6 +414,9 @@ fun SettingsScreen() {
                         }
                     }
 
+                    // ---- Updates: version, check/install (sideload), changelog ----
+                    4 -> UpdatesTab(activeTabFocus = activeTabFocus, railReq = railReq)
+
                     // ---- About: version, source link, licenses ----
                     else -> AboutTab(activeTabFocus = activeTabFocus, railReq = railReq)
                 }
@@ -429,6 +435,7 @@ private fun SettingsTab(
     focusRequester: FocusRequester?,
     activeTabRequester: FocusRequester?,
     railReq: FocusRequester,
+    badge: Boolean = false,
 ) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
@@ -453,17 +460,20 @@ private fun SettingsTab(
             .onFocusChanged { if (it.isFocused) onSelect() },
     ) {
         Box(modifier = Modifier.fillMaxHeight().padding(horizontal = 22.dp), contentAlignment = Alignment.Center) {
-            Text(
-                text = label,
-                style = type.buttonLabel.copy(color = if (selected || focused) palette.ink0 else palette.ink2),
-            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = label,
+                    style = type.buttonLabel.copy(color = if (selected || focused) palette.ink0 else palette.ink2),
+                )
+                if (badge) Box(Modifier.size(8.dp).background(palette.accent, CircleShape))
+            }
         }
     }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun LyricToggleRow(
+internal fun LyricToggleRow(
     label: String,
     checked: Boolean,
     onToggle: (Boolean) -> Unit,

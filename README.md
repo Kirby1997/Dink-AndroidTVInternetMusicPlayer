@@ -69,8 +69,8 @@ shared.
 Native WSL/Linux build. Debug build + deploy to a connected device:
 
 ```bash
-./gradlew assembleDebug
-adb install -r -t app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleGithubDebug
+adb install -r -t app/build/outputs/apk/github/debug/app-github-debug.apk
 ```
 
 Release artifacts (AAB for Play upload + APK for sideload):
