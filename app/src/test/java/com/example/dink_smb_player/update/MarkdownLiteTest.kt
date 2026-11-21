@@ -43,4 +43,9 @@ class MarkdownLiteTest {
     }
 
     @Test fun emptyBody() = assertEquals(emptyList<MdBlock>(), MarkdownLite.parse(""))
+
+    @Test fun linksShowTextOnly() = assertEquals(
+        listOf(MdSpan("Full list in CHANGELOG.md.")),
+        MarkdownLite.spans("Full list in [CHANGELOG.md](https://github.com/x/y/blob/v1.5.0/CHANGELOG.md)."),
+    )
 }

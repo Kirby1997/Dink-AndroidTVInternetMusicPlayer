@@ -2,8 +2,19 @@
 
 package com.example.dink_smb_player.ui.screens.settings
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.tv.material3.Border
+import androidx.tv.material3.Icon
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -222,33 +233,34 @@ private fun statusLine(state: UpdateState, selfUpdate: Boolean, haveReleases: Bo
     }
 }
 
+/**
+ * Version list. Each row opens the full-screen [ReleaseNotesDialog]; reading notes inline
+ * didn't work because the Settings tab area is only ~300dp tall under the header.
+ */
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun Changelog(releases: List<ReleaseInfo>, railReq: FocusRequester) {
     val palette = LocalDinkPalette.current
-    var selectedTag by remember { mutableStateOf(releases.first().tag) }
-    val selected = releases.firstOrNull { it.tag == selectedTag } ?: releases.first()
+    val type = LocalDinkType.current
+    var openIndex by remember { mutableStateOf<Int?>(null) }
 
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-        // Release list: own scroll box so 20 rows don't push the pane off-screen.
-        Column(
-            modifier = Modifier
-                .width(280.dp)
-                .height(420.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            releases.forEach { r ->
-                ReleaseRow(
-                    release = r,
-                    installed = Semver.compare(r.tag, BuildConfig.VERSION_NAME) == 0,
-                    selected = r.tag == selected.tag,
-                    onFocus = { selectedTag = r.tag },
-                    modifier = Modifier.focusProperties { left = railReq },
-                )
-            }
+    Column(modifier = Modifier.width(720.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "Select a version to read what changed.",
+            style = type.body.copy(color = palette.ink2),
+        )
+        releases.forEachIndexed { i, r ->
+            ReleaseRow(
+                release = r,
+                installed = Semver.compare(r.tag, BuildConfig.VERSION_NAME) == 0,
+                onClick = { openIndex = i },
+                modifier = Modifier.focusProperties { left = railReq },
+            )
         }
-        ReadingPane(release = selected, modifier = Modifier.weight(1f).height(420.dp))
+    }
+
+    openIndex?.let { start ->
+        ReleaseNotesDialog(releases = releases, startIndex = start, onDismiss = { openIndex = null })
     }
 }
 
@@ -257,110 +269,142 @@ private fun Changelog(releases: List<ReleaseInfo>, railReq: FocusRequester) {
 private fun ReleaseRow(
     release: ReleaseInfo,
     installed: Boolean,
-    selected: Boolean,
-    onFocus: () -> Unit,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
-    val interaction = remember { MutableInteractionSource() }
-    val focused by interaction.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(12.dp)
     Surface(
-        onClick = onFocus,
-        shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(12.dp)),
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
-            containerColor = if (selected) palette.bg3 else palette.bg0,
+            containerColor = palette.bg1,
             focusedContainerColor = palette.bg3,
             contentColor = palette.ink1,
             focusedContentColor = palette.ink0,
         ),
-        interactionSource = interaction,
-        modifier = modifier
-            .fillMaxWidth()
-            .height(52.dp)
-            .border(
-                width = if (focused) 2.dp else 0.dp,
-                color = palette.accent,
-                shape = RoundedCornerShape(12.dp),
-            )
-            .onFocusChanged { if (it.isFocused) onFocus() },
+        // Border lives on the Surface so it scales with it; no border at all when unfocused
+        // (a 0dp Modifier.border still draws a hairline).
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(BorderStroke(2.dp, palette.accent), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
+        modifier = modifier.fillMaxWidth().height(60.dp),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).height(52.dp),
+            modifier = Modifier.fillMaxSize().padding(horizontal = 18.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Column {
-                Text(
-                    text = "v${release.version}" + if (installed) "  (installed)" else "",
-                    style = type.buttonLabel.copy(color = if (focused || selected) palette.ink0 else palette.ink1),
-                )
-                Text(text = release.dateLabel, style = type.monoSmall.copy(color = palette.ink3))
+            Text(
+                text = "v${release.version}",
+                style = type.buttonLabel.copy(color = palette.ink0),
+            )
+            if (installed) {
+                Text(text = "INSTALLED", style = type.monoSmall.copy(color = palette.accent))
             }
+            Spacer(Modifier.weight(1f))
+            Text(text = release.dateLabel, style = type.monoSmall.copy(color = palette.ink3))
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = palette.ink3,
+                modifier = Modifier.size(22.dp),
+            )
         }
     }
 }
 
-/** Focusable, D-pad scrollable markdown view: Up/Down scroll the text while there is more to
- *  scroll in that direction, then fall through so focus can leave the pane. */
+/**
+ * Full-screen release notes. One focusable scroll area owns the D-pad: Up/Down scroll,
+ * Left/Right step to the older/newer release, Back closes.
+ */
 @Composable
-private fun ReadingPane(release: ReleaseInfo, modifier: Modifier = Modifier) {
+private fun ReleaseNotesDialog(releases: List<ReleaseInfo>, startIndex: Int, onDismiss: () -> Unit) {
     val palette = LocalDinkPalette.current
     val type = LocalDinkType.current
+    var index by remember { mutableStateOf(startIndex.coerceIn(0, releases.lastIndex)) }
+    val release = releases[index]
     val scroll = rememberScrollState()
     val scope = rememberCoroutineScope()
-    val stepPx = with(LocalDensity.current) { 96.dp.toPx() }
-    val interaction = remember { MutableInteractionSource() }
-    val focused by interaction.collectIsFocusedAsState()
+    val stepPx = with(LocalDensity.current) { 140.dp.toPx() }
+    val focus = remember { FocusRequester() }
     val blocks = remember(release.tag) { MarkdownLite.parse(release.body) }
-    androidx.compose.runtime.LaunchedEffect(release.tag) { scroll.scrollTo(0) }
+    val installed = Semver.compare(release.tag, BuildConfig.VERSION_NAME) == 0
 
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(palette.bg1)
-            .border(
-                width = if (focused) 2.dp else 1.dp,
-                color = if (focused) palette.accent else palette.lineStrong,
-                shape = RoundedCornerShape(14.dp),
-            )
-            .onKeyEvent { e ->
-                if (e.type != KeyEventType.KeyDown) return@onKeyEvent false
-                when (e.key) {
-                    Key.DirectionDown -> if (scroll.canScrollForward) {
-                        scope.launch { scroll.animateScrollBy(stepPx) }; true
-                    } else false
-                    Key.DirectionUp -> if (scroll.canScrollBackward) {
-                        scope.launch { scroll.animateScrollBy(-stepPx) }; true
-                    } else false
-                    else -> false
-                }
-            }
-            .focusable(interactionSource = interaction)
-            .verticalScroll(scroll)
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Text(
-            text = "v${release.version}  ·  ${release.dateLabel}",
-            style = type.monoSmall.copy(color = palette.ink3),
-        )
-        if (blocks.isEmpty()) {
-            Text(text = "No release notes.", style = type.body.copy(color = palette.ink2))
-        }
-        blocks.forEach { b ->
-            when (b) {
-                is MdBlock.Heading -> Text(
-                    text = styled(b.spans),
-                    style = (if (b.level <= 2) type.cardTitle else type.buttonLabel).copy(color = palette.ink0),
-                    modifier = Modifier.padding(top = 6.dp),
+    androidx.compose.runtime.LaunchedEffect(release.tag) { scroll.scrollTo(0) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(40)
+        runCatching { focus.requestFocus() }
+    }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 96.dp, vertical = 56.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(palette.bg1)
+                .border(1.dp, palette.lineStrong, RoundedCornerShape(20.dp))
+                .padding(horizontal = 48.dp, vertical = 36.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                Text(text = "v${release.version}", style = type.screenTitle.copy(color = palette.ink0))
+                if (installed) Text(text = "INSTALLED", style = type.monoSmall.copy(color = palette.accent))
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "◀ older · newer ▶   ▲▼ scroll   Back to close",
+                    style = type.monoSmall.copy(color = palette.ink3),
                 )
-                is MdBlock.Bullet -> Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(text = "•", style = type.body.copy(color = palette.accent))
-                    Text(text = styled(b.spans), style = type.body.copy(color = palette.ink1))
-                }
-                is MdBlock.Paragraph -> Text(text = styled(b.spans), style = type.body.copy(color = palette.ink1))
             }
+            Text(
+                text = "${release.dateLabel}  ·  ${index + 1} of ${releases.size}",
+                style = type.monoSmall.copy(color = palette.ink2),
+            )
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .focusRequester(focus)
+                    .onPreviewKeyEvent { e ->
+                        if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                        when (e.key) {
+                            Key.DirectionDown -> { scope.launch { scroll.animateScrollBy(stepPx) }; true }
+                            Key.DirectionUp -> { scope.launch { scroll.animateScrollBy(-stepPx) }; true }
+                            Key.DirectionLeft -> { if (index < releases.lastIndex) index++; true }
+                            Key.DirectionRight -> { if (index > 0) index--; true }
+                            else -> false
+                        }
+                    }
+                    .focusable()
+                    .verticalScroll(scroll)
+                    .padding(top = 8.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (blocks.isEmpty()) {
+                    Text(text = "No release notes.", style = type.body.copy(color = palette.ink2))
+                }
+                blocks.forEach { b ->
+                    when (b) {
+                        is MdBlock.Heading -> Text(
+                            text = styled(b.spans),
+                            style = (if (b.level <= 2) type.cardTitle else type.buttonLabel).copy(color = palette.ink0),
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                        is MdBlock.Bullet -> Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text(text = "•", style = type.body.copy(color = palette.accent))
+                            Text(text = styled(b.spans), style = type.body.copy(color = palette.ink1))
+                        }
+                        is MdBlock.Paragraph -> Text(text = styled(b.spans), style = type.body.copy(color = palette.ink1))
+                    }
+                }
+            }
+            Text(
+                text = if (scroll.canScrollForward) "More below ▼" else " ",
+                style = type.monoSmall.copy(color = palette.ink3),
+            )
         }
     }
 }

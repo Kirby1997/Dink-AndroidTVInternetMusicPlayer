@@ -219,6 +219,7 @@ object UpdateRepository {
             }
             return
         }
+        _notice.value = null // the "allow unknown apps" instructions are done with
         _state.value = UpdateState.Installing(release)
         try {
             sessionId = ApkInstaller.commit(c, file)

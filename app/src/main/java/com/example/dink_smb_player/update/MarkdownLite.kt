@@ -61,8 +61,12 @@ object MarkdownLite {
         return out
     }
 
+    private val LINK = Regex("""\[([^\]]+)]\(([^)\s]+)\)""")
+
     /** Splits inline text into styled runs. Unterminated markers are kept literally. */
-    fun spans(text: String): List<MdSpan> {
+    fun spans(raw: String): List<MdSpan> {
+        // Links can't be opened on a TV: show only their text.
+        val text = LINK.replace(raw) { it.groupValues[1] }
         val out = mutableListOf<MdSpan>()
         val plain = StringBuilder()
         fun flush() { if (plain.isNotEmpty()) { out += MdSpan(plain.toString()); plain.clear() } }

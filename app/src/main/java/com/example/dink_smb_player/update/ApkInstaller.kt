@@ -131,7 +131,9 @@ internal object ApkInstaller {
                 apk.inputStream().use { it.copyTo(out) }
                 session.fsync(out)
             }
-            val intent = Intent(ACTION_RESULT).setPackage(context.packageName)
+            // Explicit component: the receiver is declared without an intent-filter, so an
+            // action + package intent never reached it and the confirm prompt never showed.
+            val intent = Intent(context, UpdateInstallReceiver::class.java).setAction(ACTION_RESULT)
             val pi = PendingIntent.getBroadcast(
                 context, id, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,

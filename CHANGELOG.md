@@ -24,8 +24,8 @@ All notable changes to Dink are documented here. Format loosely follows
 
 ### Updates
 - **New Settings → Updates tab.** Shows the version you're running, checks GitHub for newer
-  releases, and lets you read the release notes for recent versions right on the TV (Up / Down
-  scrolls the notes).
+  releases, and lists recent versions. Pick one to read its release notes full screen: Up /
+  Down scrolls, Left / Right steps to the older / newer version, Back closes.
 - **In-app update (GitHub/sideload build).** When a newer version is out, a dot appears on
   Settings in the side menu and on the Updates tab. "Download & install" fetches the APK,
   checks its checksum and that it's signed by the same key as the installed app, then hands it
