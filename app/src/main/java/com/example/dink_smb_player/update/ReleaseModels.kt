@@ -42,7 +42,7 @@ private data class ReleaseDto(
 )
 
 @Serializable
-private data class AssetDto(
+internal data class AssetDto(
     val name: String = "",
     @SerialName("browser_download_url") val url: String = "",
     val size: Long = 0,
@@ -64,14 +64,22 @@ object ReleaseParser {
                     body = dto.body.orEmpty(),
                     publishedAt = dto.publishedAt.orEmpty(),
                     htmlUrl = dto.htmlUrl.orEmpty(),
-                    apk = pickApk(dto.assets),
+                    apk = pickApk(dto.assets, dto.tagName.trim().removePrefix("v").removePrefix("V")),
                 )
             }
             .sortedWith { a, b -> Semver.compare(b.tag, a.tag) }
 
-    private fun pickApk(assets: List<AssetDto>): ReleaseAsset? {
-        val apks = assets.filter { it.name.endsWith(".apk", ignoreCase = true) && it.url.isNotBlank() }
-        val chosen = apks.firstOrNull { it.name.startsWith("dink", ignoreCase = true) } ?: apks.firstOrNull()
+    /** Prefers exactly `dink-<version>.apk`, then other dink*.apk names containing "release",
+     *  then any other dink*.apk. Never returns a name containing "debug". */
+    internal fun pickApk(assets: List<AssetDto>, version: String): ReleaseAsset? {
+        val apks = assets.filter {
+            it.name.endsWith(".apk", ignoreCase = true) && it.url.isNotBlank() &&
+                !it.name.contains("debug", ignoreCase = true)
+        }
+        val dink = apks.filter { it.name.startsWith("dink", ignoreCase = true) }
+        val chosen = dink.firstOrNull { it.name.equals("dink-$version.apk", ignoreCase = true) }
+            ?: dink.firstOrNull { it.name.contains("release", ignoreCase = true) }
+            ?: dink.firstOrNull()
         return chosen?.let {
             val digest = it.digest?.trim()?.lowercase().orEmpty()
             ReleaseAsset(
@@ -81,5 +89,18 @@ object ReleaseParser {
                 sha256 = if (digest.startsWith("sha256:")) digest.removePrefix("sha256:").ifEmpty { null } else null,
             )
         }
+    }
+}
+
+/** Where release APKs may be downloaded from: https on GitHub's own hosts only (checked on every redirect hop). */
+object DownloadUrlPolicy {
+    fun isAllowed(url: String): Boolean = runCatching {
+        val u = java.net.URI(url)
+        u.scheme.equals("https", ignoreCase = true) && u.userInfo == null && isAllowedHost(u.host)
+    }.getOrDefault(false)
+
+    fun isAllowedHost(host: String?): Boolean {
+        val h = host?.lowercase() ?: return false
+        return h == "github.com" || h.endsWith(".githubusercontent.com")
     }
 }
