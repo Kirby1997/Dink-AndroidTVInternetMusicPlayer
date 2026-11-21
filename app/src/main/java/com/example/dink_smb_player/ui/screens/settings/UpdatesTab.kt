@@ -31,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -78,6 +79,8 @@ internal fun UpdatesTab(activeTabFocus: FocusRequester, railReq: FocusRequester)
     val prefs = remember(context) { UpdateRepository.prefs(context) }
     val autoCheck by prefs.autoCheck.collectAsState(initial = BuildConfig.SELF_UPDATE)
     val selfUpdate = BuildConfig.SELF_UPDATE
+    var lastCheck by remember { mutableStateOf(0L) }
+    androidx.compose.runtime.LaunchedEffect(state) { lastCheck = runCatching { prefs.lastCheck() }.getOrDefault(0L) }
 
     // Play flavor has no background check: load the changelog when the tab opens.
     androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -93,22 +96,19 @@ internal fun UpdatesTab(activeTabFocus: FocusRequester, railReq: FocusRequester)
                 text = "Installed version ${BuildConfig.VERSION_NAME}",
                 style = type.monoValue.copy(color = palette.accent),
             )
-            Text(text = statusLine(state, selfUpdate), style = type.body.copy(color = palette.ink2))
-            notice?.let { Text(text = it, style = type.body.copy(color = palette.ink1)) }
-
-            var topUsed = false
-            fun topMod(): Modifier {
-                val m = Modifier.focusProperties { left = railReq; if (!topUsed) up = activeTabFocus }
-                topUsed = true
-                return m
-            }
+            val toggleOnTop = selfUpdate
+            val checkReq = remember { FocusRequester() }
+            // True once the action button has held focus; cleared when another control takes it.
+            var actionHadFocus by remember { mutableStateOf(false) }
 
             if (selfUpdate) {
                 LyricToggleRow(
                     label = "Automatically check for updates",
                     checked = autoCheck,
                     onToggle = { next -> scope.launch { UpdateRepository.setAutoCheck(context, next) } },
-                    modifier = topMod(),
+                    modifier = Modifier
+                        .focusProperties { left = railReq; up = activeTabFocus }
+                        .onFocusChanged { if (it.hasFocus) actionHadFocus = false },
                 )
             } else {
                 Text(
@@ -122,46 +122,65 @@ internal fun UpdatesTab(activeTabFocus: FocusRequester, railReq: FocusRequester)
                 label = if (state is UpdateState.Checking) "Checking…"
                 else if (selfUpdate) "Check for updates" else "Refresh changelog",
                 onClick = { if (!busy) UpdateRepository.checkAsync() },
-                modifier = topMod(),
+                modifier = Modifier
+                    .focusRequester(checkReq)
+                    .focusProperties { left = railReq; if (!toggleOnTop) up = activeTabFocus }
+                    .onFocusChanged { if (it.hasFocus) actionHadFocus = false },
             )
 
-            if (selfUpdate) {
-                when (val s = state) {
-                    is UpdateState.Available -> {
-                        GradientButton(
-                            label = "Download & install v${s.release.version}",
-                            onClick = { UpdateRepository.downloadAndInstall() },
-                            modifier = Modifier.focusProperties { left = railReq },
-                        )
-                        Text(
-                            text = "Playback will stop while installing.",
-                            style = type.monoSmall.copy(color = palette.ink3),
-                        )
-                    }
-                    is UpdateState.Downloading -> Text(
-                        text = "Downloading v${s.release.version}… ${(s.progress * 100).toInt()}%",
-                        style = type.monoValue.copy(color = palette.accent),
-                    )
-                    is UpdateState.ReadyToInstall -> {
-                        GradientButton(
-                            label = "Install v${s.release.version}",
-                            onClick = { UpdateRepository.installDownloaded() },
-                            modifier = Modifier.focusProperties { left = railReq },
-                        )
-                        Text(
-                            text = "Playback will stop while installing.",
-                            style = type.monoSmall.copy(color = palette.ink3),
-                        )
-                    }
-                    is UpdateState.Error -> if (releases.any { Semver.isNewer(it.tag, BuildConfig.VERSION_NAME) && it.apk != null }) {
-                        GradientButton(
-                            label = "Download & install again",
-                            onClick = { UpdateRepository.downloadAndInstall() },
-                            modifier = Modifier.focusProperties { left = railReq },
-                        )
-                    }
-                    else -> Unit
+            // ONE action button for every state (same call site) so focus survives
+            // Available -> Downloading -> Error / ReadyToInstall relabels.
+            val newerRelease = releases.firstOrNull { it.apk != null && Semver.isNewer(it.tag, BuildConfig.VERSION_NAME) }
+            val actionRelease: ReleaseInfo? = if (!selfUpdate) null else when (val s = state) {
+                is UpdateState.Available -> s.release
+                is UpdateState.Downloading -> s.release
+                is UpdateState.ReadyToInstall -> s.release
+                is UpdateState.Installing -> s.release
+                is UpdateState.Error -> newerRelease
+                else -> null
+            }
+            val actionVisible = actionRelease != null
+            if (actionRelease != null) {
+                val label = when (state) {
+                    is UpdateState.Downloading -> "Downloading… ${((state as UpdateState.Downloading).progress * 100).toInt()}%"
+                    is UpdateState.ReadyToInstall -> "Install v${actionRelease.version}"
+                    is UpdateState.Installing -> "Installing…"
+                    is UpdateState.Error -> "Download & install v${actionRelease.version} again"
+                    else -> "Download & install v${actionRelease.version}"
                 }
+                GradientButton(
+                    label = label,
+                    onClick = {
+                        when (state) {
+                            is UpdateState.ReadyToInstall -> UpdateRepository.installDownloaded()
+                            is UpdateState.Downloading, is UpdateState.Installing -> Unit
+                            else -> UpdateRepository.downloadAndInstall()
+                        }
+                    },
+                    modifier = Modifier
+                        .focusProperties { left = railReq }
+                        .onFocusChanged { if (it.hasFocus) actionHadFocus = true },
+                )
+            }
+            // If the action button goes away while it had focus, land on a sibling, never the rail.
+            androidx.compose.runtime.LaunchedEffect(actionVisible) {
+                if (!actionVisible && actionHadFocus) {
+                    actionHadFocus = false
+                    runCatching { checkReq.requestFocus() }
+                }
+            }
+
+            // Status / progress / error sit directly under the buttons so they are always in view.
+            Text(
+                text = statusLine(state, selfUpdate, releases.isNotEmpty(), lastCheck),
+                style = type.body.copy(color = if (state is UpdateState.Error) palette.accent else palette.ink2),
+            )
+            notice?.let { Text(text = it, style = type.body.copy(color = palette.ink1)) }
+            if (actionVisible && (state is UpdateState.Available || state is UpdateState.ReadyToInstall || state is UpdateState.Error)) {
+                Text(
+                    text = "Playback will stop while installing.",
+                    style = type.monoSmall.copy(color = palette.ink3),
+                )
             }
         }
 
@@ -177,15 +196,30 @@ internal fun UpdatesTab(activeTabFocus: FocusRequester, railReq: FocusRequester)
     }
 }
 
-private fun statusLine(state: UpdateState, selfUpdate: Boolean): String = when (state) {
-    UpdateState.Idle -> if (selfUpdate) "Press Check for updates to look for a new version." else "Updates come from Google Play."
-    UpdateState.Checking -> "Checking GitHub for new releases…"
-    UpdateState.UpToDate -> "You're up to date."
-    is UpdateState.Available -> "Version ${state.release.version} is available."
-    is UpdateState.Downloading -> "Downloading version ${state.release.version}…"
-    is UpdateState.ReadyToInstall -> "Version ${state.release.version} is downloaded and ready to install."
-    is UpdateState.Installing -> "Installing version ${state.release.version}… confirm on the system prompt."
-    is UpdateState.Error -> state.message
+private fun lastCheckedLabel(ms: Long, now: Long = System.currentTimeMillis()): String {
+    val locale = java.util.Locale.getDefault()
+    val d = java.util.Date(ms)
+    val sameDay = java.text.SimpleDateFormat("yyyyMMdd", locale).let { it.format(d) == it.format(java.util.Date(now)) }
+    return if (sameDay) "today " + java.text.SimpleDateFormat("HH:mm", locale).format(d)
+    else java.text.SimpleDateFormat("yyyy-MM-dd", locale).format(d)
+}
+
+private fun statusLine(state: UpdateState, selfUpdate: Boolean, haveReleases: Boolean, lastCheckMs: Long): String {
+    val checked = if (lastCheckMs > 0) " · last checked ${lastCheckedLabel(lastCheckMs)}" else ""
+    return when (state) {
+        UpdateState.Idle -> when {
+            !selfUpdate -> "Updates come from Google Play."
+            haveReleases && lastCheckMs > 0 -> "Up to date$checked"
+            else -> "Press Check for updates to look for a new version."
+        }
+        UpdateState.Checking -> "Checking GitHub for new releases…"
+        UpdateState.UpToDate -> "You're up to date$checked"
+        is UpdateState.Available -> "Version ${state.release.version} is available."
+        is UpdateState.Downloading -> "Downloading version ${state.release.version}… ${(state.progress * 100).toInt()}%"
+        is UpdateState.ReadyToInstall -> "Version ${state.release.version} is downloaded and ready to install."
+        is UpdateState.Installing -> "Installing version ${state.release.version}… confirm on the system prompt."
+        is UpdateState.Error -> state.message
+    }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
@@ -235,8 +269,8 @@ private fun ReleaseRow(
         onClick = onFocus,
         shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(12.dp)),
         colors = ClickableSurfaceDefaults.colors(
-            containerColor = if (selected) palette.bg3 else palette.bg1,
-            focusedContainerColor = palette.bg2,
+            containerColor = if (selected) palette.bg3 else palette.bg0,
+            focusedContainerColor = palette.bg3,
             contentColor = palette.ink1,
             focusedContentColor = palette.ink0,
         ),
@@ -244,6 +278,11 @@ private fun ReleaseRow(
         modifier = modifier
             .fillMaxWidth()
             .height(52.dp)
+            .border(
+                width = if (focused) 2.dp else 0.dp,
+                color = palette.accent,
+                shape = RoundedCornerShape(12.dp),
+            )
             .onFocusChanged { if (it.isFocused) onFocus() },
     ) {
         Row(

@@ -128,6 +128,7 @@ object UpdateRepository {
                 if (showChecking && _state.value == UpdateState.Checking) _state.value = prior
                 throw e
             } catch (e: Exception) {
+                Log.w(TAG, "Update check failed: ${e.message}")
                 // lastCheck is deliberately not updated on failure (incl. rate limits).
                 if (_releases.value.isEmpty()) _releases.value = GitHubReleaseClient(c, p).cached()
                 evaluate(markUpToDate = false)
@@ -179,6 +180,7 @@ object UpdateRepository {
                     throw e
                 } catch (e: Exception) {
                     file.delete()
+                    Log.w(TAG, "Download/install failed: ${e.message}", e)
                     _state.value = UpdateState.Error(e.message ?: "Download failed.")
                 }
             } finally {
@@ -197,6 +199,7 @@ object UpdateRepository {
             try {
                 install(s.release, file)
             } catch (e: Exception) {
+                Log.w(TAG, "Install failed: ${e.message}", e)
                 _state.value = UpdateState.Error(e.message ?: "Install failed.")
             } finally {
                 busy.set(false)
@@ -220,6 +223,7 @@ object UpdateRepository {
         try {
             sessionId = ApkInstaller.commit(c, file)
         } catch (e: IOException) {
+            Log.w(TAG, "Session commit failed: ${e.message}", e)
             _state.value = UpdateState.Error("Install failed: ${e.message}")
             return
         }
@@ -263,6 +267,7 @@ object UpdateRepository {
             appContext?.let { ApkInstaller.clearUpdates(it) }
             _state.value = UpdateState.UpToDate
         } else {
+            Log.w(TAG, "Installer reported failure: $message")
             _state.value = UpdateState.Error(message ?: "Install failed.")
         }
     }
