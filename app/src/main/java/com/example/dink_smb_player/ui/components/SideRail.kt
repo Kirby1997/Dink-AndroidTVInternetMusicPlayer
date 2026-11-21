@@ -22,6 +22,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.foundation.shape.CircleShape
+import com.example.dink_smb_player.update.UpdateRepository
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -231,7 +234,22 @@ private fun RailItem(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                IconBadge(icon = screen.icon, active = active, focused = focused)
+                Box {
+                    IconBadge(icon = screen.icon, active = active, focused = focused)
+                    if (screen == ScreenId.Settings) {
+                        val updateAvailable by UpdateRepository.badge.collectAsState()
+                        if (updateAvailable) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 2.dp, end = 2.dp)
+                                    .size(10.dp)
+                                    .background(palette.accent, CircleShape)
+                                    .testTag("rail_update_badge"),
+                            )
+                        }
+                    }
+                }
                 if (expanded) {
                     Text(
                         text = screen.displayName,

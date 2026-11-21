@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build signed release artifacts for Dink.
-#   ./release.sh        -> AAB (for Play) + APK (for sideload)
+#   ./release.sh        -> AAB (play flavor, for Play) + APK (github flavor, for sideload / GitHub release)
 #   ./release.sh aab    -> AAB only
 #   ./release.sh apk    -> APK only
 #
@@ -13,9 +13,9 @@ cd "$(dirname "$0")"
 WHAT="${1:-both}"
 
 case "$WHAT" in
-  aab)  TASKS=(bundleRelease) ;;
-  apk)  TASKS=(assembleRelease) ;;
-  both) TASKS=(bundleRelease assembleRelease) ;;
+  aab)  TASKS=(bundlePlayRelease) ;;
+  apk)  TASKS=(assembleGithubRelease) ;;
+  both) TASKS=(bundlePlayRelease assembleGithubRelease) ;;
   *) echo "usage: $0 [aab|apk|both]"; exit 1 ;;
 esac
 
@@ -33,7 +33,7 @@ echo ">> clean"
 bash ./gradlew clean
 
 echo ">> unit tests + release lint"
-bash ./gradlew :app:testDebugUnitTest :app:lintRelease
+bash ./gradlew :app:testGithubDebugUnitTest :app:testPlayDebugUnitTest :app:lintGithubRelease :app:lintPlayRelease
 
 echo ">> build ${TASKS[*]}"
 bash ./gradlew "${TASKS[@]}"

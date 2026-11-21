@@ -11,6 +11,7 @@ import com.example.dink_smb_player.data.prefs.SharePrefs
 import com.example.dink_smb_player.data.source.MonitorWorker
 import com.example.dink_smb_player.player.EngineTags
 import com.example.dink_smb_player.player.PlayerState
+import com.example.dink_smb_player.update.UpdateRepository
 import com.example.dink_smb_player.ui.theme.preloadThemeMode
 import com.example.dink_smb_player.ui.theme.preloadUiScale
 import kotlinx.coroutines.CoroutineScope
@@ -59,6 +60,8 @@ class DinkApplication : Application() {
         // MediaLibrary.loadOnce. Volume mounts still enqueue LocalSyncWorker.
         // Periodic re-import of monitored SMB shares + local media into the library index.
         MonitorWorker.reschedule(this)
+        // Update check/cleanup: attach is trivial; the real work is delayed + on IO.
+        UpdateRepository.onAppLaunch(this)
         // Library sinks on the process-wide player, here rather than in the UI: a media-key
         // cold start plays with no activity, and its plays / engine tags must still count.
         PlayerState.shared(this).bindLibrarySinks(this)

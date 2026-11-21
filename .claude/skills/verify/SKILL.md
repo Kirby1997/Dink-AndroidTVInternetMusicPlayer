@@ -10,9 +10,9 @@ Package is `com.dink.player` (activity `com.example.dink_smb_player.MainActivity
 ## Build + deploy
 
 ```bash
-./gradlew :app:assembleDebug -q
+./gradlew :app:assembleGithubDebug -q
 adb connect 192.168.255.81:5555
-adb -s 192.168.255.81:5555 install -r -t app/build/outputs/apk/debug/app-debug.apk
+adb -s 192.168.255.81:5555 install -r -t app/build/outputs/apk/github/debug/app-github-debug.apk
 adb -s 192.168.255.81:5555 shell am force-stop com.dink.player   # Apply Changes won't pick up structural edits
 adb -s 192.168.255.81:5555 shell am start -n com.dink.player/com.example.dink_smb_player.MainActivity
 ```

@@ -32,17 +32,22 @@ In `app/build.gradle.kts`: raise `versionCode` (integer, +1 every upload) and
 ## 3. Build artifacts
 
 ```bash
-./release.sh both    # AAB (upload this) + APK (sideload to your own TV)
+./release.sh both    # Play AAB (upload this) + GitHub APK (sideload; attach to the GitHub release as dink-<version>.apk)
 ```
 
-- Upload to Play: `app/build/outputs/bundle/release/app-release.aab`
-- Sideload test:  `app/build/outputs/apk/release/app-release.apk`
+There are two product flavors (`distribution` dimension, same applicationId): `play` (AAB, no
+in-app updater, no REQUEST_INSTALL_PACKAGES) and `github` (APK with the updater). Attach the
+github APK to the GitHub release named `dink-<versionName>.apk` (the updater looks for the
+first `.apk` asset, preferring names starting with `dink`) and put the changelog in the release body.
+
+- Upload to Play: `app/build/outputs/bundle/playRelease/app-play-release.aab`
+- Sideload test:  `app/build/outputs/apk/github/release/app-github-release.apk`
 
 Verify it's signed with the upload key (not debug):
 
 ```bash
 $ANDROID_HOME/build-tools/<ver>/apksigner verify --print-certs \
-  app/build/outputs/apk/release/app-release.apk
+  app/build/outputs/apk/github/release/app-github-release.apk
 ```
 
 ## 4. Play Console setup (TV app)

@@ -3,6 +3,24 @@
 All notable changes to Dink are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the app `versionName`.
 
+## [Unreleased]
+
+### Updates
+- **New Settings → Updates tab.** Shows the version you're running, checks GitHub for newer
+  releases, and lets you read the release notes for recent versions right on the TV (Up / Down
+  scrolls the notes).
+- **In-app update (GitHub/sideload build).** When a newer version is out, a dot appears on
+  Settings in the side menu and on the Updates tab. "Download & install" fetches the APK,
+  checks its checksum and that it's signed by the same key as the installed app, then hands it
+  to Android's installer, which always asks you to confirm. Playback stops while installing. If
+  your TV hasn't allowed Dink to install apps yet, Dink opens that setting (or tells you where
+  to find it).
+- **Automatic checking.** "Automatically check for updates" (on by default) looks when the app
+  opens (at most every 6 hours) and once a day in the background. It only checks, it never
+  installs by itself. Turn it off to stop the background checks.
+- The Google Play build has no installer: updates arrive through Play, and the Updates tab is
+  just the release notes.
+
 ## [1.5.0] - 2026-10-12
 
 ### Radio

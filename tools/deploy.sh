@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.." || exit 0
 # leaving a stale build running (exactly what bit us once).
 PKG=com.dink.player
 ACT=$PKG/com.example.dink_smb_player.MainActivity
-APK=app/build/outputs/apk/debug/app-debug.apk
+APK=app/build/outputs/apk/github/debug/app-github-debug.apk
 STAMP=.deploy-stamp
 SERIAL=${DINK_SERIAL:-192.168.255.81:5555}
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
@@ -43,7 +43,7 @@ else
 fi
 
 echo "[deploy] source changed — assembling…"
-if ! ./gradlew :app:assembleDebug -q; then
+if ! ./gradlew :app:assembleGithubDebug -q; then
   echo "[deploy] BUILD FAILED" >&2
   exit 1
 fi
