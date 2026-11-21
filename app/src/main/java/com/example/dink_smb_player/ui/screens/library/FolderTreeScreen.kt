@@ -86,6 +86,7 @@ import com.example.dink_smb_player.ui.components.GradientButton
 import com.example.dink_smb_player.ui.components.MenuRow
 import com.example.dink_smb_player.ui.components.SongContextMenu
 import com.example.dink_smb_player.ui.components.ThinLoadingBar
+import com.example.dink_smb_player.ui.components.ignoreHeldSelect
 import com.example.dink_smb_player.ui.theme.LocalDinkPalette
 import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.Dispatchers
@@ -525,6 +526,7 @@ private fun FolderActionMenu(
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Column(
             modifier = Modifier
+                .ignoreHeldSelect()
                 .width(420.dp)
                 .background(palette.bg1, RoundedCornerShape(16.dp))
                 .border(1.dp, palette.lineStrong, RoundedCornerShape(16.dp))

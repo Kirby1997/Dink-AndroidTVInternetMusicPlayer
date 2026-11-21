@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -37,6 +38,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import android.view.KeyEvent as AndroidKeyEvent
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
@@ -62,6 +67,28 @@ import com.example.dink_smb_player.ui.theme.LocalDinkType
 import kotlinx.coroutines.launch
 
 private enum class MenuMode { Root, PickPlaylist, NewPlaylist }
+
+/**
+ * Menus here open on hold-OK, while OK is still physically down. Without this, the
+ * auto-repeats and the eventual release land on the freshly focused first row and click
+ * it (e.g. "Play folder" fired before the user could choose). Swallow OK/Enter until a
+ * fresh press (repeatCount 0) starts inside the menu; after that, keys pass through.
+ */
+@Composable
+internal fun Modifier.ignoreHeldSelect(): Modifier {
+    var armed by remember { mutableStateOf(false) }
+    return onPreviewKeyEvent { e ->
+        val code = e.nativeKeyEvent.keyCode
+        val select = code == AndroidKeyEvent.KEYCODE_DPAD_CENTER ||
+            code == AndroidKeyEvent.KEYCODE_ENTER ||
+            code == AndroidKeyEvent.KEYCODE_NUMPAD_ENTER
+        when {
+            !select || armed -> false
+            e.type == KeyEventType.KeyDown && e.nativeKeyEvent.repeatCount == 0 -> { armed = true; false }
+            else -> true
+        }
+    }
+}
 
 /**
  * Long-press context menu for a track. Centered dialog of D-pad-focusable rows —
@@ -108,6 +135,7 @@ fun SongContextMenu(
     ) {
         Column(
             modifier = Modifier
+                .ignoreHeldSelect()
                 .width(420.dp)
                 .background(palette.bg1, RoundedCornerShape(16.dp))
                 .border(1.dp, palette.lineStrong, RoundedCornerShape(16.dp))
@@ -199,13 +227,17 @@ internal fun MenuRow(
             contentColor = if (enabled) palette.ink0 else palette.ink3,
             focusedContentColor = palette.ink0,
         ),
+        // Default 1.1x focus scale pushed the full-width row past the dialog's padding.
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
         interactionSource = interaction,
         modifier = (focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
             .fillMaxWidth()
             .height(52.dp),
     ) {
+        // Fill the 52dp Surface so the row's vertical centring is relative to the whole
+        // row, not to the content's wrapped height (which pinned text to the top).
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+            modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
