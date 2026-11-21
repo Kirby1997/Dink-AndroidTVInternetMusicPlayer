@@ -10,6 +10,7 @@ import android.os.storage.StorageManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,7 +27,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -49,6 +50,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -73,9 +75,11 @@ import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.example.dink_smb_player.LocalContentFocus
 import com.example.dink_smb_player.LocalRailFocusRequester
+import com.example.dink_smb_player.data.SharesLibrary
 import com.example.dink_smb_player.data.library.LibraryRepository
 import com.example.dink_smb_player.data.model.Song
 import com.example.dink_smb_player.data.prefs.SharePrefs
+import com.example.dink_smb_player.data.source.SourceLocks
 import com.example.dink_smb_player.nav.ScreenId
 import com.example.dink_smb_player.player.PlayerState
 import com.example.dink_smb_player.ui.components.GradientButton
@@ -134,14 +138,18 @@ fun FolderTreeScreen(
         value = withContext(Dispatchers.Default) { FolderTreeMemo.get(songs, l) }
     }
 
-    var expanded by remember { mutableStateOf(FolderTreeMemo.expanded) }
-    fun setExpanded(next: Set<String>) {
-        expanded = next
-        FolderTreeMemo.expanded = next
-    }
-    // Forget folders that vanished from the library (keeps the memo from growing stale).
-    LaunchedEffect(roots) {
-        roots?.let { r -> FolderTree.pruneExpanded(r, expanded).let { if (it !== expanded) setExpanded(it) } }
+    // Source of truth is the memo's StateFlow: toggles are atomic updates on its current value
+    // (never a set captured at composition), so key-repeat bursts can't drop a change.
+    val expanded by FolderTreeMemo.expanded.collectAsState()
+    // Forget folders that vanished from a source that's still present. Skipped while the
+    // library is restoring or a source is mid import / monitor walk: a partial tree there
+    // would otherwise wipe the user's open folders (pruneExpanded also keeps ids of absent
+    // sources and ignores an empty tree).
+    LaunchedEffect(roots, restored) {
+        val r = roots ?: return@LaunchedEffect
+        if (!restored || r.isEmpty()) return@LaunchedEffect
+        if (SourceLocks.anyActive() || SharesLibrary.importingShares.values.any { it }) return@LaunchedEffect
+        FolderTreeMemo.prune(r)
     }
 
     // Visible rows: O(visible) walk, cheap enough to redo on each toggle.
@@ -157,6 +165,9 @@ fun FolderTreeScreen(
     // Left → parent, Right → first child, and the Back-from-detail restore.
     var pendingFocus by remember { mutableStateOf<String?>(null) }
     val targetFocus = remember { FocusRequester() }
+    // Row key that actually holds focus (set from onFocusChanged) — how a focus request is
+    // confirmed, rather than trusting requestFocus() not to throw.
+    var focusedRowKey by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(rows) {
         val list = rows ?: return@LaunchedEffect
         // One-shot (armed by app Back from a detail opened here): refocus the row we left from.
@@ -172,11 +183,28 @@ fun FolderTreeScreen(
         val idx = list.indexOfFirst { it.key == key }
         if (idx < 0) { pendingFocus = null; return@LaunchedEffect }
         if (listState.layoutInfo.visibleItemsInfo.none { it.index == idx }) listState.scrollToItem(idx)
-        repeat(20) {
-            if (runCatching { targetFocus.requestFocus() }.isSuccess) { pendingFocus = null; return@LaunchedEffect }
-            delay(30)
+        // Bounded retry, one frame apart: the row may not be composed/attached yet (just
+        // scrolled to, or the list only just appeared). Done only once focus is really on the
+        // row; a request that no-ops or throws just tries again next frame.
+        repeat(30) {
+            runCatching { targetFocus.requestFocus() }
+            withFrameNanos { }
+            if (focusedRowKey == key) { pendingFocus = null; return@LaunchedEffect }
         }
         pendingFocus = null
+    }
+
+    // When the loading placeholder held focus and the real content replaces it, hand focus
+    // on to the new contentFocus owner (Shuffle all / Add a source) rather than dropping it.
+    var loadingHolderFocused by remember { mutableStateOf(false) }
+    val contentReady = rows != null && (restored || songs.isNotEmpty())
+    LaunchedEffect(contentReady) {
+        if (!contentReady || !loadingHolderFocused) return@LaunchedEffect
+        loadingHolderFocused = false
+        repeat(15) {
+            delay(40)
+            if (runCatching { contentFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
     }
 
     var menuSong by remember { mutableStateOf<Song?>(null) }
@@ -194,8 +222,8 @@ fun FolderTreeScreen(
     fun onKey(nav: TreeNav): Boolean = when (nav) {
         TreeNav.PassThrough -> false
         TreeNav.Consume -> true
-        is TreeNav.Expand -> { setExpanded(expanded + nav.folderId); true }
-        is TreeNav.Collapse -> { setExpanded(expanded - nav.folderId); true }
+        is TreeNav.Expand -> { FolderTreeMemo.expand(nav.folderId); true }
+        is TreeNav.Collapse -> { FolderTreeMemo.collapse(nav.folderId); true }
         is TreeNav.FocusRow -> { pendingFocus = nav.rowKey; true }
     }
 
@@ -233,7 +261,21 @@ fun FolderTreeScreen(
 
         val list = rows
         if (list == null || (!restored && songs.isEmpty())) {
-            ThinLoadingBar()
+            if (songs.isEmpty()) {
+                // Neither Shuffle all nor Add a source exists yet: keep a focusable bound to
+                // contentFocus so a drawer commit can still land in content (HomeLoading's
+                // pattern) instead of leaving focus, and the open drawer, on the rail.
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(contentFocus)
+                        .focusProperties { left = railRequester }
+                        .onFocusChanged { loadingHolderFocused = it.isFocused }
+                        .focusable(),
+                ) { ThinLoadingBar() }
+            } else {
+                ThinLoadingBar()
+            }
         } else if (list.isEmpty()) {
             GradientButton(
                 label = "Add a source",
@@ -250,15 +292,23 @@ fun FolderTreeScreen(
                 contentPadding = PaddingValues(vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                itemsIndexed(list, key = { _, r -> r.key }, contentType = { _, r -> r::class }) { index, row ->
+                items(list, key = { it.key }, contentType = { it::class }) { row ->
                     val rowModifier = Modifier
                         .then(if (row.key == pendingFocus) Modifier.focusRequester(targetFocus) else Modifier)
-                        .onFocusChanged { if (it.isFocused || it.hasFocus) ListScrollMemo.setFocused(FACET, row.key) }
+                        .onFocusChanged {
+                            if (it.isFocused || it.hasFocus) {
+                                focusedRowKey = row.key
+                                ListScrollMemo.setFocused(FACET, row.key)
+                            } else if (focusedRowKey == row.key) {
+                                focusedRowKey = null
+                            }
+                        }
                         .onPreviewKeyEvent { ev ->
                             if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                             when (ev.key) {
-                                Key.DirectionLeft -> onKey(TreeKeys.left(list, index))
-                                Key.DirectionRight -> onKey(TreeKeys.right(list, index))
+                                // Decide on the expanded set as it is NOW, not as composed.
+                                Key.DirectionLeft -> onKey(TreeKeys.left(row, FolderTreeMemo.expanded.value))
+                                Key.DirectionRight -> onKey(TreeKeys.right(row, FolderTreeMemo.expanded.value))
                                 Key.Menu -> {
                                     when (row) {
                                         is TreeRow.Folder -> menuFolder = row.node
@@ -279,9 +329,7 @@ fun FolderTreeScreen(
                     when (row) {
                         is TreeRow.Folder -> FolderRow(
                             row = row,
-                            onClick = {
-                                setExpanded(if (row.expanded) expanded - row.node.id else expanded + row.node.id)
-                            },
+                            onClick = { FolderTreeMemo.toggle(row.node.id) },
                             onLongClick = { menuFolder = row.node },
                             modifier = rowModifier,
                         )
@@ -317,8 +365,8 @@ fun FolderTreeScreen(
                 LibraryDetailNav.open(
                     LibraryGroup(
                         key = node.id,
-                        title = node.name.substringAfterLast(" / "),
-                        subtitle = "${node.id} · ${all.size} tracks",
+                        title = node.leafName,
+                        subtitle = "${node.name} · ${all.size} tracks",
                         songs = all,
                     ),
                     FACET,

@@ -43,6 +43,10 @@ object SourceLocks {
     internal fun activeJobCount(sourceId: String): Int =
         tracked[sourceId]?.count { it.job.isActive } ?: 0
 
+    /** True while any source has a live import / monitor / removal job (the library may be
+     *  mid-walk and partial). */
+    fun anyActive(): Boolean = tracked.values.any { set -> set.any { it.job.isActive } }
+
     /**
      * Run [block] exclusively for [sourceId], as a job [remove] / [cancelOverlapping] can
      * cancel. [roots] are the folders it touches ("" = whole source, null = unknown/all).
